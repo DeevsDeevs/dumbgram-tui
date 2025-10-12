@@ -1,5 +1,7 @@
 use crate::telegram::types::{Chat, Folder, Message};
 use ratatui::layout::Rect;
+use std::collections::HashMap;
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusedPanel {
@@ -24,6 +26,14 @@ pub struct AppState {
     pub messages_area: Rect,
     pub input_area: Rect,
     pub folder_scroll_offset: usize,
+    pub editing_message_id: Option<i32>,
+    pub replying_to_message_id: Option<i32>,
+    pub error_message: Option<String>,
+    pub error_timestamp: Option<DateTime<Utc>>,
+    pub message_offset: usize,
+    pub has_more_messages: bool,
+    pub confirm_delete_message_id: Option<i32>,
+    pub typing_users: HashMap<i64, Vec<String>>,
 }
 
 impl AppState {
@@ -43,6 +53,14 @@ impl AppState {
             messages_area: Rect::default(),
             input_area: Rect::default(),
             folder_scroll_offset: 0,
+            editing_message_id: None,
+            replying_to_message_id: None,
+            error_message: None,
+            error_timestamp: None,
+            message_offset: 0,
+            has_more_messages: true,
+            confirm_delete_message_id: None,
+            typing_users: HashMap::new(),
         }
     }
     
@@ -173,6 +191,49 @@ impl AppState {
             FocusedPanel::Messages => FocusedPanel::Input,
             FocusedPanel::Input => FocusedPanel::Folders,
         };
+    }
+
+    pub fn is_editing(&self) -> bool {
+        self.editing_message_id.is_some()
+    }
+
+    pub fn is_replying(&self) -> bool {
+        self.replying_to_message_id.is_some()
+    }
+
+    pub fn clear_input_mode(&mut self) {
+        self.editing_message_id = None;
+        self.replying_to_message_id = None;
+        self.input_buffer.clear();
+    }
+
+    pub fn enter_edit_mode(&mut self, message_id: i32, content: String) {
+        self.editing_message_id = Some(message_id);
+        self.input_buffer = content;
+        self.focused_panel = FocusedPanel::Input;
+    }
+
+    pub fn enter_reply_mode(&mut self, message_id: i32) {
+        self.replying_to_message_id = Some(message_id);
+        self.focused_panel = FocusedPanel::Input;
+    }
+
+    pub fn set_error(&mut self, error: String) {
+        self.error_message = Some(error);
+        self.error_timestamp = Some(Utc::now());
+    }
+
+    pub fn clear_error(&mut self) {
+        self.error_message = None;
+        self.error_timestamp = None;
+    }
+    
+    pub fn check_error_timeout(&mut self) {
+        if let Some(timestamp) = self.error_timestamp {
+            if Utc::now().signed_duration_since(timestamp).num_seconds() > 5 {
+                self.clear_error();
+            }
+        }
     }
 }
 

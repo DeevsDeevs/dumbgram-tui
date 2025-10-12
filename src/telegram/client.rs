@@ -1,5 +1,6 @@
-use super::types::{Chat, Folder, Message};
+use super::types::{Chat, Folder, Message, Update};
 use color_eyre::Result;
+use tokio::sync::mpsc;
 
 pub trait TelegramClient {
     async fn connect(&mut self) -> Result<()>;
@@ -9,4 +10,6 @@ pub trait TelegramClient {
     async fn send_message(&self, chat_id: i64, content: String) -> Result<Message>;
     async fn edit_message(&self, chat_id: i64, message_id: i32, content: String) -> Result<()>;
     async fn reply_to_message(&self, chat_id: i64, reply_to: i32, content: String) -> Result<Message>;
+    async fn delete_message(&self, chat_id: i64, message_id: i32) -> Result<()>;
+    async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>>;
 }

@@ -1,16 +1,22 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
+    text::Span,
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 use crate::{app::App, config::Theme};
 use super::{render_folders, render_chats, render_messages, render_input};
 
 pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
+    let error_height = if app.state.error_message.is_some() { 2 } else { 0 };
+    
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(3),
+            Constraint::Length(error_height),
         ])
         .split(frame.area());
 
@@ -39,4 +45,16 @@ pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
     render_chats(frame, left_chunks[1], app, theme);
     render_messages(frame, horizontal_chunks[1], app, theme);
     render_input(frame, main_chunks[1], app, theme);
+    
+    if app.state.error_message.is_some() {
+        render_error_banner(frame, main_chunks[2], &app.state.error_message.as_ref().unwrap());
+    }
+}
+
+fn render_error_banner(frame: &mut Frame, area: Rect, error: &str) {
+    let error_widget = Paragraph::new(Span::raw(format!(" ❌ {}", error)))
+        .style(Style::default().fg(Color::Red).bg(Color::Black))
+        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Red)));
+    
+    frame.render_widget(error_widget, area);
 }

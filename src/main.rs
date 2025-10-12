@@ -7,13 +7,18 @@ mod ui;
 use app::App;
 use color_eyre::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
+use std::time::Duration;
+use std::sync::atomic::{AtomicI32, Ordering};
 use telegram::{MockTelegramClient, TelegramClient};
+use telegram::types::Update;
+
+static TEMP_ID_COUNTER: AtomicI32 = AtomicI32::new(-1);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -37,7 +42,9 @@ async fn main() -> Result<()> {
         }
     }
     
-    let result = run_app(&mut terminal, &mut app, &theme, &mut client).await;
+    let mut update_rx = client.subscribe_updates().await?;
+    
+    let result = run_app(&mut terminal, &mut app, &theme, &mut client, &mut update_rx).await;
     
     restore_terminal(&mut terminal)?;
     
@@ -64,31 +71,96 @@ async fn run_app(
     app: &mut App,
     theme: &config::Theme,
     client: &mut MockTelegramClient,
+    update_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Update>,
 ) -> Result<()> {
     loop {
         terminal.draw(|f| ui::render_layout(f, app, theme))?;
 
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                handle_key_event(app, key, client).await?;
+        while let Ok(update) = update_rx.try_recv() {
+            apply_update(&mut app.state, update);
+        }
+        
+        app.state.check_error_timeout();
+
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key_event(app, key, client).await?;
+                }
+                Event::Mouse(mouse_event) => {
+                    handle_mouse_event(app, mouse_event, client).await?;
+                }
+                _ => {}
             }
-            Event::Mouse(mouse_event) => {
-                handle_mouse_event(app, mouse_event, client).await?;
-            }
-            _ => {}
         }
 
         if app.should_quit {
             break;
         }
     }
-
+    
     Ok(())
 }
 
+fn apply_update(state: &mut state::AppState, update: Update) {
+    match update {
+        Update::NewMessage(msg) => {
+            if state.chats.get(state.selected_chat_index).map(|c| c.id) == Some(msg.chat_id) {
+                if !state.messages.iter().any(|m| m.id == msg.id) {
+                    state.messages.push(msg.clone());
+                }
+            }
+            
+            if let Some(chat) = state.chats.iter_mut().find(|c| c.id == msg.chat_id) {
+                chat.last_message = Some(msg.content.chars().take(50).collect());
+                if !msg.is_own {
+                    chat.unread_count += 1;
+                }
+            }
+        }
+        
+        Update::EditMessage { chat_id, message_id, new_content } => {
+            if let Some(msg) = state.messages.iter_mut().find(|m| m.id == message_id && m.chat_id == chat_id) {
+                msg.content = new_content;
+                msg.is_edited = true;
+            }
+        }
+        
+        Update::DeleteMessage { chat_id, message_id } => {
+            state.messages.retain(|m| !(m.id == message_id && m.chat_id == chat_id));
+            if state.selected_message_index >= state.messages.len() && !state.messages.is_empty() {
+                state.selected_message_index = state.messages.len() - 1;
+            }
+        }
+        
+        Update::TypingStatus { chat_id, user_name, is_typing } => {
+            if is_typing {
+                let users = state.typing_users.entry(chat_id).or_insert_with(Vec::new);
+                if !users.contains(&user_name) {
+                    users.push(user_name);
+                }
+            } else {
+                if let Some(users) = state.typing_users.get_mut(&chat_id) {
+                    users.retain(|u| u != &user_name);
+                    if users.is_empty() {
+                        state.typing_users.remove(&chat_id);
+                    }
+                }
+            }
+        }
+        
+        Update::MessageStatusUpdate { chat_id, message_id, status } => {
+            if let Some(msg) = state.messages.iter_mut().find(|m| m.id == message_id && m.chat_id == chat_id) {
+                msg.status = status;
+            }
+        }
+    }
+}
+
+
 async fn handle_key_event(app: &mut App, key: KeyEvent, client: &mut MockTelegramClient) -> Result<()> {
     if app.state.focused_panel == state::FocusedPanel::Input {
-        handle_input_focused(app, key);
+        handle_input_focused(app, key, client).await?;
     } else {
         handle_normal_navigation(app, key, client).await?;
     }
@@ -96,6 +168,34 @@ async fn handle_key_event(app: &mut App, key: KeyEvent, client: &mut MockTelegra
 }
 
 async fn handle_normal_navigation(app: &mut App, key: KeyEvent, client: &mut MockTelegramClient) -> Result<()> {
+    if app.state.confirm_delete_message_id.is_some() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let msg_id = app.state.confirm_delete_message_id.unwrap();
+                let chat_id = app.state.chats[app.state.selected_chat_index].id;
+                
+                match client.delete_message(chat_id, msg_id).await {
+                    Ok(_) => {
+                        app.state.messages.retain(|m| m.id != msg_id);
+                        app.state.confirm_delete_message_id = None;
+                        if app.state.selected_message_index >= app.state.messages.len() && !app.state.messages.is_empty() {
+                            app.state.selected_message_index = app.state.messages.len() - 1;
+                        }
+                    }
+                    Err(e) => {
+                        app.state.set_error(format!("Delete failed: {}", e));
+                        app.state.confirm_delete_message_id = None;
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.state.confirm_delete_message_id = None;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    
     match key.code {
         KeyCode::Char('q') => app.quit(),
         KeyCode::Tab => app.state.focus_next_panel(),
@@ -207,14 +307,48 @@ async fn handle_normal_navigation(app: &mut App, key: KeyEvent, client: &mut Moc
         }
         KeyCode::Char('<') => app.state.adjust_split_left(),
         KeyCode::Char('>') => app.state.adjust_split_right(),
+        KeyCode::Char('e') if app.state.focused_panel == state::FocusedPanel::Messages => {
+            if !app.state.messages.is_empty() {
+                if let Some(msg) = app.state.messages.get(app.state.selected_message_index) {
+                    if msg.is_own && msg.can_edit {
+                        app.state.enter_edit_mode(msg.id, msg.content.clone());
+                    } else {
+                        app.state.set_error("Cannot edit this message".to_string());
+                    }
+                }
+            }
+        }
+        KeyCode::Char('r') if app.state.focused_panel == state::FocusedPanel::Messages => {
+            if !app.state.messages.is_empty() {
+                if let Some(msg) = app.state.messages.get(app.state.selected_message_index) {
+                    app.state.enter_reply_mode(msg.id);
+                }
+            }
+        }
+        KeyCode::Char('d') if app.state.focused_panel == state::FocusedPanel::Messages => {
+            if !app.state.messages.is_empty() {
+                if let Some(msg) = app.state.messages.get(app.state.selected_message_index) {
+                    if msg.is_own && msg.can_delete {
+                        app.state.confirm_delete_message_id = Some(msg.id);
+                    } else {
+                        app.state.set_error("Cannot delete this message".to_string());
+                    }
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
 }
 
-fn handle_input_focused(app: &mut App, key: KeyEvent) {
+async fn handle_input_focused(app: &mut App, key: KeyEvent, client: &mut MockTelegramClient) -> Result<()> {
     match key.code {
         KeyCode::Esc => {
+            app.state.clear_input_mode();
+            app.state.focused_panel = state::FocusedPanel::Messages;
+        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.state.clear_input_mode();
             app.state.focused_panel = state::FocusedPanel::Messages;
         }
         KeyCode::Char(c) => {
@@ -224,12 +358,88 @@ fn handle_input_focused(app: &mut App, key: KeyEvent) {
             app.state.input_buffer.pop();
         }
         KeyCode::Enter => {
-            if !app.state.input_buffer.is_empty() {
-                app.state.input_buffer.clear();
-            }
+            handle_message_send(app, client).await?;
         }
         _ => {}
     }
+    Ok(())
+}
+
+async fn handle_message_send(app: &mut App, client: &mut MockTelegramClient) -> Result<()> {
+    if app.state.input_buffer.is_empty() {
+        return Ok(());
+    }
+    
+    if app.state.chats.is_empty() {
+        app.state.set_error("No chat selected".to_string());
+        return Ok(());
+    }
+    
+    let chat_id = app.state.chats[app.state.selected_chat_index].id;
+    let content = app.state.input_buffer.clone();
+    
+    if let Some(msg_id) = app.state.editing_message_id {
+        match client.edit_message(chat_id, msg_id, content).await {
+            Ok(_) => {
+                if let Some(msg) = app.state.messages.iter_mut().find(|m| m.id == msg_id) {
+                    msg.content = app.state.input_buffer.clone();
+                    msg.is_edited = true;
+                }
+                app.state.clear_input_mode();
+            }
+            Err(e) => {
+                app.state.set_error(format!("Edit failed: {}", e));
+            }
+        }
+    } else if let Some(reply_id) = app.state.replying_to_message_id {
+        match client.reply_to_message(chat_id, reply_id, content).await {
+            Ok(new_msg) => {
+                app.state.messages.push(new_msg);
+                app.state.clear_input_mode();
+            }
+            Err(e) => {
+                app.state.set_error(format!("Reply failed: {}", e));
+            }
+        }
+    } else {
+        let temp_id = TEMP_ID_COUNTER.fetch_sub(1, Ordering::SeqCst);
+        
+        let pending_msg = telegram::types::Message {
+            id: temp_id,
+            chat_id,
+            sender_name: "You".to_string(),
+            sender_id: 0,
+            content: content.clone(),
+            timestamp: chrono::Utc::now(),
+            is_own: true,
+            is_edited: false,
+            reply_to_id: None,
+            reply_to_content: None,
+            status: telegram::types::MessageStatus::Sending,
+            can_edit: true,
+            can_delete: true,
+            error: None,
+        };
+        
+        app.state.messages.push(pending_msg.clone());
+        app.state.input_buffer.clear();
+        
+        match client.send_message(chat_id, content).await {
+            Ok(sent_msg) => {
+                if let Some(msg) = app.state.messages.iter_mut().find(|m| m.id == temp_id) {
+                    *msg = sent_msg;
+                }
+            }
+            Err(e) => {
+                if let Some(msg) = app.state.messages.iter_mut().find(|m| m.id == temp_id) {
+                    msg.status = telegram::types::MessageStatus::Failed;
+                    msg.error = Some(e.to_string());
+                }
+            }
+        }
+    }
+    
+    Ok(())
 }
 
 async fn handle_mouse_event(
