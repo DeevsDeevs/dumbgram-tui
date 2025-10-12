@@ -15,7 +15,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use std::time::Duration;
 use std::sync::atomic::{AtomicI32, Ordering};
-use telegram::{MockTelegramClient, TelegramClient};
+use telegram::{GrammersClient, TelegramClient};
 use telegram::types::Update;
 
 static TEMP_ID_COUNTER: AtomicI32 = AtomicI32::new(-1);
@@ -24,10 +24,67 @@ static TEMP_ID_COUNTER: AtomicI32 = AtomicI32::new(-1);
 async fn main() -> Result<()> {
     color_eyre::install()?;
     
+    let config = config::Config::load("config.toml")
+        .map_err(|e| {
+            eprintln!("Failed to load config.toml: {}", e);
+            eprintln!("Make sure config.toml exists with your Telegram credentials.");
+            e
+        })?;
+    
+    if config.telegram.api_id == 0 || config.telegram.api_hash.is_empty() {
+        eprintln!("Error: api_id and api_hash must be set in config.toml");
+        std::process::exit(1);
+    }
+    
     let mut terminal = setup_terminal()?;
     let mut app = App::new();
     let theme = config::Theme::default();
-    let mut client = MockTelegramClient::new();
+    
+    let mut client = GrammersClient::new(
+        config.telegram.api_id,
+        config.telegram.api_hash.clone(),
+        &config.telegram.session_file,
+    ).await?;
+    
+    if !client.inner().is_authorized().await? {
+        restore_terminal(&mut terminal)?;
+        
+        println!("\n=== Telegram Login Required ===\n");
+        
+        let phone = prompt_input("Enter phone number (with country code, e.g., +1234567890): ")?;
+        println!("Requesting login code...");
+        let token = client.inner().request_login_code(&phone).await?;
+        println!("✓ Code sent to {}\n", phone);
+        
+        let code = prompt_input("Enter verification code: ")?;
+        println!("Signing in...");
+        
+        match client.inner().sign_in(&token, &code).await {
+            Ok(user) => {
+                println!("✓ Signed in as: {}\n", user.first_name());
+            }
+            Err(grammers_client::SignInError::PasswordRequired(password_token)) => {
+                let hint = password_token.hint().unwrap_or("");
+                println!("2FA enabled.");
+                if !hint.is_empty() {
+                    println!("Hint: {}", hint);
+                }
+                
+                let password = prompt_input("Enter 2FA password: ")?;
+                let user = client.inner().check_password(password_token, password.as_bytes()).await?;
+                println!("✓ Signed in with 2FA as: {}\n", user.first_name());
+            }
+            Err(e) => {
+                eprintln!("Sign in failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        
+        println!("Session saved! Press Enter to start...");
+        prompt_input("")?;
+        
+        terminal = setup_terminal()?;
+    }
     
     client.connect().await?;
     
@@ -51,6 +108,15 @@ async fn main() -> Result<()> {
     result
 }
 
+fn prompt_input(msg: &str) -> Result<String> {
+    use std::io::{self, Write};
+    print!("{}", msg);
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -70,7 +136,7 @@ async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     theme: &config::Theme,
-    client: &mut MockTelegramClient,
+    client: &mut GrammersClient,
     update_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Update>,
 ) -> Result<()> {
     loop {
@@ -158,7 +224,7 @@ fn apply_update(state: &mut state::AppState, update: Update) {
 }
 
 
-async fn handle_key_event(app: &mut App, key: KeyEvent, client: &mut MockTelegramClient) -> Result<()> {
+async fn handle_key_event(app: &mut App, key: KeyEvent, client: &mut GrammersClient) -> Result<()> {
     if app.state.focused_panel == state::FocusedPanel::Input {
         handle_input_focused(app, key, client).await?;
     } else {
@@ -167,7 +233,7 @@ async fn handle_key_event(app: &mut App, key: KeyEvent, client: &mut MockTelegra
     Ok(())
 }
 
-async fn handle_normal_navigation(app: &mut App, key: KeyEvent, client: &mut MockTelegramClient) -> Result<()> {
+async fn handle_normal_navigation(app: &mut App, key: KeyEvent, client: &mut GrammersClient) -> Result<()> {
     if app.state.confirm_delete_message_id.is_some() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -341,7 +407,7 @@ async fn handle_normal_navigation(app: &mut App, key: KeyEvent, client: &mut Moc
     Ok(())
 }
 
-async fn handle_input_focused(app: &mut App, key: KeyEvent, client: &mut MockTelegramClient) -> Result<()> {
+async fn handle_input_focused(app: &mut App, key: KeyEvent, client: &mut GrammersClient) -> Result<()> {
     match key.code {
         KeyCode::Esc => {
             app.state.clear_input_mode();
@@ -365,7 +431,7 @@ async fn handle_input_focused(app: &mut App, key: KeyEvent, client: &mut MockTel
     Ok(())
 }
 
-async fn handle_message_send(app: &mut App, client: &mut MockTelegramClient) -> Result<()> {
+async fn handle_message_send(app: &mut App, client: &mut GrammersClient) -> Result<()> {
     if app.state.input_buffer.is_empty() {
         return Ok(());
     }
@@ -445,7 +511,7 @@ async fn handle_message_send(app: &mut App, client: &mut MockTelegramClient) -> 
 async fn handle_mouse_event(
     app: &mut App,
     mouse_event: crossterm::event::MouseEvent,
-    client: &mut MockTelegramClient,
+    client: &mut GrammersClient,
 ) -> Result<()> {
     
     match mouse_event.kind {

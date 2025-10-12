@@ -1,0 +1,5 @@
+[telegram]
+# Get these from https://my.telegram.org
+api_id = 0
+api_hash = ""
+session_file = "session.dat"

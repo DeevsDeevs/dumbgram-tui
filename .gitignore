@@ -13,4 +13,9 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Config and session files
+config.toml
+session.dat
+*.dat
+
 *.md
