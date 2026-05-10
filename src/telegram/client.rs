@@ -9,7 +9,12 @@ pub trait TelegramClient {
     async fn get_messages(&self, chat_id: i64, limit: usize) -> Result<Vec<Message>>;
     async fn send_message(&self, chat_id: i64, content: String) -> Result<Message>;
     async fn edit_message(&self, chat_id: i64, message_id: i32, content: String) -> Result<()>;
-    async fn reply_to_message(&self, chat_id: i64, reply_to: i32, content: String) -> Result<Message>;
+    async fn reply_to_message(
+        &self,
+        chat_id: i64,
+        reply_to: i32,
+        content: String,
+    ) -> Result<Message>;
     async fn delete_message(&self, chat_id: i64, message_id: i32) -> Result<()>;
     async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>>;
 }

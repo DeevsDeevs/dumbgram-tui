@@ -7,58 +7,61 @@ mod ui;
 use app::App;
 use color_eyre::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
-use std::time::Duration;
 use std::sync::atomic::{AtomicI32, Ordering};
-use telegram::{GrammersClient, TelegramClient};
+use std::time::Duration;
 use telegram::types::Update;
+use telegram::{GrammersClient, TelegramClient};
 
 static TEMP_ID_COUNTER: AtomicI32 = AtomicI32::new(-1);
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    
-    let config = config::Config::load("config.toml")
-        .map_err(|e| {
-            eprintln!("Failed to load config.toml: {}", e);
-            eprintln!("Make sure config.toml exists with your Telegram credentials.");
-            e
-        })?;
-    
+
+    let config = config::Config::load("config.toml").map_err(|e| {
+        eprintln!("Failed to load config.toml: {}", e);
+        eprintln!("Make sure config.toml exists with your Telegram credentials.");
+        e
+    })?;
+
     if config.telegram.api_id == 0 || config.telegram.api_hash.is_empty() {
         eprintln!("Error: api_id and api_hash must be set in config.toml");
         std::process::exit(1);
     }
-    
+
     let mut terminal = setup_terminal()?;
     let mut app = App::new();
     let theme = config::Theme::default();
-    
+
     let mut client = GrammersClient::new(
         config.telegram.api_id,
         config.telegram.api_hash.clone(),
         &config.telegram.session_file,
-    ).await?;
-    
+    )
+    .await?;
+
     if !client.inner().is_authorized().await? {
         restore_terminal(&mut terminal)?;
-        
+
         println!("\n=== Telegram Login Required ===\n");
-        
+
         let phone = prompt_input("Enter phone number (with country code, e.g., +1234567890): ")?;
         println!("Requesting login code...");
         let token = client.inner().request_login_code(&phone).await?;
         println!("✓ Code sent to {}\n", phone);
-        
+
         let code = prompt_input("Enter verification code: ")?;
         println!("Signing in...");
-        
+
         match client.inner().sign_in(&token, &code).await {
             Ok(user) => {
                 println!("✓ Signed in as: {}\n", user.first_name());
@@ -70,9 +73,12 @@ async fn main() -> Result<()> {
                 if !hint.is_empty() {
                     println!("Hint: {}", hint);
                 }
-                
+
                 let password = prompt_input("Enter 2FA password: ")?;
-                let user = client.inner().check_password(password_token, password.as_bytes()).await?;
+                let user = client
+                    .inner()
+                    .check_password(password_token, password.as_bytes())
+                    .await?;
                 println!("✓ Signed in with 2FA as: {}\n", user.first_name());
                 client.save_session()?;
             }
@@ -81,32 +87,32 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        
+
         println!("✓ Session saved! Press Enter to start...");
         prompt_input("")?;
-        
+
         terminal = setup_terminal()?;
     }
-    
+
     client.connect().await?;
-    
+
     app.state.folders = client.get_folders().await?;
     if !app.state.folders.is_empty() {
         let folder_id = Some(app.state.folders[0].id);
         app.state.chats = client.get_chats(folder_id).await?;
-        
+
         if !app.state.chats.is_empty() {
             let chat_id = app.state.chats[0].id;
             app.state.messages = client.get_messages(chat_id, 50).await?;
         }
     }
-    
+
     let mut update_rx = client.subscribe_updates().await?;
-    
+
     let result = run_app(&mut terminal, &mut app, &theme, &mut client, &mut update_rx).await;
-    
+
     restore_terminal(&mut terminal)?;
-    
+
     result
 }
 
@@ -129,7 +135,11 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -147,7 +157,7 @@ async fn run_app(
         while let Ok(update) = update_rx.try_recv() {
             apply_update(&mut app.state, update);
         }
-        
+
         app.state.check_error_timeout();
 
         if event::poll(Duration::from_millis(100))? {
@@ -166,7 +176,7 @@ async fn run_app(
             break;
         }
     }
-    
+
     Ok(())
 }
 
@@ -174,13 +184,13 @@ fn apply_update(state: &mut state::AppState, update: Update) {
     match update {
         Update::NewMessage(msg) => {
             let current_chat_id = state.chats.get(state.selected_chat_index).map(|c| c.id);
-            
+
             if current_chat_id == Some(msg.chat_id) {
                 if !state.messages.iter().any(|m| m.id == msg.id) {
                     state.messages.push(msg.clone());
                 }
             }
-            
+
             if let Some(chat) = state.chats.iter_mut().find(|c| c.id == msg.chat_id) {
                 chat.last_message = Some(msg.content.chars().take(50).collect());
                 if !msg.is_own {
@@ -188,27 +198,44 @@ fn apply_update(state: &mut state::AppState, update: Update) {
                 }
             }
         }
-        
-        Update::EditMessage { chat_id, message_id, new_content } => {
-            if let Some(msg) = state.messages.iter_mut().find(|m| m.id == message_id && m.chat_id == chat_id) {
+
+        Update::EditMessage {
+            chat_id,
+            message_id,
+            new_content,
+        } => {
+            if let Some(msg) = state
+                .messages
+                .iter_mut()
+                .find(|m| m.id == message_id && m.chat_id == chat_id)
+            {
                 msg.content = new_content.clone();
                 msg.is_edited = true;
             }
         }
-        
-        Update::DeleteMessage { chat_id, message_id } => {
+
+        Update::DeleteMessage {
+            chat_id,
+            message_id,
+        } => {
             if chat_id == 0 {
                 state.messages.retain(|m| m.id != message_id);
             } else {
-                state.messages.retain(|m| !(m.id == message_id && m.chat_id == chat_id));
+                state
+                    .messages
+                    .retain(|m| !(m.id == message_id && m.chat_id == chat_id));
             }
-            
+
             if !state.messages.is_empty() && state.selected_message_index >= state.messages.len() {
                 state.selected_message_index = state.messages.len() - 1;
             }
         }
-        
-        Update::TypingStatus { chat_id, user_name, is_typing } => {
+
+        Update::TypingStatus {
+            chat_id,
+            user_name,
+            is_typing,
+        } => {
             if is_typing {
                 let users = state.typing_users.entry(chat_id).or_insert_with(Vec::new);
                 if !users.contains(&user_name) {
@@ -221,15 +248,22 @@ fn apply_update(state: &mut state::AppState, update: Update) {
                 }
             }
         }
-        
-        Update::MessageStatusUpdate { chat_id, message_id, status } => {
-            if let Some(msg) = state.messages.iter_mut().find(|m| m.id == message_id && m.chat_id == chat_id) {
+
+        Update::MessageStatusUpdate {
+            chat_id,
+            message_id,
+            status,
+        } => {
+            if let Some(msg) = state
+                .messages
+                .iter_mut()
+                .find(|m| m.id == message_id && m.chat_id == chat_id)
+            {
                 msg.status = status;
             }
         }
     }
 }
-
 
 async fn handle_key_event(app: &mut App, key: KeyEvent, client: &mut GrammersClient) -> Result<()> {
     if app.state.focused_panel == state::FocusedPanel::Input {
@@ -240,18 +274,24 @@ async fn handle_key_event(app: &mut App, key: KeyEvent, client: &mut GrammersCli
     Ok(())
 }
 
-async fn handle_normal_navigation(app: &mut App, key: KeyEvent, client: &mut GrammersClient) -> Result<()> {
+async fn handle_normal_navigation(
+    app: &mut App,
+    key: KeyEvent,
+    client: &mut GrammersClient,
+) -> Result<()> {
     if app.state.confirm_delete_message_id.is_some() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(msg_id) = app.state.confirm_delete_message_id {
                     if !app.state.chats.is_empty() {
                         let chat_id = app.state.chats[app.state.selected_chat_index].id;
-                        
+
                         match client.delete_message(chat_id, msg_id).await {
                             Ok(_) => {
                                 app.state.messages.retain(|m| m.id != msg_id);
-                                if app.state.selected_message_index >= app.state.messages.len() && !app.state.messages.is_empty() {
+                                if app.state.selected_message_index >= app.state.messages.len()
+                                    && !app.state.messages.is_empty()
+                                {
                                     app.state.selected_message_index = app.state.messages.len() - 1;
                                 }
                             }
@@ -270,124 +310,120 @@ async fn handle_normal_navigation(app: &mut App, key: KeyEvent, client: &mut Gra
         }
         return Ok(());
     }
-    
+
     match key.code {
         KeyCode::Char('q') => app.quit(),
         KeyCode::Tab => app.state.focus_next_panel(),
-        KeyCode::Down => {
-            match app.state.focused_panel {
-                state::FocusedPanel::Folders => {
-                    app.state.focused_panel = state::FocusedPanel::Chats;
-                }
-                state::FocusedPanel::Chats => {
-                    if !app.state.chats.is_empty() {
-                        let old_index = app.state.selected_chat_index;
-                        app.state.select_next_chat();
-                        if old_index != app.state.selected_chat_index {
-                            let chat_id = app.state.chats[app.state.selected_chat_index].id;
-                            app.state.messages = client.get_messages(chat_id, 50).await?;
-                            app.state.selected_message_index = 0;
-                        }
-                    }
-                }
-                state::FocusedPanel::Messages => {
-                    if app.state.messages.is_empty() {
-                        app.state.focused_panel = state::FocusedPanel::Input;
-                    } else if app.state.selected_message_index == app.state.messages.len() - 1 {
-                        app.state.focused_panel = state::FocusedPanel::Input;
-                    } else {
-                        app.state.select_next_message();
-                    }
-                }
-                state::FocusedPanel::Input => {}
+        KeyCode::Down => match app.state.focused_panel {
+            state::FocusedPanel::Folders => {
+                app.state.focused_panel = state::FocusedPanel::Chats;
             }
-        }
-        KeyCode::Up => {
-            match app.state.focused_panel {
-                state::FocusedPanel::Folders => {}
-                state::FocusedPanel::Chats => {
-                    if app.state.chats.is_empty() || app.state.selected_chat_index == 0 {
-                        app.state.focused_panel = state::FocusedPanel::Folders;
-                        return Ok(());
-                    }
+            state::FocusedPanel::Chats => {
+                if !app.state.chats.is_empty() {
                     let old_index = app.state.selected_chat_index;
-                    app.state.select_prev_chat();
+                    app.state.select_next_chat();
                     if old_index != app.state.selected_chat_index {
                         let chat_id = app.state.chats[app.state.selected_chat_index].id;
                         app.state.messages = client.get_messages(chat_id, 50).await?;
                         app.state.selected_message_index = 0;
                     }
                 }
-                state::FocusedPanel::Messages => app.state.select_prev_message(),
-                state::FocusedPanel::Input => {
-                    app.state.focused_panel = state::FocusedPanel::Messages;
+            }
+            state::FocusedPanel::Messages => {
+                if app.state.messages.is_empty() {
+                    app.state.focused_panel = state::FocusedPanel::Input;
+                } else if app.state.selected_message_index == app.state.messages.len() - 1 {
+                    app.state.focused_panel = state::FocusedPanel::Input;
+                } else {
+                    app.state.select_next_message();
                 }
             }
-        }
-        KeyCode::Left => {
-            match app.state.focused_panel {
-                state::FocusedPanel::Folders => {
-                    let old_index = app.state.selected_folder_index;
-                    app.state.select_prev_folder();
-                    app.state.ensure_selected_folder_visible();
-                    if old_index != app.state.selected_folder_index && !app.state.folders.is_empty() {
-                        let folder_id = if app.state.folders[app.state.selected_folder_index].name == "All" {
-                            None
-                        } else {
-                            Some(app.state.folders[app.state.selected_folder_index].id)
-                        };
-                        app.state.chats = client.get_chats(folder_id).await?;
-                        app.state.selected_chat_index = 0;
-                        if !app.state.chats.is_empty() {
-                            let chat_id = app.state.chats[0].id;
-                            app.state.messages = client.get_messages(chat_id, 50).await?;
-                        } else {
-                            app.state.messages.clear();
-                        }
-                    }
-                }
-                state::FocusedPanel::Chats => {
+            state::FocusedPanel::Input => {}
+        },
+        KeyCode::Up => match app.state.focused_panel {
+            state::FocusedPanel::Folders => {}
+            state::FocusedPanel::Chats => {
+                if app.state.chats.is_empty() || app.state.selected_chat_index == 0 {
                     app.state.focused_panel = state::FocusedPanel::Folders;
+                    return Ok(());
                 }
-                state::FocusedPanel::Messages => {
-                    app.state.focused_panel = state::FocusedPanel::Chats;
+                let old_index = app.state.selected_chat_index;
+                app.state.select_prev_chat();
+                if old_index != app.state.selected_chat_index {
+                    let chat_id = app.state.chats[app.state.selected_chat_index].id;
+                    app.state.messages = client.get_messages(chat_id, 50).await?;
+                    app.state.selected_message_index = 0;
                 }
-                state::FocusedPanel::Input => {}
             }
-        }
-        KeyCode::Right => {
-            match app.state.focused_panel {
-                state::FocusedPanel::Folders => {
-                    let old_index = app.state.selected_folder_index;
-                    app.state.select_next_folder();
-                    app.state.ensure_selected_folder_visible();
-                    if old_index != app.state.selected_folder_index && !app.state.folders.is_empty() {
-                        let folder_id = if app.state.folders[app.state.selected_folder_index].name == "All" {
+            state::FocusedPanel::Messages => app.state.select_prev_message(),
+            state::FocusedPanel::Input => {
+                app.state.focused_panel = state::FocusedPanel::Messages;
+            }
+        },
+        KeyCode::Left => match app.state.focused_panel {
+            state::FocusedPanel::Folders => {
+                let old_index = app.state.selected_folder_index;
+                app.state.select_prev_folder();
+                app.state.ensure_selected_folder_visible();
+                if old_index != app.state.selected_folder_index && !app.state.folders.is_empty() {
+                    let folder_id =
+                        if app.state.folders[app.state.selected_folder_index].name == "All" {
                             None
                         } else {
                             Some(app.state.folders[app.state.selected_folder_index].id)
                         };
-                        app.state.chats = client.get_chats(folder_id).await?;
-                        app.state.selected_chat_index = 0;
-                        if !app.state.chats.is_empty() {
-                            let chat_id = app.state.chats[0].id;
-                            app.state.messages = client.get_messages(chat_id, 50).await?;
-                        } else {
-                            app.state.messages.clear();
-                        }
+                    app.state.chats = client.get_chats(folder_id).await?;
+                    app.state.selected_chat_index = 0;
+                    if !app.state.chats.is_empty() {
+                        let chat_id = app.state.chats[0].id;
+                        app.state.messages = client.get_messages(chat_id, 50).await?;
+                    } else {
+                        app.state.messages.clear();
                     }
                 }
-                state::FocusedPanel::Chats => {
-                    app.state.focused_panel = state::FocusedPanel::Messages;
-                }
-                state::FocusedPanel::Messages => {}
-                state::FocusedPanel::Input => {}
             }
-        }
+            state::FocusedPanel::Chats => {
+                app.state.focused_panel = state::FocusedPanel::Folders;
+            }
+            state::FocusedPanel::Messages => {
+                app.state.focused_panel = state::FocusedPanel::Chats;
+            }
+            state::FocusedPanel::Input => {}
+        },
+        KeyCode::Right => match app.state.focused_panel {
+            state::FocusedPanel::Folders => {
+                let old_index = app.state.selected_folder_index;
+                app.state.select_next_folder();
+                app.state.ensure_selected_folder_visible();
+                if old_index != app.state.selected_folder_index && !app.state.folders.is_empty() {
+                    let folder_id =
+                        if app.state.folders[app.state.selected_folder_index].name == "All" {
+                            None
+                        } else {
+                            Some(app.state.folders[app.state.selected_folder_index].id)
+                        };
+                    app.state.chats = client.get_chats(folder_id).await?;
+                    app.state.selected_chat_index = 0;
+                    if !app.state.chats.is_empty() {
+                        let chat_id = app.state.chats[0].id;
+                        app.state.messages = client.get_messages(chat_id, 50).await?;
+                    } else {
+                        app.state.messages.clear();
+                    }
+                }
+            }
+            state::FocusedPanel::Chats => {
+                app.state.focused_panel = state::FocusedPanel::Messages;
+            }
+            state::FocusedPanel::Messages => {}
+            state::FocusedPanel::Input => {}
+        },
         KeyCode::Char('<') => app.state.adjust_split_left(),
         KeyCode::Char('>') => app.state.adjust_split_right(),
         KeyCode::Char('e') if app.state.focused_panel == state::FocusedPanel::Messages => {
-            if !app.state.messages.is_empty() && app.state.selected_message_index < app.state.messages.len() {
+            if !app.state.messages.is_empty()
+                && app.state.selected_message_index < app.state.messages.len()
+            {
                 let msg = &app.state.messages[app.state.selected_message_index];
                 if msg.is_own && msg.can_edit {
                     app.state.enter_edit_mode(msg.id, msg.content.clone());
@@ -397,18 +433,23 @@ async fn handle_normal_navigation(app: &mut App, key: KeyEvent, client: &mut Gra
             }
         }
         KeyCode::Char('r') if app.state.focused_panel == state::FocusedPanel::Messages => {
-            if !app.state.messages.is_empty() && app.state.selected_message_index < app.state.messages.len() {
+            if !app.state.messages.is_empty()
+                && app.state.selected_message_index < app.state.messages.len()
+            {
                 let msg_id = app.state.messages[app.state.selected_message_index].id;
                 app.state.enter_reply_mode(msg_id);
             }
         }
         KeyCode::Char('d') if app.state.focused_panel == state::FocusedPanel::Messages => {
-            if !app.state.messages.is_empty() && app.state.selected_message_index < app.state.messages.len() {
+            if !app.state.messages.is_empty()
+                && app.state.selected_message_index < app.state.messages.len()
+            {
                 let msg = &app.state.messages[app.state.selected_message_index];
                 if msg.is_own && msg.can_delete {
                     app.state.confirm_delete_message_id = Some(msg.id);
                 } else {
-                    app.state.set_error("Cannot delete this message".to_string());
+                    app.state
+                        .set_error("Cannot delete this message".to_string());
                 }
             }
         }
@@ -417,7 +458,11 @@ async fn handle_normal_navigation(app: &mut App, key: KeyEvent, client: &mut Gra
     Ok(())
 }
 
-async fn handle_input_focused(app: &mut App, key: KeyEvent, client: &mut GrammersClient) -> Result<()> {
+async fn handle_input_focused(
+    app: &mut App,
+    key: KeyEvent,
+    client: &mut GrammersClient,
+) -> Result<()> {
     match key.code {
         KeyCode::Esc => {
             app.state.clear_input_mode();
@@ -445,15 +490,15 @@ async fn handle_message_send(app: &mut App, client: &mut GrammersClient) -> Resu
     if app.state.input_buffer.is_empty() {
         return Ok(());
     }
-    
+
     if app.state.chats.is_empty() || app.state.selected_chat_index >= app.state.chats.len() {
         app.state.set_error("No chat selected".to_string());
         return Ok(());
     }
-    
+
     let chat_id = app.state.chats[app.state.selected_chat_index].id;
     let content = app.state.input_buffer.clone();
-    
+
     if let Some(msg_id) = app.state.editing_message_id {
         match client.edit_message(chat_id, msg_id, content).await {
             Ok(_) => {
@@ -479,7 +524,7 @@ async fn handle_message_send(app: &mut App, client: &mut GrammersClient) -> Resu
         }
     } else {
         let temp_id = TEMP_ID_COUNTER.fetch_sub(1, Ordering::SeqCst);
-        
+
         let pending_msg = telegram::types::Message {
             id: temp_id,
             chat_id,
@@ -496,10 +541,10 @@ async fn handle_message_send(app: &mut App, client: &mut GrammersClient) -> Resu
             can_delete: true,
             error: None,
         };
-        
+
         app.state.messages.push(pending_msg.clone());
         app.state.input_buffer.clear();
-        
+
         match client.send_message(chat_id, content).await {
             Ok(sent_msg) => {
                 if let Some(idx) = app.state.messages.iter().position(|m| m.id == temp_id) {
@@ -515,7 +560,7 @@ async fn handle_message_send(app: &mut App, client: &mut GrammersClient) -> Resu
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -524,24 +569,27 @@ async fn handle_mouse_event(
     mouse_event: crossterm::event::MouseEvent,
     client: &mut GrammersClient,
 ) -> Result<()> {
-    
     match mouse_event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let x = mouse_event.column;
             let y = mouse_event.row;
-            
-            if app.state.folders_area.contains(ratatui::layout::Position::new(x, y)) {
+
+            if app
+                .state
+                .folders_area
+                .contains(ratatui::layout::Position::new(x, y))
+            {
                 app.state.focused_panel = state::FocusedPanel::Folders;
-                
+
                 let (visible_folders, _, _) = app.state.get_visible_folders();
                 if !visible_folders.is_empty() {
                     let border = 2;
                     let usable_width = app.state.folders_area.width.saturating_sub(border);
                     let segment_width = usable_width / visible_folders.len() as u16;
-                    
+
                     let relative_x = x.saturating_sub(app.state.folders_area.x + 1);
                     let clicked_visible_index = (relative_x / segment_width.max(1)) as usize;
-                    
+
                     if clicked_visible_index < visible_folders.len() {
                         let folder_idx = app.state.folder_scroll_offset + clicked_visible_index;
                         app.state.select_folder(folder_idx);
@@ -560,15 +608,19 @@ async fn handle_mouse_event(
                         }
                     }
                 }
-            } else if app.state.chats_area.contains(ratatui::layout::Position::new(x, y)) {
+            } else if app
+                .state
+                .chats_area
+                .contains(ratatui::layout::Position::new(x, y))
+            {
                 app.state.focused_panel = state::FocusedPanel::Chats;
-                
+
                 if !app.state.chats.is_empty() {
                     let border_offset = 1;
                     let relative_y = y.saturating_sub(app.state.chats_area.y + border_offset);
                     let height_per_chat = 2;
                     let clicked_chat = (relative_y / height_per_chat) as usize;
-                    
+
                     if clicked_chat < app.state.chats.len() {
                         app.state.select_chat(clicked_chat);
                         let chat_id = app.state.chats[clicked_chat].id;
@@ -576,14 +628,22 @@ async fn handle_mouse_event(
                         app.state.selected_message_index = 0;
                     }
                 }
-            } else if app.state.messages_area.contains(ratatui::layout::Position::new(x, y)) {
+            } else if app
+                .state
+                .messages_area
+                .contains(ratatui::layout::Position::new(x, y))
+            {
                 app.state.focused_panel = state::FocusedPanel::Messages;
-            } else if app.state.input_area.contains(ratatui::layout::Position::new(x, y)) {
+            } else if app
+                .state
+                .input_area
+                .contains(ratatui::layout::Position::new(x, y))
+            {
                 app.state.focused_panel = state::FocusedPanel::Input;
             }
         }
         _ => {}
     }
-    
+
     Ok(())
 }

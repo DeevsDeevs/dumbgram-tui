@@ -39,7 +39,7 @@ impl Default for Config {
 
 pub fn load_config() -> Result<Config> {
     let config_path = get_config_path()?;
-    
+
     if !config_path.exists() {
         return Ok(Config::default());
     }

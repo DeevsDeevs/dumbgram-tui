@@ -1,10 +1,10 @@
+use chrono::{DateTime, Utc};
+use color_eyre::Result;
 use grammers_client::{Client, Config, InitParams, InputMessage};
 use grammers_session::Session;
-use color_eyre::Result;
-use tokio::sync::mpsc;
-use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 use super::client::TelegramClient;
 use super::types::{Chat, Folder, Message, MessageStatus, Update};
@@ -18,7 +18,7 @@ pub struct GrammersClient {
 impl GrammersClient {
     pub async fn new(api_id: i32, api_hash: String, session_path: &str) -> Result<Self> {
         let session = Session::load_file_or_create(session_path)?;
-        
+
         let client = Client::connect(Config {
             session,
             api_id,
@@ -35,7 +35,7 @@ impl GrammersClient {
         })
         .await?;
 
-        Ok(Self { 
+        Ok(Self {
             client,
             chat_cache: Arc::new(Mutex::new(HashMap::new())),
             session_path: session_path.to_string(),
@@ -45,16 +45,16 @@ impl GrammersClient {
     pub fn inner(&self) -> &Client {
         &self.client
     }
-    
+
     pub fn save_session(&self) -> Result<()> {
         self.client.session().save_to_file(&self.session_path)?;
         Ok(())
     }
-    
+
     fn get_chat(&self, chat_id: i64) -> Option<grammers_client::types::Chat> {
         self.chat_cache.lock().unwrap().get(&chat_id).cloned()
     }
-    
+
     fn cache_chat(&self, chat: grammers_client::types::Chat) {
         self.chat_cache.lock().unwrap().insert(chat.id(), chat);
     }
@@ -64,12 +64,11 @@ fn convert_message(msg: grammers_client::types::Message) -> Message {
     Message {
         id: msg.id(),
         chat_id: msg.chat().id(),
-        sender_name: msg.sender()
+        sender_name: msg
+            .sender()
             .map(|s| s.name().to_string())
             .unwrap_or_else(|| "Unknown".to_string()),
-        sender_id: msg.sender()
-            .map(|s| s.id())
-            .unwrap_or(0),
+        sender_id: msg.sender().map(|s| s.id()).unwrap_or(0),
         content: msg.text().to_string(),
         timestamp: msg.date(),
         is_own: msg.outgoing(),
@@ -98,16 +97,19 @@ impl TelegramClient for GrammersClient {
     }
 
     async fn send_message(&self, chat_id: i64, content: String) -> Result<Message> {
-        let chat = self.get_chat(chat_id)
+        let chat = self
+            .get_chat(chat_id)
             .ok_or_else(|| color_eyre::eyre::eyre!("Chat not found in cache"))?;
-        let msg = self.client
+        let msg = self
+            .client
             .send_message(chat, InputMessage::text(content))
             .await?;
         Ok(convert_message(msg))
     }
 
     async fn edit_message(&self, chat_id: i64, message_id: i32, content: String) -> Result<()> {
-        let chat = self.get_chat(chat_id)
+        let chat = self
+            .get_chat(chat_id)
             .ok_or_else(|| color_eyre::eyre::eyre!("Chat not found in cache"))?;
         self.client
             .edit_message(chat, message_id, InputMessage::text(content))
@@ -121,7 +123,8 @@ impl TelegramClient for GrammersClient {
         reply_to: i32,
         content: String,
     ) -> Result<Message> {
-        let chat = self.get_chat(chat_id)
+        let chat = self
+            .get_chat(chat_id)
             .ok_or_else(|| color_eyre::eyre::eyre!("Chat not found in cache"))?;
         let input = InputMessage::text(content).reply_to(Some(reply_to));
         let msg = self.client.send_message(chat, input).await?;
@@ -129,14 +132,16 @@ impl TelegramClient for GrammersClient {
     }
 
     async fn delete_message(&self, chat_id: i64, message_id: i32) -> Result<()> {
-        let chat = self.get_chat(chat_id)
+        let chat = self
+            .get_chat(chat_id)
             .ok_or_else(|| color_eyre::eyre::eyre!("Chat not found in cache"))?;
         self.client.delete_messages(chat, &[message_id]).await?;
         Ok(())
     }
 
     async fn get_messages(&self, chat_id: i64, limit: usize) -> Result<Vec<Message>> {
-        let chat = self.get_chat(chat_id)
+        let chat = self
+            .get_chat(chat_id)
             .ok_or_else(|| color_eyre::eyre::eyre!("Chat not found in cache"))?;
         let mut iter = self.client.iter_messages(chat);
         let mut messages = Vec::new();
@@ -159,13 +164,14 @@ impl TelegramClient for GrammersClient {
         while let Some(dialog) = iter.next().await? {
             let chat = dialog.chat();
             self.cache_chat(chat.clone());
-            
+
             chats.push(Chat {
                 id: chat.id(),
                 name: chat.name().to_string(),
-                last_message: dialog.last_message.as_ref().map(|m| {
-                    m.text().chars().take(50).collect()
-                }),
+                last_message: dialog
+                    .last_message
+                    .as_ref()
+                    .map(|m| m.text().chars().take(50).collect()),
                 unread_count: 0,
                 is_group: matches!(chat, grammers_client::types::Chat::Group(_)),
                 folder_id: None,
@@ -186,7 +192,7 @@ impl TelegramClient for GrammersClient {
     async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
         let (tx, rx) = mpsc::unbounded_channel();
         let client = self.client.clone();
-        
+
         tokio::spawn(async move {
             loop {
                 match client.next_update().await {
@@ -206,17 +212,16 @@ impl TelegramClient for GrammersClient {
                                     new_content: msg.text().to_string(),
                                 })
                             }
-                            grammers_client::Update::MessageDeleted(deletion) => {
-                                deletion.messages().first().map(|msg_id| {
-                                    Update::DeleteMessage {
-                                        chat_id: 0,
-                                        message_id: *msg_id,
-                                    }
-                                })
-                            }
+                            grammers_client::Update::MessageDeleted(deletion) => deletion
+                                .messages()
+                                .first()
+                                .map(|msg_id| Update::DeleteMessage {
+                                    chat_id: 0,
+                                    message_id: *msg_id,
+                                }),
                             _ => None,
                         };
-                        
+
                         if let Some(update) = our_update {
                             if tx.send(update).is_err() {
                                 break;
@@ -230,7 +235,7 @@ impl TelegramClient for GrammersClient {
                 }
             }
         });
-        
+
         Ok(rx)
     }
 }

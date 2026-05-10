@@ -2,8 +2,8 @@ use super::client::TelegramClient;
 use super::types::{Chat, Folder, Message, MessageStatus, Update};
 use chrono::Utc;
 use color_eyre::Result;
-use tokio::sync::mpsc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 pub struct MockTelegramClient {
     connected: bool,
@@ -310,7 +310,12 @@ impl TelegramClient for MockTelegramClient {
         Ok(())
     }
 
-    async fn reply_to_message(&self, chat_id: i64, reply_to: i32, content: String) -> Result<Message> {
+    async fn reply_to_message(
+        &self,
+        chat_id: i64,
+        reply_to: i32,
+        content: String,
+    ) -> Result<Message> {
         Ok(Message {
             id: 1000,
             chat_id,
@@ -335,14 +340,14 @@ impl TelegramClient for MockTelegramClient {
 
     async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
         let (tx, rx) = mpsc::unbounded_channel();
-        
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             let mut counter = 0;
             loop {
                 interval.tick().await;
                 counter += 1;
-                
+
                 let update = match counter % 3 {
                     0 => Update::NewMessage(Message {
                         id: 2000 + counter,
@@ -363,7 +368,10 @@ impl TelegramClient for MockTelegramClient {
                     1 => Update::EditMessage {
                         chat_id: 1,
                         message_id: 1,
-                        new_content: format!("Updated content at {}", Utc::now().format("%H:%M:%S")),
+                        new_content: format!(
+                            "Updated content at {}",
+                            Utc::now().format("%H:%M:%S")
+                        ),
                     },
                     _ => Update::TypingStatus {
                         chat_id: 1,
@@ -371,13 +379,13 @@ impl TelegramClient for MockTelegramClient {
                         is_typing: true,
                     },
                 };
-                
+
                 if tx.send(update).is_err() {
                     break;
                 }
             }
         });
-        
+
         Ok(rx)
     }
 }

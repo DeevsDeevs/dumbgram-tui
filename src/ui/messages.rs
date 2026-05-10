@@ -1,11 +1,11 @@
+use crate::{app::App, config::Theme, state::FocusedPanel, telegram::types::MessageStatus};
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
-    Frame,
 };
-use crate::{app::App, config::Theme, state::FocusedPanel, telegram::types::MessageStatus};
 
 pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
     let items: Vec<ListItem> = app
@@ -14,7 +14,7 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
         .iter()
         .map(|msg| {
             let time_str = msg.timestamp.format("%H:%M").to_string();
-            
+
             let status_icon = match msg.status {
                 MessageStatus::Sending => "⏱",
                 MessageStatus::Sent => "✓",
@@ -22,15 +22,15 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
                 MessageStatus::Read => "✓✓",
                 MessageStatus::Failed => "❌",
             };
-            
+
             let edited_indicator = if msg.is_edited { " [edited]" } else { "" };
-            
+
             let error_text = if let Some(err) = &msg.error {
                 format!(" ({})", err)
             } else {
                 String::new()
             };
-            
+
             let msg_color = if msg.status == MessageStatus::Failed {
                 ratatui::style::Color::Red
             } else if msg.is_own {
@@ -38,23 +38,29 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
             } else {
                 theme.other_message
             };
-            
+
             let main_line = Line::from(vec![
                 Span::styled(
                     format!("{}: ", msg.sender_name),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(&msg.content, Style::default().fg(msg_color)),
-                Span::raw(format!(" {}{} {}{}", time_str, edited_indicator, status_icon, error_text)),
+                Span::raw(format!(
+                    " {}{} {}{}",
+                    time_str, edited_indicator, status_icon, error_text
+                )),
             ]);
-            
+
             if let Some(reply_content) = &msg.reply_to_content {
-                let reply_line = Line::from(vec![
-                    Span::styled(
-                        format!("   └─ Reply: {}", reply_content.chars().take(40).collect::<String>()),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                let reply_line = Line::from(vec![Span::styled(
+                    format!(
+                        "   └─ Reply: {}",
+                        reply_content.chars().take(40).collect::<String>()
                     ),
-                ]);
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                )]);
                 ListItem::new(vec![main_line, reply_line])
             } else {
                 ListItem::new(main_line)
@@ -90,12 +96,16 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
     let selected_index = if app.state.messages.is_empty() {
         None
     } else {
-        Some(app.state.selected_message_index.min(app.state.messages.len().saturating_sub(1)))
+        Some(
+            app.state
+                .selected_message_index
+                .min(app.state.messages.len().saturating_sub(1)),
+        )
     };
-    
+
     let mut list_state = ListState::default().with_selected(selected_index);
     frame.render_stateful_widget(list, area, &mut list_state);
-    
+
     if app.state.confirm_delete_message_id.is_some() {
         let popup_area = centered_rect(60, 20, area);
         let confirmation = Paragraph::new(" Delete this message? (y/n) ")
@@ -115,7 +125,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_y) / 2),
         ])
         .split(r);
-    
+
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([

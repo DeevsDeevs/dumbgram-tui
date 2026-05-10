@@ -1,7 +1,7 @@
 use crate::telegram::types::{Chat, Folder, Message};
+use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
 use std::collections::HashMap;
-use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusedPanel {
@@ -63,20 +63,20 @@ impl AppState {
             typing_users: HashMap::new(),
         }
     }
-    
+
     pub fn get_visible_folders(&self) -> (Vec<&Folder>, bool, bool) {
         if self.folders.is_empty() {
             return (Vec::new(), false, false);
         }
-        
+
         let available_width = self.folders_area.width.saturating_sub(4);
         let mut visible_folders = Vec::new();
         let mut current_width = 0u16;
-        
+
         let has_left_scroll = self.folder_scroll_offset > 0;
         let scroll_indicator_width = if has_left_scroll { 3 } else { 0 };
         current_width += scroll_indicator_width;
-        
+
         for folder in self.folders.iter().skip(self.folder_scroll_offset) {
             let folder_width = folder.name.len() as u16 + 5;
             if current_width + folder_width + 3 > available_width {
@@ -85,43 +85,46 @@ impl AppState {
             visible_folders.push(folder);
             current_width += folder_width;
         }
-        
-        let has_right_scroll = self.folder_scroll_offset + visible_folders.len() < self.folders.len();
+
+        let has_right_scroll =
+            self.folder_scroll_offset + visible_folders.len() < self.folders.len();
         (visible_folders, has_left_scroll, has_right_scroll)
     }
-    
+
     pub fn scroll_folders_left(&mut self) {
         if self.folder_scroll_offset > 0 {
             self.folder_scroll_offset -= 1;
         }
     }
-    
+
     pub fn scroll_folders_right(&mut self) {
         let (visible, _, has_right) = self.get_visible_folders();
         if has_right && self.folder_scroll_offset + visible.len() < self.folders.len() {
             self.folder_scroll_offset += 1;
         }
     }
-    
+
     pub fn ensure_selected_folder_visible(&mut self) {
         if self.selected_folder_index < self.folder_scroll_offset {
             self.folder_scroll_offset = self.selected_folder_index;
         }
-        
+
         let (visible, _, _) = self.get_visible_folders();
         let max_visible_index = self.folder_scroll_offset + visible.len().saturating_sub(1);
         if self.selected_folder_index > max_visible_index {
-            self.folder_scroll_offset = self.selected_folder_index.saturating_sub(visible.len().saturating_sub(1));
+            self.folder_scroll_offset = self
+                .selected_folder_index
+                .saturating_sub(visible.len().saturating_sub(1));
         }
     }
-    
+
     pub fn select_folder(&mut self, index: usize) {
         if index < self.folders.len() {
             self.selected_folder_index = index;
             self.ensure_selected_folder_visible();
         }
     }
-    
+
     pub fn select_chat(&mut self, index: usize) {
         if index < self.chats.len() {
             self.selected_chat_index = index;
@@ -162,7 +165,8 @@ impl AppState {
 
     pub fn select_next_message(&mut self) {
         if !self.messages.is_empty() {
-            self.selected_message_index = (self.selected_message_index + 1).min(self.messages.len() - 1);
+            self.selected_message_index =
+                (self.selected_message_index + 1).min(self.messages.len() - 1);
         }
     }
 
@@ -223,7 +227,7 @@ impl AppState {
         self.error_message = None;
         self.error_timestamp = None;
     }
-    
+
     pub fn check_error_timeout(&mut self) {
         if let Some(timestamp) = self.error_timestamp {
             if Utc::now().signed_duration_since(timestamp).num_seconds() > 5 {

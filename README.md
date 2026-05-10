@@ -1,168 +1,147 @@
 # Dumbgram TUI
 
-A minimalist Telegram TUI client built with Rust, focusing on essential features without the bloat.
+Dumbgram TUI is a terminal Telegram client written in Rust. It focuses on a small, keyboard-friendly interface for reading chats and performing common message actions from the terminal.
 
-## 🎉 Current Status: Phase 3 Complete - REAL TELEGRAM INTEGRATION! 🎉
+The project currently provides a working Telegram integration through the Grammers client libraries and a Ratatui/Crossterm terminal UI.
 
-### What's Working
+## Features
 
-**Core Features:**
-- ✅ **Real Telegram API**: Fully integrated with grammers-client v0.7.0
-- ✅ **Authentication**: CLI-based login (phone → code → 2FA)
-- ✅ **Session Persistence**: Login once, reuse forever
-- ✅ **Send Messages**: Type and send to real Telegram chats
-- ✅ **Edit Messages**: Press `e` to edit your messages
-- ✅ **Delete Messages**: Press `d` then `y` to delete
-- ✅ **Reply to Messages**: Press `r` to reply
-- ✅ **Real-Time Updates**: Receive messages from other users instantly
-- ✅ **Chat Cache**: Smart caching for optimal performance
+- Telegram login with phone code and optional 2FA password.
+- Session persistence through a local `session.dat` file.
+- Chat list and message view backed by real Telegram data.
+- Send, edit, reply to, and delete messages.
+- Real-time update handling for incoming, edited, and deleted messages.
+- Keyboard and mouse navigation.
+- Configurable Telegram credentials through `config.toml`.
 
-**UI Features:**
-- ✅ **Modular Architecture**: Clean separation of concerns across modules
-- ✅ **Split-Panel Design**: Folders, chats, messages, and input
-- ✅ **Mouse Support**: Fully clickable UI for all interactions
-- ✅ **Keyboard Navigation**: Full arrow key and vim-like support
-- ✅ **Theme System**: Catppuccin Mocha color scheme
-- ✅ **Dynamic Content**: Real chat messages from Telegram
-- ✅ **Folder Filtering**: Single "All" folder (MVP approach)
+## Status
 
-### Project Structure
+This is early-stage software. The main chat and message flows work, but some Telegram and UI capabilities are intentionally limited while the client remains small and maintainable.
 
-```
-src/
-├── main.rs           # Entry point with event loop
-├── app.rs            # Application state & mode management
-├── state.rs          # Global app state
-├── telegram/
-│   ├── mod.rs
-│   ├── client.rs     # Telegram client trait
-│   ├── mock.rs       # Mock client implementation
-│   └── types.rs      # Data structures (Chat, Folder, Message)
-├── config/
-│   ├── mod.rs
-│   ├── parser.rs     # TOML configuration parsing
-│   ├── theme.rs      # Theme system
-│   └── defaults.rs   # Default values
-└── ui/
-    ├── mod.rs
-    ├── layout.rs     # Main layout orchestration
-    ├── folders.rs    # Folder tabs widget
-    ├── chats.rs      # Chat list widget
-    ├── messages.rs   # Message view widget
-    └── input.rs      # Input field widget
-```
+Known limitations:
 
-## Setup
+- Custom Telegram folders are not fully implemented; the primary view is the combined chat list.
+- Unread counts are not currently populated.
+- Media preview, downloads, search, and multiple account support are not implemented.
+- Message deletion updates may not include enough Telegram-side context to identify the chat in every case.
 
-### 1. Get Telegram API Credentials
+## Requirements
 
-1. Go to https://my.telegram.org
-2. Log in with your phone number
-3. Go to "API development tools"
-4. Create a new application
-5. Copy your `api_id` and `api_hash`
+- [Devbox](https://www.jetify.com/devbox/) for the development environment.
+- Telegram API credentials from <https://my.telegram.org>.
 
-### 2. Configure the App
+The repository includes `devbox.json` and `devbox.lock` so contributors can use the same Rust tooling without installing it globally.
+
+## Quick start
+
+Install the development environment:
 
 ```bash
-# Copy the example config
-cp config.example.toml config.toml
+devbox install
+```
 
-# Edit config.toml and add your credentials
+Create a local config file:
+
+```bash
+cp config.example.toml config.toml
+```
+
+Edit `config.toml` with your Telegram API credentials:
+
+```toml
 [telegram]
-api_id = YOUR_API_ID
-api_hash = "YOUR_API_HASH"
+api_id = 12345
+api_hash = "your_api_hash"
 session_file = "session.dat"
 ```
 
-### 3. Run the App
+Run the app:
 
 ```bash
-cargo run
+devbox run run
 ```
 
-**First run:** You'll be prompted for:
-- Phone number (with country code, e.g., +1234567890)
-- Verification code (sent via SMS or Telegram app)
-- 2FA password (if enabled)
+On the first run, Dumbgram TUI prompts for your phone number, verification code, and 2FA password if your Telegram account requires one. After a successful login, the Telegram session is saved locally and reused on later runs.
 
-**Subsequent runs:** Auto-login using saved session!
+## Development
 
-## Interactions
+Use Devbox for all project commands:
 
-### Mouse Support
-- **Click folder tabs** - Switch between folder views and load chats
-- **Click chat items** - Select chat and load messages
-- **Click input box** - Focus input and start typing
-- **Click anywhere** - Focus that panel
+```bash
+devbox run check       # Type-check the crate
+devbox run build       # Build the binary
+devbox run test        # Run tests
+devbox run fmt         # Format Rust source
+devbox run fmt:check   # Check Rust formatting
+devbox run clippy      # Run Clippy
+devbox run run         # Run the client
+```
 
-### Arrow Key Navigation (Primary)
-- **← →** (Left/Right) - Navigate between folders OR move focus between panels
-  - In Folders: Scroll through folder tabs (auto-scrolls if 20+ folders!)
-  - In Chats: Move focus left to Folders
-  - In Messages: Move focus left to Chats
-- **↑ ↓** (Up/Down) - Navigate items in current panel
-  - In Chats: Select different chat (loads messages automatically)
-  - In Messages: Scroll through messages
-  - In Folders: Move down to Chats panel
+You can also enter the environment interactively:
 
-### Scalable Folder Display
-- **Smart scrolling**: Folders auto-scroll to show current selection
-- **Visual indicators**: `◀ ▶` arrows show when more folders exist
-- **Works with 3 or 300 folders**: Handles any number gracefully
+```bash
+devbox shell
+```
 
-### Message Operations
-- **Select a message** - Use arrow keys to navigate
-- **`e`** - Edit selected message (your messages only)
-- **`r`** - Reply to selected message
-- **`d`** - Delete selected message (confirmation required)
-- **`y`** - Confirm deletion
-- **`n` or `Esc`** - Cancel deletion
+Minimum validation before submitting code changes:
 
-### Input Box Behavior
-When the input box is focused (highlighted border):
-- **Just start typing** - No need for special modes
-- `Enter` - Send message to current chat (sends to real Telegram!)
-- `Backspace` - Delete characters
-- `Esc` or `↑` - Exit input box, return to messages panel
+```bash
+devbox run fmt:check
+devbox run check
+devbox run clippy
+```
 
-### Additional Keyboard Shortcuts
-- `q` - Quit application
-- `Tab` - Cycle through panels (Folders → Chats → Messages → Input → Folders)
-- `</>` - Adjust split panel size
+## Project layout
 
-## Development Status
+```text
+src/
+├── main.rs             # Startup, login flow, terminal setup, event loop
+├── app.rs              # Application container and mode management
+├── state.rs            # UI state, focus, selection, input, transient errors
+├── config/             # TOML config loading and theme defaults
+├── telegram/           # Telegram trait, Grammers client, mock client, data types
+└── ui/                 # Ratatui layout and widgets
+```
 
-**Completed Phases:**
-- ✅ **Phase 1**: Foundation (TUI architecture, mock data)
-- ✅ **Phase 2**: Message Operations (send, edit, reply, delete with optimistic UI)
-- ✅ **Phase 3**: Real Telegram Integration (grammers-client, authentication, real-time updates)
+Additional files:
 
-**Future Enhancements:**
-- Custom folder support (beyond "All")
-- Unread message counts
-- Media preview/download
-- Search functionality
-- Multiple account support
+- `config.example.toml` — safe starter config.
+- `docs/config-schema.md` — expanded configuration schema notes.
+- `AGENTS.md` — contributor and coding-agent guidance.
+- `devbox.json` / `devbox.lock` — reproducible development environment.
 
-See [PHASE3_PLAN.md](PHASE3_PLAN.md) for detailed implementation notes.
+## Controls
 
-## Architecture Highlights
+General navigation:
 
-- **Trait-based Client**: Clean abstraction over grammers-client
-- **Chat Caching**: Smart HashMap-based cache for grammers API requirements
-- **Real-Time Updates**: Background tokio task with mpsc channel
-- **Optimistic UI**: Immediate feedback for message operations
-- **Session Persistence**: Login once, auto-reconnect on subsequent runs
-- **Immutable Widget Pattern**: Following ratatui best practices
-- **Mouse-First Design**: Full clickable UI with keyboard alternatives
-- **Area Tracking**: UI components track their screen regions for click detection
-- **Non-blocking Event Loop**: Uses `event::poll()` for responsive updates
+- `q` — quit.
+- `Tab` — cycle focus through folders, chats, messages, and input.
+- Arrow keys — move selection or focus depending on the active panel.
+- `<` / `>` — adjust the split between chat list and message view.
 
-## Known Limitations
+Message actions:
 
-- **Unread Counts**: Not available (grammers Dialog API limitation)
-- **Custom Folders**: Only "All" folder supported (MVP approach)
-- **Delete Message Chat ID**: Always 0 due to grammers MessageDeletion limitation
+- `Enter` in the input panel — send the current message.
+- `e` on a selected message — edit the message when allowed.
+- `r` on a selected message — reply to the message.
+- `d` on a selected message — request deletion.
+- `y` / `n` — confirm or cancel deletion.
+- `Esc` — leave input mode or cancel pending actions.
 
-These are API limitations, not bugs. The app works perfectly within these constraints!
+Mouse support is available for selecting folders, chats, messages, and the input area.
+
+## Configuration and secrets
+
+Local runtime files are intentionally ignored by Git:
+
+- `config.toml`
+- `session.dat`
+- `*.dat`
+- `target/`
+- `.devbox/`
+
+Do not commit Telegram API credentials or session files. If a session file is exposed, revoke the session from Telegram and regenerate local credentials as needed.
+
+## License
+
+No license file is currently included. Add one before distributing or accepting external contributions.

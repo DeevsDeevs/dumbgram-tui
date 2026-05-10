@@ -1,13 +1,13 @@
+use crate::{app::App, config::Theme, state::FocusedPanel};
 use ratatui::{
+    Frame,
     style::Style,
     widgets::{Block, Borders, Paragraph},
-    Frame,
 };
-use crate::{app::App, config::Theme, state::FocusedPanel};
 
 pub fn render_input(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
     let is_focused = app.state.focused_panel == FocusedPanel::Input;
-    
+
     let title = if let Some(msg_id) = app.state.editing_message_id {
         format!(" Editing message #{} ", msg_id)
     } else if let Some(reply_id) = app.state.replying_to_message_id {
@@ -22,7 +22,7 @@ pub fn render_input(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, t
     } else {
         " Input ".to_string()
     };
-    
+
     let paragraph = Paragraph::new(app.state.input_buffer.as_str())
         .block(
             Block::default()

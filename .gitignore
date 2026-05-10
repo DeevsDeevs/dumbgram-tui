@@ -13,6 +13,12 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Local Devbox state
+.devbox/
+
+# Local agent/mission state
+.missions/
+
 # Config and session files
 config.toml
 session.dat
