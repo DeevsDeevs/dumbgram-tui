@@ -3,7 +3,7 @@ use crate::{
     app::App,
     config::Theme,
     state::FocusedPanel,
-    telegram::types::MessageStatus,
+    telegram::types::{MessageStatus, message_display_content},
     text::{display_width, truncate_with_ellipsis},
 };
 use ratatui::{
@@ -59,13 +59,16 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
                 let content_width = text_width
                     .saturating_sub(display_width(&sender) + display_width(&metadata))
                     .max(1);
-                let content = truncate_with_ellipsis(&msg.content, content_width);
+                let display_content = message_display_content(msg.media.as_ref(), &msg.content);
+                let content = truncate_with_ellipsis(&display_content, content_width);
 
-                let main_line = Line::from(vec![
-                    Span::styled(sender, Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(content, Style::default().fg(msg_color)),
-                    Span::raw(metadata),
-                ]);
+                let mut main_spans = vec![Span::styled(
+                    sender,
+                    Style::default().add_modifier(Modifier::BOLD),
+                )];
+                main_spans.extend(message_content_spans(&content, msg_color));
+                main_spans.push(Span::raw(metadata));
+                let main_line = Line::from(main_spans);
 
                 if let Some(reply_content) = &msg.reply_to_content {
                     let reply_line = Line::from(vec![Span::styled(
@@ -169,7 +172,37 @@ fn reply_content_width(text_width: usize) -> usize {
     )
 }
 
-fn message_metadata(
+pub(crate) fn message_content_spans(content: &str, default_color: Color) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for link in crate::links::links_in_text(content) {
+        if cursor < link.start {
+            spans.push(Span::styled(
+                content[cursor..link.start].to_string(),
+                Style::default().fg(default_color),
+            ));
+        }
+        spans.push(Span::styled(
+            content[link.start..link.end].to_string(),
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::UNDERLINED),
+        ));
+        cursor = link.end;
+    }
+    if cursor < content.len() {
+        spans.push(Span::styled(
+            content[cursor..].to_string(),
+            Style::default().fg(default_color),
+        ));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled("", Style::default().fg(default_color)));
+    }
+    spans
+}
+
+pub(crate) fn message_metadata(
     time_str: &str,
     is_edited: bool,
     status_label: &str,
@@ -279,9 +312,9 @@ mod tests {
         DELETE_CONFIRMATION_POPUP_HEIGHT_PERCENT, DELETE_CONFIRMATION_POPUP_WIDTH_PERCENT,
         DELETE_CONFIRMATION_TEXT, DELETE_CONFIRMATION_TITLE, MESSAGE_EMPTY_NO_CHAT_LABEL,
         MESSAGE_EMPTY_NO_MESSAGES_LABEL, MESSAGE_TITLE_BORDER_RESERVED_COLUMNS, REPLY_LINE_PREFIX,
-        REPLY_MARKER, REPLY_MARKER_SEPARATOR, display_width, message_empty_placeholder,
-        message_metadata, message_panel_title, message_position_label, message_status_label,
-        message_title_width, reply_content_width, typing_label,
+        REPLY_MARKER, REPLY_MARKER_SEPARATOR, display_width, message_content_spans,
+        message_empty_placeholder, message_metadata, message_panel_title, message_position_label,
+        message_status_label, message_title_width, reply_content_width, typing_label,
     };
     use crate::telegram::types::MessageStatus;
 
@@ -364,6 +397,26 @@ mod tests {
         assert_eq!(metadata, " 12:34 · edited · read · error: network down");
         assert!(!metadata.contains("[edited]"));
         assert!(!metadata.contains(" | "));
+    }
+
+    #[test]
+    fn message_content_spans_style_urls_without_changing_text() {
+        let spans =
+            message_content_spans("see https://example.org now", ratatui::style::Color::Gray);
+        let rendered = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(rendered, "see https://example.org now");
+        assert!(spans.iter().any(|span| {
+            span.content.as_ref() == "https://example.org"
+                && span.style.fg == Some(ratatui::style::Color::Blue)
+                && span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+        }));
     }
 
     #[test]

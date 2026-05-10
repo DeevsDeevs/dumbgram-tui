@@ -36,6 +36,9 @@ pub(crate) const HELP_BAR_HEIGHT: u16 = 1;
 pub(crate) const HIDE_HELP_CONTROL_LABEL: &str = "? hide help";
 pub(crate) const BANNER_HEIGHT: u16 = 3;
 pub(crate) const FOLDERS_PANEL_HEIGHT: u16 = 3;
+pub(crate) const IMAGE_VIEWPORT_TITLE: &str = "Image preview";
+pub(crate) const IMAGE_VIEWPORT_MIN_WIDTH: u16 = 24;
+pub(crate) const IMAGE_VIEWPORT_MAX_WIDTH: u16 = 48;
 const SLOW_RENDER_LOG_THRESHOLD_MS: u128 = 100;
 
 pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
@@ -81,14 +84,18 @@ pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
         ])
         .split(horizontal_chunks[0]);
 
+    let (messages_area, image_area) = message_and_image_areas(horizontal_chunks[1], app);
+
     app.state.folders_area = left_chunks[0];
     app.state.chats_area = left_chunks[1];
-    app.state.messages_area = horizontal_chunks[1];
+    app.state.messages_area = messages_area;
+    app.state.terminal_image_area = image_area;
     app.state.input_area = main_chunks[1];
 
     render_folders(frame, left_chunks[0], app, theme);
     render_chats(frame, left_chunks[1], app, theme);
-    render_messages(frame, horizontal_chunks[1], app, theme);
+    render_messages(frame, messages_area, app, theme);
+    render_image_viewport(frame, image_area, theme);
     render_input(frame, main_chunks[1], app, theme);
     if show_help_bar {
         render_help_bar(frame, main_chunks[2], app, theme);
@@ -119,6 +126,38 @@ pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
             );
         }
     }
+}
+
+fn message_and_image_areas(area: Rect, app: &App) -> (Rect, Rect) {
+    let has_selected_local_image = app
+        .state
+        .selected_message()
+        .and_then(|message| message.media.as_ref())
+        .and_then(|media| media.local_image_path())
+        .is_some();
+    if !has_selected_local_image || area.width < IMAGE_VIEWPORT_MIN_WIDTH * 2 {
+        return (area, Rect::default());
+    }
+
+    let image_width = (area.width / 3).clamp(IMAGE_VIEWPORT_MIN_WIDTH, IMAGE_VIEWPORT_MAX_WIDTH);
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(image_width)])
+        .split(area);
+    (chunks[0], chunks[1])
+}
+
+fn render_image_viewport(frame: &mut Frame, area: Rect, theme: &Theme) {
+    if area.is_empty() {
+        return;
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border))
+        .title(IMAGE_VIEWPORT_TITLE)
+        .style(Style::default().bg(theme.background));
+    frame.render_widget(block, area);
 }
 
 fn render_help_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -231,7 +270,7 @@ fn help_bar_controls(app: &App) -> String {
             "Down chats",
             "Tab focus",
             "q quit",
-            "</> split",
+            "< > resize",
             HIDE_HELP_CONTROL_LABEL,
         ])
     } else if app.state.focused_panel == FocusedPanel::Chats {
@@ -249,7 +288,7 @@ fn help_bar_controls(app: &App) -> String {
             "Left folders",
             "Tab focus",
             "q quit",
-            "</> split",
+            "< > resize",
             HIDE_HELP_CONTROL_LABEL,
         ]);
         join_help_controls(&controls)
@@ -261,7 +300,7 @@ fn help_bar_controls(app: &App) -> String {
             "Left chats",
             "Tab focus",
             "q quit",
-            "</> split",
+            "< > resize",
             HIDE_HELP_CONTROL_LABEL,
         ])
     } else if app.state.focused_panel == FocusedPanel::Messages
@@ -276,7 +315,7 @@ fn help_bar_controls(app: &App) -> String {
             "Left chats",
             "Tab focus",
             "q quit",
-            "</> split",
+            "< > resize",
             HIDE_HELP_CONTROL_LABEL,
         ])
     } else if app.state.focused_panel == FocusedPanel::Messages
@@ -291,7 +330,7 @@ fn help_bar_controls(app: &App) -> String {
             "Left chats",
             "Tab focus",
             "q quit",
-            "</> split",
+            "< > resize",
             HIDE_HELP_CONTROL_LABEL,
         ])
     } else if app.state.focused_panel == FocusedPanel::Messages {
@@ -307,7 +346,7 @@ fn help_bar_controls(app: &App) -> String {
                 ])
             })
     } else {
-        join_help_controls(&["q quit", "Tab focus", "</> split", HIDE_HELP_CONTROL_LABEL])
+        join_help_controls(&["q quit", "Tab focus", "< > resize", HIDE_HELP_CONTROL_LABEL])
     }
 }
 
@@ -337,6 +376,10 @@ fn selected_message_help_controls(state: &AppState, message: &Message) -> String
 
     controls.push("r reply");
 
+    if crate::links::first_url(&message.content).is_some() {
+        controls.push("o open link");
+    }
+
     if message.is_own && message.can_delete {
         controls.push("d delete");
     }
@@ -345,7 +388,7 @@ fn selected_message_help_controls(state: &AppState, message: &Message) -> String
         "Left chats",
         "Tab focus",
         "q quit",
-        "</> split",
+        "< > resize",
         HIDE_HELP_CONTROL_LABEL,
     ]);
     join_help_controls(&controls)
@@ -387,16 +430,18 @@ fn render_status_banner(frame: &mut Frame, area: Rect, status: &str, theme: &The
 mod tests {
     use super::{
         BANNER_HEIGHT, ERROR_BANNER_PREFIX, FOCUS_LABEL_PREFIX, FOLDERS_PANEL_HEIGHT,
-        HELP_BAR_HEIGHT, HELP_SEPARATOR, INPUT_PANEL_HEIGHT, LEGACY_HELP_SEPARATOR,
-        MAIN_CONTENT_MIN_HEIGHT, STATUS_BANNER_PREFIX, help_bar_controls,
+        HELP_BAR_HEIGHT, HELP_SEPARATOR, IMAGE_VIEWPORT_MIN_WIDTH, IMAGE_VIEWPORT_TITLE,
+        INPUT_PANEL_HEIGHT, LEGACY_HELP_SEPARATOR, MAIN_CONTENT_MIN_HEIGHT, STATUS_BANNER_PREFIX,
+        help_bar_controls,
     };
     use crate::app::App;
     use crate::state::{DeleteConfirmation, FocusedPanel};
     use crate::telegram::types::{
-        Chat, Folder, Message, MessageStatus, OWN_SENDER_NAME, all_folder,
+        Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, all_folder,
     };
     use crate::ui::render_app_to_string_for_test;
     use chrono::Utc;
+    use ratatui::layout::Rect;
 
     fn folder(id: i32, name: &str) -> Folder {
         Folder {
@@ -427,6 +472,7 @@ mod tests {
             is_own: true,
             is_edited: false,
             reply_to_content: None,
+            media: None,
             status,
             can_edit: false,
             can_delete: false,
@@ -452,6 +498,39 @@ mod tests {
         assert_eq!(HELP_BAR_HEIGHT, 1);
         assert_eq!(BANNER_HEIGHT, 3);
         assert_eq!(FOLDERS_PANEL_HEIGHT, 3);
+        assert_eq!(IMAGE_VIEWPORT_MIN_WIDTH, 24);
+    }
+
+    #[test]
+    fn image_viewport_splits_messages_to_right_only_for_selected_local_image() {
+        let full_area = Rect::new(0, 0, 120, 30);
+        let mut app = App::new();
+
+        let (messages_area, image_area) = super::message_and_image_areas(full_area, &app);
+        assert_eq!(messages_area, full_area);
+        assert!(image_area.is_empty());
+
+        app.state.messages = vec![message_with_status(MessageStatus::Delivered)];
+        app.state.messages[0].media = Some(MessageMedia::photo().with_local_path("/tmp/photo.jpg"));
+        let (messages_area, image_area) = super::message_and_image_areas(full_area, &app);
+
+        assert!(messages_area.width < full_area.width);
+        assert!(!image_area.is_empty());
+        assert_eq!(image_area.x, messages_area.x + messages_area.width);
+    }
+
+    #[test]
+    fn layout_renders_image_viewport_without_covering_message_list() {
+        let mut app = App::new();
+        app.state.chats = vec![chat(10, "Media")];
+        app.state.messages = vec![message_with_status(MessageStatus::Delivered)];
+        app.state.messages[0].media = Some(MessageMedia::photo().with_local_path("/tmp/photo.jpg"));
+
+        let rendered = render_app_to_string_for_test(&mut app);
+
+        assert!(rendered.contains(IMAGE_VIEWPORT_TITLE));
+        assert!(!app.state.terminal_image_area.is_empty());
+        assert!(app.state.messages_area.width < app.state.terminal_image_area.x);
     }
 
     #[test]
@@ -684,20 +763,20 @@ mod tests {
         folders.state.focused_panel = FocusedPanel::Folders;
         assert_eq!(
             help_bar_controls(&folders),
-            "Folders: no other folders · Down chats · Tab focus · q quit · </> split · ? hide help"
+            "Folders: no other folders · Down chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         folders.state.folders = vec![all_folder(0), folder(2, "Work")];
         assert_eq!(
             help_bar_controls(&folders),
-            "Folders: Left/Right switch · Down chats · Tab focus · q quit · </> split · ? hide help"
+            "Folders: Left/Right switch · Down chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         let mut chats = App::new();
         chats.state.focused_panel = FocusedPanel::Chats;
         assert_eq!(
             help_bar_controls(&chats),
-            "Chats: no other chats · Right messages · Left folders · Tab focus · q quit · </> split · ? hide help"
+            "Chats: no other chats · Right messages · Left folders · Tab focus · q quit · < > resize · ? hide help"
         );
 
         chats.state.chats = vec![crate::telegram::types::Chat {
@@ -710,7 +789,7 @@ mod tests {
         }];
         assert_eq!(
             help_bar_controls(&chats),
-            "Chats: no other chats · Right messages · Left folders · Tab focus · q quit · </> split · ? hide help"
+            "Chats: no other chats · Right messages · Left folders · Tab focus · q quit · < > resize · ? hide help"
         );
 
         chats.state.chats.push(crate::telegram::types::Chat {
@@ -723,7 +802,7 @@ mod tests {
         });
         assert_eq!(
             help_bar_controls(&chats),
-            "Chats: Up/Down choose · letters jump · Right messages · Left folders · Tab focus · q quit · </> split · ? hide help"
+            "Chats: Up/Down choose · letters jump · Right messages · Left folders · Tab focus · q quit · < > resize · ? hide help"
         );
     }
 
@@ -734,7 +813,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&app),
-            "Messages: no message selected · Left chats · Tab focus · q quit · </> split · ? hide help"
+            "Messages: no message selected · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
     }
 
@@ -746,7 +825,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&app),
-            "Sending: waiting for Telegram · edit/delete/reply disabled · Left chats · Tab focus · q quit · </> split · ? hide help"
+            "Sending: waiting for Telegram · edit/delete/reply disabled · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
     }
 
@@ -758,7 +837,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&app),
-            "Failed send: d dismiss · Input restored: Enter retry · Left chats · Tab focus · q quit · </> split · ? hide help"
+            "Failed send: d dismiss · Input restored: Enter retry · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
     }
 
@@ -770,7 +849,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&reply_only),
-            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · Left chats · Tab focus · q quit · </> split · ? hide help"
+            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         reply_only
@@ -780,7 +859,7 @@ mod tests {
         reply_only.state.selected_message_index = 1;
         assert_eq!(
             help_bar_controls(&reply_only),
-            "Messages: Up/Pg/Home/End move · Down input · r reply · Left chats · Tab focus · q quit · </> split · ? hide help"
+            "Messages: Up/Pg/Home/End move · Down input · r reply · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         reply_only
@@ -790,7 +869,7 @@ mod tests {
         reply_only.state.selected_message_index = 1;
         assert_eq!(
             help_bar_controls(&reply_only),
-            "Messages: Up/Down/Pg/Home/End move · r reply · Left chats · Tab focus · q quit · </> split · ? hide help"
+            "Messages: Up/Down/Pg/Home/End move · r reply · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         let mut full_actions = App::new();
@@ -801,7 +880,17 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&full_actions),
-            "Messages: Up/PgUp older · Down input · Pg/Home/End move · e edit · r reply · d delete · Left chats · Tab focus · q quit · </> split · ? hide help"
+            "Messages: Up/PgUp older · Down input · Pg/Home/End move · e edit · r reply · d delete · Left chats · Tab focus · q quit · < > resize · ? hide help"
+        );
+
+        let mut link_actions = App::new();
+        link_actions.state.focused_panel = FocusedPanel::Messages;
+        link_actions.state.messages = vec![message_with_status(MessageStatus::Sent)];
+        link_actions.state.messages[0].content = "open https://example.org".to_string();
+
+        assert_eq!(
+            help_bar_controls(&link_actions),
+            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · o open link · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
     }
 
@@ -815,7 +904,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&app),
-            "Messages: no older history · Down input · Pg/Home/End move · r reply · Left chats · Tab focus · q quit · </> split · ? hide help"
+            "Messages: no older history · Down input · Pg/Home/End move · r reply · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
     }
 }

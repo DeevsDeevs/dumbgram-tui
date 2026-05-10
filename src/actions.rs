@@ -802,6 +802,7 @@ mod tests {
             is_own: true,
             is_edited: false,
             reply_to_content: None,
+            media: None,
             status: MessageStatus::Delivered,
             can_edit: true,
             can_delete: true,

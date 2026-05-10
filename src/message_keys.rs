@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKeyOutcome {
     Handled,
+    OpenSelectedLink,
     Ignored,
 }
 
@@ -30,6 +31,7 @@ pub fn handle_message_key(state: &mut AppState, key: KeyEvent) -> MessageKeyOutc
         KeyCode::Char('e') => state.request_edit_selected_message(),
         KeyCode::Char('r') => state.request_reply_to_selected_message(),
         KeyCode::Char('d') => state.request_delete_selected_message(),
+        KeyCode::Char('o') => return MessageKeyOutcome::OpenSelectedLink,
         _ => return MessageKeyOutcome::Ignored,
     }
 
@@ -58,6 +60,7 @@ mod tests {
             is_own: true,
             is_edited: false,
             reply_to_content: None,
+            media: None,
             status: MessageStatus::Sent,
             can_edit: true,
             can_delete: true,
@@ -127,6 +130,11 @@ mod tests {
         );
 
         state.focused_panel = FocusedPanel::Messages;
+        assert_eq!(
+            handle_message_key(&mut state, key(KeyCode::Char('o'))),
+            MessageKeyOutcome::OpenSelectedLink
+        );
+
         assert_eq!(
             handle_message_key(&mut state, key(KeyCode::Char('x'))),
             MessageKeyOutcome::Ignored

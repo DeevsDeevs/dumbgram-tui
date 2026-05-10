@@ -1,5 +1,6 @@
 use crate::text::truncate_with_ellipsis;
 use chrono::{DateTime, Utc};
+use std::path::PathBuf;
 
 pub const LAST_MESSAGE_PREVIEW_WIDTH: usize = 50;
 pub const UNKNOWN_DELETE_UPDATE_CHAT_ID: i64 = 0;
@@ -10,6 +11,19 @@ pub const UNKNOWN_SENDER_NAME: &str = "Unknown";
 
 pub fn message_preview(content: &str) -> String {
     truncate_with_ellipsis(content, LAST_MESSAGE_PREVIEW_WIDTH)
+}
+
+pub fn message_display_content(media: Option<&MessageMedia>, content: &str) -> String {
+    let has_text = !content.trim().is_empty();
+    match (media, has_text) {
+        (Some(media), false) => media.label.clone(),
+        (Some(media), true) => format!("{} {content}", media.label),
+        (None, _) => content.to_string(),
+    }
+}
+
+pub fn message_display_preview(media: Option<&MessageMedia>, content: &str) -> String {
+    message_preview(&message_display_content(media, content))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +55,53 @@ pub enum Update {
     Error(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageMediaKind {
+    Photo,
+    Image,
+    Sticker,
+    Video,
+    Document,
+    WebPage,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageMedia {
+    pub kind: MessageMediaKind,
+    pub label: String,
+    pub local_path: Option<PathBuf>,
+}
+
+impl MessageMedia {
+    pub fn new(kind: MessageMediaKind, label: impl Into<String>) -> Self {
+        Self {
+            kind,
+            label: label.into(),
+            local_path: None,
+        }
+    }
+
+    pub fn photo() -> Self {
+        Self::new(MessageMediaKind::Photo, "[photo]")
+    }
+
+    pub fn image() -> Self {
+        Self::new(MessageMediaKind::Image, "[image]")
+    }
+
+    pub fn with_local_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.local_path = Some(path.into());
+        self
+    }
+
+    pub fn local_image_path(&self) -> Option<&std::path::Path> {
+        matches!(self.kind, MessageMediaKind::Photo | MessageMediaKind::Image)
+            .then_some(self.local_path.as_deref())
+            .flatten()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Folder {
     pub id: i32,
@@ -68,6 +129,7 @@ pub struct Message {
     pub is_own: bool,
     pub is_edited: bool,
     pub reply_to_content: Option<String>,
+    pub media: Option<MessageMedia>,
     pub status: MessageStatus,
     pub can_edit: bool,
     pub can_delete: bool,
@@ -89,9 +151,9 @@ pub fn is_all_folder(folder: &Folder) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALL_FOLDER_ID, ALL_FOLDER_NAME, Folder, LAST_MESSAGE_PREVIEW_WIDTH, OWN_SENDER_NAME,
-        UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, all_folder, is_all_folder,
-        message_preview,
+        ALL_FOLDER_ID, ALL_FOLDER_NAME, Folder, LAST_MESSAGE_PREVIEW_WIDTH, MessageMedia,
+        OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, all_folder,
+        is_all_folder, message_display_content, message_display_preview, message_preview,
     };
     use crate::text::display_width;
 
@@ -138,6 +200,28 @@ mod tests {
         let text = "好".repeat(40);
         let preview = message_preview(&text);
 
+        assert!(preview.ends_with('…'));
+        assert!(display_width(&preview) <= LAST_MESSAGE_PREVIEW_WIDTH);
+    }
+
+    #[test]
+    fn message_display_content_includes_media_label_for_empty_or_captioned_media() {
+        let photo = MessageMedia::photo();
+
+        assert_eq!(message_display_content(Some(&photo), ""), "[photo]");
+        assert_eq!(
+            message_display_content(Some(&photo), "caption"),
+            "[photo] caption"
+        );
+        assert_eq!(message_display_content(None, "plain"), "plain");
+    }
+
+    #[test]
+    fn message_display_preview_truncates_media_caption() {
+        let photo = MessageMedia::photo();
+        let preview = message_display_preview(Some(&photo), &"好".repeat(40));
+
+        assert!(preview.starts_with("[photo] "));
         assert!(preview.ends_with('…'));
         assert!(display_width(&preview) <= LAST_MESSAGE_PREVIEW_WIDTH);
     }

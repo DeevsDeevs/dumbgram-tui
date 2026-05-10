@@ -97,6 +97,7 @@ mod tests {
             is_own: false,
             is_edited: false,
             reply_to_content: None,
+            media: None,
             status: MessageStatus::Read,
             can_edit: false,
             can_delete: false,

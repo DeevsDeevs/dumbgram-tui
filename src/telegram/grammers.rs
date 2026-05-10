@@ -2,16 +2,21 @@ use chrono::{DateTime, Utc};
 use color_eyre::Result;
 #[cfg(test)]
 use grammers_client::types::ChatMap;
-use grammers_client::{Client, Config, InitParams, InputMessage, grammers_tl_types as tl};
+use grammers_client::{
+    Client, Config, InitParams, InputMessage, grammers_tl_types as tl,
+    types::{Downloadable, photo_sizes::PhotoSize},
+};
 use grammers_session::Session;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::mpsc;
 
 use super::client::TelegramClient;
 use super::types::{
-    Chat, Folder, Message, MessageStatus, OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID,
-    UNKNOWN_SENDER_NAME, Update, all_folder, message_preview,
+    Chat, Folder, Message, MessageMedia, MessageMediaKind, MessageStatus, OWN_SENDER_NAME,
+    UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update, all_folder,
+    message_display_preview,
 };
 use crate::diagnostics;
 
@@ -28,6 +33,7 @@ pub struct GrammersClient {
     chat_cache: Arc<Mutex<ChatCache>>,
     dialog_filter_cache: Arc<Mutex<DialogFilterCache>>,
     session_path: String,
+    media_cache_dir: PathBuf,
 }
 
 impl GrammersClient {
@@ -47,6 +53,7 @@ impl GrammersClient {
             chat_cache: Arc::new(Mutex::new(HashMap::new())),
             dialog_filter_cache: Arc::new(Mutex::new(HashMap::new())),
             session_path: session_path.to_string(),
+            media_cache_dir: media_cache_dir(session_path),
         })
     }
 
@@ -152,6 +159,7 @@ fn message_sender_name(is_outgoing: bool, sender_name: Option<String>) -> String
 
 fn convert_message(msg: grammers_client::types::Message) -> Message {
     let is_outgoing = msg.outgoing();
+    let media = message_media(msg.media().as_ref());
     Message {
         id: msg.id(),
         chat_id: msg.chat().id(),
@@ -161,6 +169,7 @@ fn convert_message(msg: grammers_client::types::Message) -> Message {
         is_own: is_outgoing,
         is_edited: msg.edit_date().is_some(),
         reply_to_content: None,
+        media,
         status: if is_outgoing {
             MessageStatus::Sent
         } else {
@@ -170,6 +179,158 @@ fn convert_message(msg: grammers_client::types::Message) -> Message {
         can_delete: is_outgoing,
         error: None,
     }
+}
+
+fn media_cache_dir(session_path: &str) -> PathBuf {
+    let session_stem = Path::new(session_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("session");
+    std::env::temp_dir()
+        .join("dumbgram-tui-media")
+        .join(session_stem)
+}
+
+fn message_media(media: Option<&grammers_client::types::Media>) -> Option<MessageMedia> {
+    use grammers_client::types::Media;
+
+    match media? {
+        Media::Photo(_) => Some(MessageMedia::photo()),
+        Media::Document(document)
+            if document
+                .mime_type()
+                .is_some_and(|mime| mime.starts_with("image/")) =>
+        {
+            Some(MessageMedia::image())
+        }
+        Media::Document(document)
+            if document
+                .mime_type()
+                .is_some_and(|mime| mime.starts_with("video/")) =>
+        {
+            Some(MessageMedia::new(MessageMediaKind::Video, "[video]"))
+        }
+        Media::Sticker(_) => Some(MessageMedia::new(MessageMediaKind::Sticker, "[sticker]")),
+        Media::Document(_) => Some(MessageMedia::new(MessageMediaKind::Document, "[document]")),
+        Media::WebPage(_) => Some(MessageMedia::new(MessageMediaKind::WebPage, "[web page]")),
+        Media::Geo(_) => Some(MessageMedia::new(MessageMediaKind::Other, "[location]")),
+        Media::GeoLive(_) => Some(MessageMedia::new(
+            MessageMediaKind::Other,
+            "[live location]",
+        )),
+        Media::Contact(_) => Some(MessageMedia::new(MessageMediaKind::Other, "[contact]")),
+        Media::Poll(_) => Some(MessageMedia::new(MessageMediaKind::Other, "[poll]")),
+        Media::Dice(_) => Some(MessageMedia::new(MessageMediaKind::Other, "[dice]")),
+        Media::Venue(_) => Some(MessageMedia::new(MessageMediaKind::Other, "[venue]")),
+        _ => Some(MessageMedia::new(MessageMediaKind::Other, "[media]")),
+    }
+}
+
+async fn message_media_with_local_preview(
+    client: &Client,
+    cache_dir: &Path,
+    chat_id: i64,
+    message_id: i32,
+    media: Option<&grammers_client::types::Media>,
+) -> Option<MessageMedia> {
+    let mut message_media = message_media(media);
+    if let (Some(message_media), Some(media)) = (message_media.as_mut(), media)
+        && matches!(
+            message_media.kind,
+            MessageMediaKind::Photo | MessageMediaKind::Image
+        )
+    {
+        match download_media_thumbnail(client, cache_dir, chat_id, message_id, media).await {
+            Ok(Some(path)) => *message_media = message_media.clone().with_local_path(path),
+            Ok(None) => {}
+            Err(error) => diagnostics::event(
+                "media_preview_download_error",
+                format!("chat_id={chat_id} message_id={message_id} error={error}"),
+            ),
+        }
+    }
+    message_media
+}
+
+async fn download_media_thumbnail(
+    client: &Client,
+    cache_dir: &Path,
+    chat_id: i64,
+    message_id: i32,
+    media: &grammers_client::types::Media,
+) -> std::io::Result<Option<PathBuf>> {
+    let thumbnail = media_thumbnail(media);
+    let Some(thumbnail) = thumbnail else {
+        return Ok(None);
+    };
+
+    std::fs::create_dir_all(cache_dir)?;
+    let path = cache_dir.join(format!("chat-{chat_id}-message-{message_id}-thumb.jpg"));
+    if path.exists() {
+        return Ok(Some(path));
+    }
+
+    client
+        .download_media(&Downloadable::PhotoSize(thumbnail), &path)
+        .await?;
+    Ok(Some(path))
+}
+
+fn media_thumbnail(media: &grammers_client::types::Media) -> Option<PhotoSize> {
+    use grammers_client::types::Media;
+
+    let mut thumbs = match media {
+        Media::Photo(photo) => photo.thumbs(),
+        Media::Document(document) => document.thumbs(),
+        _ => Vec::new(),
+    };
+    thumbs.sort_by_key(PhotoSize::size);
+    thumbs.pop()
+}
+
+async fn convert_message_with_media_preview(
+    client: &Client,
+    media_cache_dir: &Path,
+    msg: grammers_client::types::Message,
+) -> Message {
+    let is_outgoing = msg.outgoing();
+    let media = msg.media();
+    let message_media = message_media_with_local_preview(
+        client,
+        media_cache_dir,
+        msg.chat().id(),
+        msg.id(),
+        media.as_ref(),
+    )
+    .await;
+
+    Message {
+        id: msg.id(),
+        chat_id: msg.chat().id(),
+        sender_name: message_sender_name(is_outgoing, msg.sender().map(|s| s.name().to_string())),
+        content: msg.text().to_string(),
+        timestamp: msg.date(),
+        is_own: is_outgoing,
+        is_edited: msg.edit_date().is_some(),
+        reply_to_content: None,
+        media: message_media,
+        status: if is_outgoing {
+            MessageStatus::Sent
+        } else {
+            MessageStatus::Delivered
+        },
+        can_edit: is_outgoing && is_within_edit_window(msg.date()),
+        can_delete: is_outgoing,
+        error: None,
+    }
+}
+
+fn message_preview_from_grammers_message(message: &grammers_client::types::Message) -> String {
+    message_display_preview(
+        message_media(message.media().as_ref()).as_ref(),
+        message.text(),
+    )
 }
 
 fn is_within_edit_window(date: DateTime<Utc>) -> bool {
@@ -237,12 +398,12 @@ fn raw_message_preview_for_dialog(
         tl::enums::Message::Message(message)
             if message.id == top_message_id && peers_match(&message.peer_id, peer) =>
         {
-            Some(message_preview(&message.message))
+            Some(super::types::message_preview(&message.message))
         }
         tl::enums::Message::Service(message)
             if message.id == top_message_id && peers_match(&message.peer_id, peer) =>
         {
-            Some(message_preview(""))
+            Some(super::types::message_preview(""))
         }
         _ => None,
     })
@@ -419,6 +580,8 @@ fn folders_from_dialog_filters(
 }
 
 async fn collect_message_page(
+    client: &Client,
+    media_cache_dir: &Path,
     mut iter: grammers_client::client::messages::MessageIter,
     chat_id: i64,
     limit: usize,
@@ -427,7 +590,7 @@ async fn collect_message_page(
     let mut messages = Vec::new();
 
     while let Some(msg) = iter.next().await? {
-        messages.push(convert_message(msg));
+        messages.push(convert_message_with_media_preview(client, media_cache_dir, msg).await);
         if messages.len() % 10 == 0 || messages.len() >= limit {
             diagnostics::event(
                 "message_iter_progress",
@@ -520,7 +683,15 @@ impl TelegramClient for GrammersClient {
         async move {
             let chat = self.cached_chat(chat_id)?;
             let iter = self.client.iter_messages(chat);
-            collect_message_page(iter, chat_id, limit, "latest").await
+            collect_message_page(
+                &self.client,
+                &self.media_cache_dir,
+                iter,
+                chat_id,
+                limit,
+                "latest",
+            )
+            .await
         }
     }
 
@@ -534,7 +705,15 @@ impl TelegramClient for GrammersClient {
         async move {
             let chat = self.cached_chat(chat_id)?;
             let iter = self.client.iter_messages(chat).offset_id(before_message_id);
-            collect_message_page(iter, chat_id, limit, "older").await
+            collect_message_page(
+                &self.client,
+                &self.media_cache_dir,
+                iter,
+                chat_id,
+                limit,
+                "older",
+            )
+            .await
         }
     }
 
@@ -586,7 +765,7 @@ impl TelegramClient for GrammersClient {
                 last_message: dialog
                     .last_message
                     .as_ref()
-                    .map(|m| message_preview(m.text())),
+                    .map(message_preview_from_grammers_message),
                 unread_count: dialog_unread_count(&dialog),
                 is_group: matches!(chat, grammers_client::types::Chat::Group(_)),
                 folder_id: folder_id.or(dialog_folder_id),

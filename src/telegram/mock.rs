@@ -1,8 +1,11 @@
 use super::client::TelegramClient;
-use super::types::{Chat, Folder, Message, MessageStatus, OWN_SENDER_NAME, Update, all_folder};
+use super::types::{
+    Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, Update, all_folder,
+};
+use base64::Engine;
 use chrono::Utc;
 use color_eyre::Result;
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -14,6 +17,28 @@ impl MockTelegramClient {
     pub fn new() -> Self {
         Self { connected: false }
     }
+}
+
+const MOCK_IMAGE_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAKAAAABQCAIAAAARP+ljAAAA2klEQVR42u3bMQ0AIAxFwYpABBKRiKuioVMTegnzG/6tJdbJ0su7S0+/tx8GAgwAMADA+oD1AesD1gcM2ECAAQAGAFgfsD5gfcBjgQ36dx8wYACAAQDWB6wPWB+wPmDABgIMADAAwPqA9QHrA54LbFAXHQAAAwCsD1gfsD5gfcCADQQYAGAAgPUB6wPWBwzYQP4HG9RFBwDA+oD1AesD1gcMGABgAID1AesD1gesDxiwgQAD8D8YmIsOfcD6gPUBAzYQYACAAQDWB6wPWB+wPmDABgIMALB+a/8BI+/vC6JSYoIAAAAASUVORK5CYII=";
+
+fn mock_image_path() -> Option<PathBuf> {
+    let path = std::env::temp_dir()
+        .join("dumbgram-tui-media")
+        .join("mock")
+        .join("photo.png");
+
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(MOCK_IMAGE_PNG_BASE64)
+        .ok()?;
+    std::fs::write(&path, bytes).ok()?;
+    Some(path)
+}
+
+fn mock_photo_media() -> MessageMedia {
+    mock_image_path().map_or_else(MessageMedia::photo, |path| {
+        MessageMedia::photo().with_local_path(path)
+    })
 }
 
 impl Default for MockTelegramClient {
@@ -112,6 +137,7 @@ impl TelegramClient for MockTelegramClient {
                         is_own: false,
                         is_edited: false,
                         reply_to_content: None,
+                        media: None,
                         status: MessageStatus::Delivered,
                         can_edit: false,
                         can_delete: false,
@@ -126,6 +152,7 @@ impl TelegramClient for MockTelegramClient {
                         is_own: true,
                         is_edited: false,
                         reply_to_content: None,
+                        media: None,
                         status: MessageStatus::Read,
                         can_edit: true,
                         can_delete: true,
@@ -140,6 +167,7 @@ impl TelegramClient for MockTelegramClient {
                         is_own: false,
                         is_edited: false,
                         reply_to_content: Some("I'm doing great! How about you?".to_string()),
+                        media: None,
                         status: MessageStatus::Delivered,
                         can_edit: false,
                         can_delete: false,
@@ -156,6 +184,7 @@ impl TelegramClient for MockTelegramClient {
                         is_own: false,
                         is_edited: false,
                         reply_to_content: None,
+                        media: None,
                         status: MessageStatus::Delivered,
                         can_edit: false,
                         can_delete: false,
@@ -170,6 +199,7 @@ impl TelegramClient for MockTelegramClient {
                         is_own: true,
                         is_edited: false,
                         reply_to_content: None,
+                        media: None,
                         status: MessageStatus::Read,
                         can_edit: true,
                         can_delete: true,
@@ -186,6 +216,7 @@ impl TelegramClient for MockTelegramClient {
                         is_own: false,
                         is_edited: false,
                         reply_to_content: None,
+                        media: None,
                         status: MessageStatus::Delivered,
                         can_edit: false,
                         can_delete: false,
@@ -200,6 +231,7 @@ impl TelegramClient for MockTelegramClient {
                         is_own: true,
                         is_edited: false,
                         reply_to_content: None,
+                        media: None,
                         status: MessageStatus::Sent,
                         can_edit: true,
                         can_delete: true,
@@ -214,6 +246,7 @@ impl TelegramClient for MockTelegramClient {
                         is_own: false,
                         is_edited: false,
                         reply_to_content: None,
+                        media: None,
                         status: MessageStatus::Delivered,
                         can_edit: false,
                         can_delete: false,
@@ -230,6 +263,7 @@ impl TelegramClient for MockTelegramClient {
                         is_own: false,
                         is_edited: false,
                         reply_to_content: None,
+                        media: Some(mock_photo_media()),
                         status: MessageStatus::Delivered,
                         can_edit: false,
                         can_delete: false,
@@ -244,6 +278,7 @@ impl TelegramClient for MockTelegramClient {
                         is_own: true,
                         is_edited: true,
                         reply_to_content: None,
+                        media: None,
                         status: MessageStatus::Delivered,
                         can_edit: true,
                         can_delete: true,
@@ -258,6 +293,7 @@ impl TelegramClient for MockTelegramClient {
                         is_own: false,
                         is_edited: false,
                         reply_to_content: Some("Great! Let's review it first".to_string()),
+                        media: None,
                         status: MessageStatus::Delivered,
                         can_edit: false,
                         can_delete: false,
@@ -300,6 +336,7 @@ impl TelegramClient for MockTelegramClient {
                 is_own: true,
                 is_edited: false,
                 reply_to_content: None,
+                media: None,
                 status: MessageStatus::Sent,
                 can_edit: true,
                 can_delete: true,
@@ -335,6 +372,7 @@ impl TelegramClient for MockTelegramClient {
                 is_own: true,
                 is_edited: false,
                 reply_to_content: Some("Replied message".to_string()),
+                media: None,
                 status: MessageStatus::Sent,
                 can_edit: true,
                 can_delete: true,
@@ -377,6 +415,7 @@ impl TelegramClient for MockTelegramClient {
                             is_own: false,
                             is_edited: false,
                             reply_to_content: None,
+                            media: None,
                             status: MessageStatus::Delivered,
                             can_edit: false,
                             can_delete: false,
@@ -405,5 +444,27 @@ impl TelegramClient for MockTelegramClient {
 
             Ok(rx)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MOCK_IMAGE_PNG_BASE64, mock_photo_media};
+    use base64::Engine;
+
+    #[test]
+    fn mock_photo_media_has_local_preview_file_for_kitty_smoke() {
+        let media = mock_photo_media();
+
+        let path = media
+            .local_image_path()
+            .expect("mock photo should have a local preview image");
+        assert!(path.exists());
+        assert!(std::fs::metadata(path).unwrap().len() > 200);
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(MOCK_IMAGE_PNG_BASE64)
+            .unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 }

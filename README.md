@@ -16,7 +16,7 @@ A small terminal Telegram client written in Rust with Ratatui/Crossterm and Gram
 
 - Large accounts are loaded in bounded pages, but full chat pagination UI is still limited.
 - Telegram folder names are best-effort from dialog filters/folder metadata; folder-rule editing is not implemented.
-- Media, downloads, search, and multiple accounts are not implemented.
+- Photo/image messages are shown with text placeholders such as `[photo]`. In Ghostty/Kitty-compatible terminals, selected downloaded thumbnails are also displayed with the Kitty graphics protocol. Full media browser controls, manual downloads, search, and multiple accounts are not implemented.
 - Some Telegram delete updates do not include enough context to identify the chat precisely.
 
 ## Setup
@@ -93,7 +93,7 @@ The log records timings, counts, selected IDs, and UI events. It does not log me
 
 ## Controls
 
-The bottom help bar shows available actions for the current focus. Press `?` outside input to hide or show it.
+The bottom help bar shows available actions for the current focus. Press `?` outside input to hide or show it. Dumbgram stores that UI preference, along with the chat/message split width, in a local `*.state.toml` file next to your config.
 
 Navigation:
 
@@ -110,6 +110,8 @@ Message actions:
 - `e` — edit selected own editable message.
 - `r` — reply to selected message.
 - `d` — delete selected own deletable message, or dismiss a failed local send.
+- `o` — open the first web link in the selected message.
+- Click a visible `http://` or `https://` link in a message to open it.
 - `y` — confirm delete.
 - `n`, `Esc`, `Ctrl-C` — cancel delete.
 - `Esc` / `Ctrl-C` — leave input or cancel edit/reply where applicable.
@@ -132,7 +134,7 @@ devbox run test
 devbox run smoke
 ```
 
-Local runtime files such as `config.toml`, `session.dat`, `*.dat`, `.devbox/`, and `target/` are ignored by Git. Do not commit Telegram credentials or session files.
+Local runtime files such as `config.toml`, `session.dat`, `*.dat`, `*.state.toml`, `.devbox/`, and `target/` are ignored by Git. Do not commit Telegram credentials or session files.
 
 ## License
 

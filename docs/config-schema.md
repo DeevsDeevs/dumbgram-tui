@@ -60,6 +60,18 @@ dumbgram_tui --check-auth --config config.toml
 - `--check-config` parses and validates the file only.
 - `--check-auth` connects to Telegram and verifies that the saved session is authorized. It requires valid credentials, network access, and an existing authorized session.
 
+## Local UI state
+
+Dumbgram keeps runtime UI preferences out of `config.toml`. When launched with `--config config.toml`, it stores preferences in `config.state.toml` next to that config file. Currently persisted values are:
+
+```toml
+[ui]
+show_help_bar = true
+split_ratio = 0.3
+```
+
+The `?` key updates `ui.show_help_bar`; `<` and `>` update `ui.split_ratio`. These `*.state.toml` files are local runtime state and should not be committed.
+
 ## Not yet configurable
 
-The current app still uses built-in behavior for UI layout, keybindings, theme colors, message fetch count, chat sorting, and sync/cache policy. Those may become config settings later, but adding them to `config.toml` today has no effect.
+The current app still uses built-in behavior for keybindings, theme colors, message fetch count, chat sorting, and sync/cache policy. Those may become config settings later, but adding them to `config.toml` today has no effect.

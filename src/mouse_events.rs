@@ -1,4 +1,9 @@
-use crate::state::{AppState, FocusedPanel};
+use crate::{
+    state::{AppState, FocusedPanel},
+    telegram::types::message_display_content,
+    text::{display_width, truncate_with_ellipsis},
+    ui::{self, SELECTED_ROW_SYMBOL},
+};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
 
@@ -8,11 +13,12 @@ pub enum MouseScrollOutcome {
     Ignored,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MouseClickOutcome {
     Handled,
     OpenFolderAt(usize),
     OpenChatAt(usize),
+    OpenLink(String),
     Ignored,
 }
 
@@ -81,8 +87,13 @@ pub fn handle_mouse_click(state: &mut AppState, mouse_event: MouseEvent) -> Mous
     } else if state.messages_area.contains(position) {
         state.focused_panel = FocusedPanel::Messages;
         let relative_y = y.saturating_sub(state.messages_area.y + 1) as usize;
+        let clicked_link = message_link_at_click(state, x, y);
         state.select_message_at_visible_row(relative_y);
-        MouseClickOutcome::Handled
+        if let Some(url) = clicked_link {
+            MouseClickOutcome::OpenLink(url)
+        } else {
+            MouseClickOutcome::Handled
+        }
     } else if state.input_area.contains(position) {
         state.focused_panel = FocusedPanel::Input;
         let relative_x = x.saturating_sub(state.input_area.x + 1) as usize;
@@ -91,6 +102,51 @@ pub fn handle_mouse_click(state: &mut AppState, mouse_event: MouseEvent) -> Mous
     } else {
         MouseClickOutcome::Ignored
     }
+}
+
+fn message_link_at_click(state: &AppState, x: u16, y: u16) -> Option<String> {
+    let relative_y = y.saturating_sub(state.messages_area.y + 1) as usize;
+    let relative_x = x.saturating_sub(state.messages_area.x + 1) as usize;
+    let mut current_row = 0;
+
+    for message in state.messages.iter().skip(state.message_scroll_offset) {
+        let message_height = if message.reply_to_content.is_some() {
+            2
+        } else {
+            1
+        };
+        if relative_y < current_row + message_height {
+            if relative_y != current_row {
+                return None;
+            }
+
+            let time_str = message.timestamp.format("%H:%M").to_string();
+            let metadata = ui::messages::message_metadata(
+                &time_str,
+                message.is_edited,
+                ui::messages::message_status_label(&message.status, message.is_own),
+                message.error.as_deref(),
+            );
+            let sender = format!("{}: ", message.sender_name);
+            let text_width = ui::list_text_width(state.messages_area.width);
+            let content_width = text_width
+                .saturating_sub(display_width(&sender) + display_width(&metadata))
+                .max(1);
+            let display_content = message_display_content(message.media.as_ref(), &message.content);
+            let content = truncate_with_ellipsis(&display_content, content_width);
+            let content_start = display_width(SELECTED_ROW_SYMBOL) + display_width(&sender);
+
+            return relative_x
+                .checked_sub(content_start)
+                .and_then(|column| crate::links::link_at_display_column(&content, column));
+        }
+        current_row += message_height;
+        if current_row >= state.message_visible_capacity() {
+            return None;
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -123,15 +179,20 @@ mod tests {
     }
 
     fn message(id: i32) -> Message {
+        message_with_content(id, &format!("message {id}"))
+    }
+
+    fn message_with_content(id: i32, content: &str) -> Message {
         Message {
             id,
             chat_id: 7,
             sender_name: "me".to_string(),
-            content: format!("message {id}"),
+            content: content.to_string(),
             timestamp: Utc::now(),
             is_own: true,
             is_edited: false,
             reply_to_content: None,
+            media: None,
             status: MessageStatus::Sent,
             can_edit: true,
             can_delete: true,
@@ -397,5 +458,27 @@ mod tests {
         );
         assert_eq!(state.focused_panel, FocusedPanel::Input);
         assert_eq!(state.input_cursor(), 2);
+    }
+
+    #[test]
+    fn message_click_on_visible_url_requests_link_open() {
+        let mut state = AppState::new();
+        state.messages_area = Rect::new(30, 5, 80, 8);
+        state.messages = vec![message_with_content(1, "go https://example.org now")];
+
+        let url_column = 30 + 1 + 2 + 4 + 3;
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    url_column,
+                    6
+                )
+            ),
+            MouseClickOutcome::OpenLink("https://example.org".to_string())
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Messages);
+        assert_eq!(state.selected_message_index, 0);
     }
 }

@@ -1,7 +1,7 @@
 use crate::diagnostics;
 use crate::telegram::types::{
     Chat, Folder, Message, MessageStatus, OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID, Update,
-    is_all_folder, message_preview,
+    is_all_folder, message_display_preview,
 };
 use crate::text::display_width;
 use chrono::{DateTime, Utc};
@@ -146,6 +146,7 @@ pub struct AppState {
     pub folders_area: Rect,
     pub chats_area: Rect,
     pub messages_area: Rect,
+    pub terminal_image_area: Rect,
     pub input_area: Rect,
     pub folder_scroll_offset: usize,
     pub editing_message_id: Option<i32>,
@@ -181,6 +182,7 @@ impl AppState {
             folders_area: Rect::default(),
             chats_area: Rect::default(),
             messages_area: Rect::default(),
+            terminal_image_area: Rect::default(),
             input_area: Rect::default(),
             folder_scroll_offset: 0,
             editing_message_id: None,
@@ -803,7 +805,8 @@ impl AppState {
                 }
 
                 if let Some(chat) = self.chats.iter_mut().find(|c| c.id == msg.chat_id) {
-                    chat.last_message = Some(message_preview(&msg.content));
+                    chat.last_message =
+                        Some(message_display_preview(msg.media.as_ref(), &msg.content));
                     if current_chat_id == Some(msg.chat_id) {
                         chat.unread_count = 0;
                     } else if !msg.is_own {
@@ -1209,7 +1212,7 @@ impl AppState {
                 .iter()
                 .rev()
                 .find(|message| message.chat_id == chat_id)
-                .map(|message| message_preview(&message.content))
+                .map(|message| message_display_preview(message.media.as_ref(), &message.content))
         });
 
         if let Some(chat) = self.chats.get_mut(self.selected_chat_index) {
@@ -1253,6 +1256,7 @@ impl AppState {
             is_own: true,
             is_edited: false,
             reply_to_content: None,
+            media: None,
             status: MessageStatus::Sending,
             can_edit: false,
             can_delete: false,
@@ -1409,8 +1413,8 @@ mod tests {
         last_index, message_visible_row_height, reply_failed_error, send_failed_error,
     };
     use crate::telegram::types::{
-        Chat, Folder, Message, MessageStatus, OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID,
-        Update, all_folder,
+        Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME,
+        UNKNOWN_DELETE_UPDATE_CHAT_ID, Update, all_folder,
     };
     use chrono::{Duration, Utc};
     use ratatui::layout::Rect;
@@ -1486,6 +1490,7 @@ mod tests {
             is_own: false,
             is_edited: false,
             reply_to_content: None,
+            media: None,
             status: MessageStatus::Delivered,
             can_edit: false,
             can_delete: false,
@@ -1503,6 +1508,7 @@ mod tests {
             is_own,
             is_edited: false,
             reply_to_content: None,
+            media: None,
             status: MessageStatus::Delivered,
             can_edit: is_own,
             can_delete: is_own,
@@ -1716,6 +1722,21 @@ mod tests {
         assert_eq!(state.folders[1].unread_count, 5);
         assert!(state.messages.is_empty());
         assert_eq!(state.chats[1].last_message.as_deref(), Some("background"));
+    }
+
+    #[test]
+    fn incoming_media_message_preview_keeps_photo_visible_without_caption() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(0)];
+        state.chats = vec![chat_with_unread(1, "Chat 1", 0, None)];
+        state.selected_chat_index = 0;
+        let mut update = update_message(11, 1, "", false);
+        update.media = Some(MessageMedia::photo());
+
+        state.apply_update(Update::NewMessage(update));
+
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.chats[0].last_message.as_deref(), Some("[photo]"));
     }
 
     #[test]

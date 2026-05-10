@@ -8,10 +8,13 @@ mod diagnostics;
 mod folder_keys;
 mod global_keys;
 mod input_keys;
+mod links;
 mod message_keys;
 mod mouse_events;
+mod preferences;
 mod state;
 mod telegram;
+mod terminal_images;
 mod text;
 mod ui;
 
@@ -29,7 +32,7 @@ use ratatui::{
     Terminal,
     backend::{CrosstermBackend, TestBackend},
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{fs, io};
 use telegram::types::{Message, Update};
@@ -39,6 +42,9 @@ const LOADING_TELEGRAM_STATUS: &str = "Loading Telegram data…";
 const LOADING_OLDER_MESSAGES_STATUS: &str = "Loading older messages…";
 const LOADING_CHAT_MESSAGES_STATUS: &str = "Loading chat messages…";
 const LOADING_FOLDER_CHATS_STATUS: &str = "Loading folder chats…";
+const LINK_OPENED_STATUS: &str = "Link opened";
+const NO_LINK_IN_SELECTED_MESSAGE_STATUS: &str = "No link in selected message";
+const OPEN_LINK_FAILED_PREFIX: &str = "Open link failed";
 const DELETING_MESSAGE_STATUS: &str = "Deleting message…";
 const SENDING_MESSAGE_STATUS: &str = "Sending message…";
 const SAVING_EDIT_STATUS: &str = "Saving edit…";
@@ -154,7 +160,8 @@ async fn main() -> Result<()> {
             let (config, session_path) = load_checked_config_with_session_parent(&cli.config_path)
                 .unwrap_or_else(|error| exit_with_error(error, SETUP_ERROR_EXIT_CODE));
             color_eyre::install()?;
-            run_real_telegram(config, session_path, &theme).await
+            let preferences_path = preferences::state_path_for_config(&cli.config_path);
+            run_real_telegram(config, session_path, &theme, Some(preferences_path)).await
         }
         RunMode::Mock => {
             color_eyre::install()?;
@@ -377,6 +384,7 @@ async fn run_real_telegram(
     config: config::Config,
     session_path: String,
     theme: &config::Theme,
+    preferences_path: Option<PathBuf>,
 ) -> Result<()> {
     diagnostics::event(
         "real_client_create_start",
@@ -402,7 +410,7 @@ async fn run_real_telegram(
         diagnostics::event("login_finish", "authorized=true");
     }
 
-    run_with_client(client, theme).await
+    run_with_client(client, theme, preferences_path).await
 }
 
 fn login_code_sent_message(phone: &str) -> String {
@@ -469,7 +477,7 @@ async fn run_mock(theme: &config::Theme, smoke: bool) -> Result<()> {
     if smoke {
         run_smoke_with_client(MockTelegramClient::new(), theme).await
     } else {
-        run_with_client(MockTelegramClient::new(), theme).await
+        run_with_client(MockTelegramClient::new(), theme, None).await
     }
 }
 
@@ -1189,6 +1197,7 @@ async fn run_mouse_smoke<C: TelegramClient + Clone + Send + Sync + 'static>(
 async fn run_with_client<C: TelegramClient + Clone + Send + Sync + 'static>(
     mut client: C,
     theme: &config::Theme,
+    preferences_path: Option<PathBuf>,
 ) -> Result<()> {
     diagnostics::event("client_connect_start", "client=telegram");
     let started = Instant::now();
@@ -1199,6 +1208,8 @@ async fn run_with_client<C: TelegramClient + Clone + Send + Sync + 'static>(
     );
 
     let mut app = App::new();
+    app.preferences_path = preferences_path;
+    load_app_preferences(&mut app);
     let mut terminal = setup_terminal()?;
 
     app.state.set_status(LOADING_TELEGRAM_STATUS);
@@ -1286,14 +1297,60 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(
+    let clear_images_result = terminal_images::clear_terminal_images(terminal.backend_mut());
+    let raw_mode_result = disable_raw_mode();
+    let leave_screen_result = execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    );
+    let cursor_result = terminal.show_cursor();
+
+    clear_images_result?;
+    raw_mode_result?;
+    leave_screen_result?;
+    cursor_result?;
     Ok(())
+}
+
+fn load_app_preferences(app: &mut App) {
+    let Some(path) = app.preferences_path.as_deref() else {
+        return;
+    };
+
+    match preferences::AppPreferences::load(path) {
+        Ok(preferences) => {
+            preferences.apply_to_state(&mut app.state);
+            diagnostics::event("preferences_load", format!("path={}", path.display()));
+        }
+        Err(error) => diagnostics::event(
+            "preferences_load_error",
+            format!("path={} error={error}", path.display()),
+        ),
+    }
+}
+
+fn save_app_preferences_if_changed(app: &mut App, before: preferences::AppPreferences) {
+    let after = preferences::AppPreferences::from_state(&app.state);
+    if before == after {
+        return;
+    }
+
+    let Some(path) = app.preferences_path.as_deref() else {
+        return;
+    };
+
+    match after.save(path) {
+        Ok(()) => diagnostics::event("preferences_save", format!("path={}", path.display())),
+        Err(error) => {
+            diagnostics::event(
+                "preferences_save_error",
+                format!("path={} error={error}", path.display()),
+            );
+            app.state
+                .set_error(format!("Save preferences failed: {error}"));
+        }
+    }
 }
 
 async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
@@ -1331,6 +1388,7 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
     loop {
         let draw_started = Instant::now();
         terminal.draw(|f| ui::render_layout(f, app, theme))?;
+        terminal_images::render_selected_image(terminal.backend_mut(), app)?;
         log_draw_duration("main_loop", draw_started);
 
         while let Ok(subscribe_result) = subscribe_updates_rx.try_recv() {
@@ -2193,6 +2251,30 @@ fn log_draw_duration(label: &str, started: Instant) {
     }
 }
 
+fn open_selected_message_link(app: &mut App) {
+    if let Some(url) = app
+        .state
+        .selected_message()
+        .and_then(|message| links::first_url(&message.content))
+    {
+        open_message_link(app, &url);
+    } else {
+        app.state.set_status(NO_LINK_IN_SELECTED_MESSAGE_STATUS);
+    }
+}
+
+fn open_message_link(app: &mut App, url: &str) {
+    diagnostics::event("link_open", "target=browser");
+    match links::open_url(url) {
+        Ok(()) => app.state.set_status(LINK_OPENED_STATUS),
+        Err(error) => {
+            diagnostics::event("link_open_error", format!("error={error}"));
+            app.state
+                .set_error(format!("{OPEN_LINK_FAILED_PREFIX}: {error}"));
+        }
+    }
+}
+
 fn key_event_label(key: KeyEvent, focus: state::FocusedPanel) -> String {
     match key.code {
         KeyCode::Char(_) if focus == state::FocusedPanel::Input => "Char(redacted)".to_string(),
@@ -2297,10 +2379,13 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
         return Ok(());
     }
 
-    if message_keys::handle_message_key(&mut app.state, key)
-        == message_keys::MessageKeyOutcome::Handled
-    {
-        return Ok(());
+    match message_keys::handle_message_key(&mut app.state, key) {
+        message_keys::MessageKeyOutcome::Handled => return Ok(()),
+        message_keys::MessageKeyOutcome::OpenSelectedLink => {
+            open_selected_message_link(app);
+            return Ok(());
+        }
+        message_keys::MessageKeyOutcome::Ignored => {}
     }
 
     match chat_keys::handle_chat_key(&mut app.state, key) {
@@ -2364,8 +2449,12 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
         folder_keys::FolderKeyOutcome::Ignored => {}
     }
 
+    let preferences_before = preferences::AppPreferences::from_state(&app.state);
     match app_keys::handle_app_key(&mut app.state, key) {
-        app_keys::AppKeyOutcome::Handled | app_keys::AppKeyOutcome::Ignored => {}
+        app_keys::AppKeyOutcome::Handled => {
+            save_app_preferences_if_changed(app, preferences_before)
+        }
+        app_keys::AppKeyOutcome::Ignored => {}
         app_keys::AppKeyOutcome::Quit => app.quit(),
     }
     Ok(())
@@ -2570,6 +2659,7 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
 
     match mouse_events::handle_mouse_click(&mut app.state, mouse_event) {
         mouse_events::MouseClickOutcome::Handled | mouse_events::MouseClickOutcome::Ignored => {}
+        mouse_events::MouseClickOutcome::OpenLink(url) => open_message_link(app, &url),
         mouse_events::MouseClickOutcome::OpenFolderAt(index) => {
             diagnostics::event(
                 "mouse_action",
@@ -2637,8 +2727,8 @@ mod tests {
         login_2fa_hint_message, login_2fa_signed_in_message, login_code_sent_message,
         login_failed_message, login_signed_in_message, message_submit_action_status,
         older_message_key_navigation, parse_args_from, preserve_prompt_input_line_spaces,
-        require_prompt_line, require_prompt_response, smoke_ok_message, trim_prompt_input_line,
-        validate_config,
+        require_prompt_line, require_prompt_response, save_app_preferences_if_changed,
+        smoke_ok_message, trim_prompt_input_line, validate_config,
     };
     use crate::app::App;
     use crate::config::telegram::{Config, TelegramConfig};
@@ -2718,6 +2808,7 @@ mod tests {
             is_own: false,
             is_edited: false,
             reply_to_content: None,
+            media: None,
             status: MessageStatus::Delivered,
             can_edit: false,
             can_delete: false,
@@ -2972,6 +3063,25 @@ mod tests {
             app.state.status_message.as_deref(),
             Some(SENDING_MESSAGE_STATUS)
         );
+    }
+
+    #[test]
+    fn app_preferences_are_saved_when_help_or_split_changes() {
+        let path = unique_temp_session_path().with_extension("state.toml");
+        let mut app = App::new();
+        app.preferences_path = Some(path.clone());
+        let before = crate::preferences::AppPreferences::from_state(&app.state);
+
+        app.state.toggle_help_bar();
+        app.state.adjust_split_right();
+        save_app_preferences_if_changed(&mut app, before);
+
+        let saved = crate::preferences::AppPreferences::load(&path)
+            .expect("saved app preferences should reload");
+        assert!(!saved.ui.show_help_bar);
+        assert_eq!(saved.ui.split_ratio, app.state.split_ratio);
+
+        std::fs::remove_file(path).ok();
     }
 
     #[tokio::test]
