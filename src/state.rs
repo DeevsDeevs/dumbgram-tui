@@ -162,17 +162,13 @@ impl AppState {
 
     pub fn select_next_message(&mut self) {
         if !self.messages.is_empty() {
-            self.selected_message_index = (self.selected_message_index + 1) % self.messages.len();
+            self.selected_message_index = (self.selected_message_index + 1).min(self.messages.len() - 1);
         }
     }
 
     pub fn select_prev_message(&mut self) {
-        if !self.messages.is_empty() {
-            self.selected_message_index = if self.selected_message_index == 0 {
-                self.messages.len() - 1
-            } else {
-                self.selected_message_index - 1
-            };
+        if self.selected_message_index > 0 {
+            self.selected_message_index -= 1;
         }
     }
 

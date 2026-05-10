@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
         match client.inner().sign_in(&token, &code).await {
             Ok(user) => {
                 println!("✓ Signed in as: {}\n", user.first_name());
+                client.save_session()?;
             }
             Err(grammers_client::SignInError::PasswordRequired(password_token)) => {
                 let hint = password_token.hint().unwrap_or("");
@@ -73,6 +74,7 @@ async fn main() -> Result<()> {
                 let password = prompt_input("Enter 2FA password: ")?;
                 let user = client.inner().check_password(password_token, password.as_bytes()).await?;
                 println!("✓ Signed in with 2FA as: {}\n", user.first_name());
+                client.save_session()?;
             }
             Err(e) => {
                 eprintln!("Sign in failed: {}", e);
@@ -80,7 +82,7 @@ async fn main() -> Result<()> {
             }
         }
         
-        println!("Session saved! Press Enter to start...");
+        println!("✓ Session saved! Press Enter to start...");
         prompt_input("")?;
         
         terminal = setup_terminal()?;
@@ -171,7 +173,9 @@ async fn run_app(
 fn apply_update(state: &mut state::AppState, update: Update) {
     match update {
         Update::NewMessage(msg) => {
-            if state.chats.get(state.selected_chat_index).map(|c| c.id) == Some(msg.chat_id) {
+            let current_chat_id = state.chats.get(state.selected_chat_index).map(|c| c.id);
+            
+            if current_chat_id == Some(msg.chat_id) {
                 if !state.messages.iter().any(|m| m.id == msg.id) {
                     state.messages.push(msg.clone());
                 }
@@ -187,14 +191,19 @@ fn apply_update(state: &mut state::AppState, update: Update) {
         
         Update::EditMessage { chat_id, message_id, new_content } => {
             if let Some(msg) = state.messages.iter_mut().find(|m| m.id == message_id && m.chat_id == chat_id) {
-                msg.content = new_content;
+                msg.content = new_content.clone();
                 msg.is_edited = true;
             }
         }
         
         Update::DeleteMessage { chat_id, message_id } => {
-            state.messages.retain(|m| !(m.id == message_id && m.chat_id == chat_id));
-            if state.selected_message_index >= state.messages.len() && !state.messages.is_empty() {
+            if chat_id == 0 {
+                state.messages.retain(|m| m.id != message_id);
+            } else {
+                state.messages.retain(|m| !(m.id == message_id && m.chat_id == chat_id));
+            }
+            
+            if !state.messages.is_empty() && state.selected_message_index >= state.messages.len() {
                 state.selected_message_index = state.messages.len() - 1;
             }
         }
@@ -205,12 +214,10 @@ fn apply_update(state: &mut state::AppState, update: Update) {
                 if !users.contains(&user_name) {
                     users.push(user_name);
                 }
-            } else {
-                if let Some(users) = state.typing_users.get_mut(&chat_id) {
-                    users.retain(|u| u != &user_name);
-                    if users.is_empty() {
-                        state.typing_users.remove(&chat_id);
-                    }
+            } else if let Some(users) = state.typing_users.get_mut(&chat_id) {
+                users.retain(|u| u != &user_name);
+                if users.is_empty() {
+                    state.typing_users.remove(&chat_id);
                 }
             }
         }
@@ -237,21 +244,23 @@ async fn handle_normal_navigation(app: &mut App, key: KeyEvent, client: &mut Gra
     if app.state.confirm_delete_message_id.is_some() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let msg_id = app.state.confirm_delete_message_id.unwrap();
-                let chat_id = app.state.chats[app.state.selected_chat_index].id;
-                
-                match client.delete_message(chat_id, msg_id).await {
-                    Ok(_) => {
-                        app.state.messages.retain(|m| m.id != msg_id);
-                        app.state.confirm_delete_message_id = None;
-                        if app.state.selected_message_index >= app.state.messages.len() && !app.state.messages.is_empty() {
-                            app.state.selected_message_index = app.state.messages.len() - 1;
+                if let Some(msg_id) = app.state.confirm_delete_message_id {
+                    if !app.state.chats.is_empty() {
+                        let chat_id = app.state.chats[app.state.selected_chat_index].id;
+                        
+                        match client.delete_message(chat_id, msg_id).await {
+                            Ok(_) => {
+                                app.state.messages.retain(|m| m.id != msg_id);
+                                if app.state.selected_message_index >= app.state.messages.len() && !app.state.messages.is_empty() {
+                                    app.state.selected_message_index = app.state.messages.len() - 1;
+                                }
+                            }
+                            Err(e) => {
+                                app.state.set_error(format!("Delete failed: {}", e));
+                            }
                         }
                     }
-                    Err(e) => {
-                        app.state.set_error(format!("Delete failed: {}", e));
-                        app.state.confirm_delete_message_id = None;
-                    }
+                    app.state.confirm_delete_message_id = None;
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -271,16 +280,20 @@ async fn handle_normal_navigation(app: &mut App, key: KeyEvent, client: &mut Gra
                     app.state.focused_panel = state::FocusedPanel::Chats;
                 }
                 state::FocusedPanel::Chats => {
-                    let old_index = app.state.selected_chat_index;
-                    app.state.select_next_chat();
-                    if old_index != app.state.selected_chat_index && !app.state.chats.is_empty() {
-                        let chat_id = app.state.chats[app.state.selected_chat_index].id;
-                        app.state.messages = client.get_messages(chat_id, 50).await?;
-                        app.state.selected_message_index = 0;
+                    if !app.state.chats.is_empty() {
+                        let old_index = app.state.selected_chat_index;
+                        app.state.select_next_chat();
+                        if old_index != app.state.selected_chat_index {
+                            let chat_id = app.state.chats[app.state.selected_chat_index].id;
+                            app.state.messages = client.get_messages(chat_id, 50).await?;
+                            app.state.selected_message_index = 0;
+                        }
                     }
                 }
                 state::FocusedPanel::Messages => {
-                    if !app.state.messages.is_empty() && app.state.selected_message_index == app.state.messages.len() - 1 {
+                    if app.state.messages.is_empty() {
+                        app.state.focused_panel = state::FocusedPanel::Input;
+                    } else if app.state.selected_message_index == app.state.messages.len() - 1 {
                         app.state.focused_panel = state::FocusedPanel::Input;
                     } else {
                         app.state.select_next_message();
@@ -293,13 +306,13 @@ async fn handle_normal_navigation(app: &mut App, key: KeyEvent, client: &mut Gra
             match app.state.focused_panel {
                 state::FocusedPanel::Folders => {}
                 state::FocusedPanel::Chats => {
-                    if app.state.selected_chat_index == 0 {
+                    if app.state.chats.is_empty() || app.state.selected_chat_index == 0 {
                         app.state.focused_panel = state::FocusedPanel::Folders;
                         return Ok(());
                     }
                     let old_index = app.state.selected_chat_index;
                     app.state.select_prev_chat();
-                    if old_index != app.state.selected_chat_index && !app.state.chats.is_empty() {
+                    if old_index != app.state.selected_chat_index {
                         let chat_id = app.state.chats[app.state.selected_chat_index].id;
                         app.state.messages = client.get_messages(chat_id, 50).await?;
                         app.state.selected_message_index = 0;
@@ -374,31 +387,28 @@ async fn handle_normal_navigation(app: &mut App, key: KeyEvent, client: &mut Gra
         KeyCode::Char('<') => app.state.adjust_split_left(),
         KeyCode::Char('>') => app.state.adjust_split_right(),
         KeyCode::Char('e') if app.state.focused_panel == state::FocusedPanel::Messages => {
-            if !app.state.messages.is_empty() {
-                if let Some(msg) = app.state.messages.get(app.state.selected_message_index) {
-                    if msg.is_own && msg.can_edit {
-                        app.state.enter_edit_mode(msg.id, msg.content.clone());
-                    } else {
-                        app.state.set_error("Cannot edit this message".to_string());
-                    }
+            if !app.state.messages.is_empty() && app.state.selected_message_index < app.state.messages.len() {
+                let msg = &app.state.messages[app.state.selected_message_index];
+                if msg.is_own && msg.can_edit {
+                    app.state.enter_edit_mode(msg.id, msg.content.clone());
+                } else {
+                    app.state.set_error("Cannot edit this message".to_string());
                 }
             }
         }
         KeyCode::Char('r') if app.state.focused_panel == state::FocusedPanel::Messages => {
-            if !app.state.messages.is_empty() {
-                if let Some(msg) = app.state.messages.get(app.state.selected_message_index) {
-                    app.state.enter_reply_mode(msg.id);
-                }
+            if !app.state.messages.is_empty() && app.state.selected_message_index < app.state.messages.len() {
+                let msg_id = app.state.messages[app.state.selected_message_index].id;
+                app.state.enter_reply_mode(msg_id);
             }
         }
         KeyCode::Char('d') if app.state.focused_panel == state::FocusedPanel::Messages => {
-            if !app.state.messages.is_empty() {
-                if let Some(msg) = app.state.messages.get(app.state.selected_message_index) {
-                    if msg.is_own && msg.can_delete {
-                        app.state.confirm_delete_message_id = Some(msg.id);
-                    } else {
-                        app.state.set_error("Cannot delete this message".to_string());
-                    }
+            if !app.state.messages.is_empty() && app.state.selected_message_index < app.state.messages.len() {
+                let msg = &app.state.messages[app.state.selected_message_index];
+                if msg.is_own && msg.can_delete {
+                    app.state.confirm_delete_message_id = Some(msg.id);
+                } else {
+                    app.state.set_error("Cannot delete this message".to_string());
                 }
             }
         }
@@ -436,7 +446,7 @@ async fn handle_message_send(app: &mut App, client: &mut GrammersClient) -> Resu
         return Ok(());
     }
     
-    if app.state.chats.is_empty() {
+    if app.state.chats.is_empty() || app.state.selected_chat_index >= app.state.chats.len() {
         app.state.set_error("No chat selected".to_string());
         return Ok(());
     }
@@ -492,8 +502,8 @@ async fn handle_message_send(app: &mut App, client: &mut GrammersClient) -> Resu
         
         match client.send_message(chat_id, content).await {
             Ok(sent_msg) => {
-                if let Some(msg) = app.state.messages.iter_mut().find(|m| m.id == temp_id) {
-                    *msg = sent_msg;
+                if let Some(idx) = app.state.messages.iter().position(|m| m.id == temp_id) {
+                    app.state.messages[idx] = sent_msg;
                 }
             }
             Err(e) => {
@@ -501,6 +511,7 @@ async fn handle_message_send(app: &mut App, client: &mut GrammersClient) -> Resu
                     msg.status = telegram::types::MessageStatus::Failed;
                     msg.error = Some(e.to_string());
                 }
+                app.state.set_error(format!("Send failed: {}", e));
             }
         }
     }
@@ -552,16 +563,18 @@ async fn handle_mouse_event(
             } else if app.state.chats_area.contains(ratatui::layout::Position::new(x, y)) {
                 app.state.focused_panel = state::FocusedPanel::Chats;
                 
-                let border_offset = 1;
-                let relative_y = y.saturating_sub(app.state.chats_area.y + border_offset);
-                let height_per_chat = 2;
-                let clicked_chat = (relative_y / height_per_chat) as usize;
-                
-                if clicked_chat < app.state.chats.len() {
-                    app.state.select_chat(clicked_chat);
-                    let chat_id = app.state.chats[clicked_chat].id;
-                    app.state.messages = client.get_messages(chat_id, 50).await?;
-                    app.state.selected_message_index = 0;
+                if !app.state.chats.is_empty() {
+                    let border_offset = 1;
+                    let relative_y = y.saturating_sub(app.state.chats_area.y + border_offset);
+                    let height_per_chat = 2;
+                    let clicked_chat = (relative_y / height_per_chat) as usize;
+                    
+                    if clicked_chat < app.state.chats.len() {
+                        app.state.select_chat(clicked_chat);
+                        let chat_id = app.state.chats[clicked_chat].id;
+                        app.state.messages = client.get_messages(chat_id, 50).await?;
+                        app.state.selected_message_index = 0;
+                    }
                 }
             } else if app.state.messages_area.contains(ratatui::layout::Position::new(x, y)) {
                 app.state.focused_panel = state::FocusedPanel::Messages;

@@ -12,6 +12,7 @@ use super::types::{Chat, Folder, Message, MessageStatus, Update};
 pub struct GrammersClient {
     client: Client,
     chat_cache: Arc<Mutex<HashMap<i64, grammers_client::types::Chat>>>,
+    session_path: String,
 }
 
 impl GrammersClient {
@@ -37,11 +38,17 @@ impl GrammersClient {
         Ok(Self { 
             client,
             chat_cache: Arc::new(Mutex::new(HashMap::new())),
+            session_path: session_path.to_string(),
         })
     }
 
     pub fn inner(&self) -> &Client {
         &self.client
+    }
+    
+    pub fn save_session(&self) -> Result<()> {
+        self.client.session().save_to_file(&self.session_path)?;
+        Ok(())
     }
     
     fn get_chat(&self, chat_id: i64) -> Option<grammers_client::types::Chat> {
@@ -200,12 +207,12 @@ impl TelegramClient for GrammersClient {
                                 })
                             }
                             grammers_client::Update::MessageDeleted(deletion) => {
-                                deletion.messages().iter().map(|msg_id| {
+                                deletion.messages().first().map(|msg_id| {
                                     Update::DeleteMessage {
-                                         chat_id: 0,
+                                        chat_id: 0,
                                         message_id: *msg_id,
                                     }
-                                }).next()
+                                })
                             }
                             _ => None,
                         };

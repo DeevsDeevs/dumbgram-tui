@@ -56,6 +56,12 @@ pub fn render_chats(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, t
         )
         .highlight_symbol(">> ");
 
-    let mut list_state = ListState::default().with_selected(Some(app.state.selected_chat_index));
+    let selected_index = if app.state.chats.is_empty() {
+        None
+    } else {
+        Some(app.state.selected_chat_index.min(app.state.chats.len().saturating_sub(1)))
+    };
+    
+    let mut list_state = ListState::default().with_selected(selected_index);
     frame.render_stateful_widget(list, area, &mut list_state);
 }

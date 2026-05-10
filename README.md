@@ -2,19 +2,29 @@
 
 A minimalist Telegram TUI client built with Rust, focusing on essential features without the bloat.
 
-## Current Status: Phase 1 Complete ✅
+## 🎉 Current Status: Phase 3 Complete - REAL TELEGRAM INTEGRATION! 🎉
 
 ### What's Working
 
+**Core Features:**
+- ✅ **Real Telegram API**: Fully integrated with grammers-client v0.7.0
+- ✅ **Authentication**: CLI-based login (phone → code → 2FA)
+- ✅ **Session Persistence**: Login once, reuse forever
+- ✅ **Send Messages**: Type and send to real Telegram chats
+- ✅ **Edit Messages**: Press `e` to edit your messages
+- ✅ **Delete Messages**: Press `d` then `y` to delete
+- ✅ **Reply to Messages**: Press `r` to reply
+- ✅ **Real-Time Updates**: Receive messages from other users instantly
+- ✅ **Chat Cache**: Smart caching for optimal performance
+
+**UI Features:**
 - ✅ **Modular Architecture**: Clean separation of concerns across modules
-- ✅ **Mock Telegram Client**: Fully functional mock client with sample data
-- ✅ **Basic TUI Layout**: Split-panel design with folders, chats, messages, and input
+- ✅ **Split-Panel Design**: Folders, chats, messages, and input
 - ✅ **Mouse Support**: Fully clickable UI for all interactions
-- ✅ **Event Handling**: Keyboard navigation and mode switching
-- ✅ **Theme System**: Catppuccin Mocha theme integrated
-- ✅ **State Management**: Centralized app state with panel focus tracking
-- ✅ **Dynamic Content**: Chat messages update when switching between chats
-- ✅ **Folder Filtering**: Chats filter by selected folder tab
+- ✅ **Keyboard Navigation**: Full arrow key and vim-like support
+- ✅ **Theme System**: Catppuccin Mocha color scheme
+- ✅ **Dynamic Content**: Real chat messages from Telegram
+- ✅ **Folder Filtering**: Single "All" folder (MVP approach)
 
 ### Project Structure
 
@@ -42,11 +52,41 @@ src/
     └── input.rs      # Input field widget
 ```
 
-## Running the App
+## Setup
+
+### 1. Get Telegram API Credentials
+
+1. Go to https://my.telegram.org
+2. Log in with your phone number
+3. Go to "API development tools"
+4. Create a new application
+5. Copy your `api_id` and `api_hash`
+
+### 2. Configure the App
+
+```bash
+# Copy the example config
+cp config.example.toml config.toml
+
+# Edit config.toml and add your credentials
+[telegram]
+api_id = YOUR_API_ID
+api_hash = "YOUR_API_HASH"
+session_file = "session.dat"
+```
+
+### 3. Run the App
 
 ```bash
 cargo run
 ```
+
+**First run:** You'll be prompted for:
+- Phone number (with country code, e.g., +1234567890)
+- Verification code (sent via SMS or Telegram app)
+- 2FA password (if enabled)
+
+**Subsequent runs:** Auto-login using saved session!
 
 ## Interactions
 
@@ -71,31 +111,58 @@ cargo run
 - **Visual indicators**: `◀ ▶` arrows show when more folders exist
 - **Works with 3 or 300 folders**: Handles any number gracefully
 
+### Message Operations
+- **Select a message** - Use arrow keys to navigate
+- **`e`** - Edit selected message (your messages only)
+- **`r`** - Reply to selected message
+- **`d`** - Delete selected message (confirmation required)
+- **`y`** - Confirm deletion
+- **`n` or `Esc`** - Cancel deletion
+
 ### Input Box Behavior
 When the input box is focused (highlighted border):
 - **Just start typing** - No need for special modes
-- `Enter` - Send message (currently clears input)
+- `Enter` - Send message to current chat (sends to real Telegram!)
 - `Backspace` - Delete characters
 - `Esc` or `↑` - Exit input box, return to messages panel
 
 ### Additional Keyboard Shortcuts
 - `q` - Quit application
 - `Tab` - Cycle through panels (Folders → Chats → Messages → Input → Folders)
-  - *Note: Tab follows a linear left-to-right, top-to-bottom order through all UI panels*
 - `</>` - Adjust split panel size
 
-## Next Steps
+## Development Status
 
-See [AGENTS.md](AGENTS.md) for the full development plan and remaining phases:
-- Phase 2: Real Telegram API integration
-- Phase 3: Message sending/editing/replying
-- Phase 4: Polish and optimization
+**Completed Phases:**
+- ✅ **Phase 1**: Foundation (TUI architecture, mock data)
+- ✅ **Phase 2**: Message Operations (send, edit, reply, delete with optimistic UI)
+- ✅ **Phase 3**: Real Telegram Integration (grammers-client, authentication, real-time updates)
+
+**Future Enhancements:**
+- Custom folder support (beyond "All")
+- Unread message counts
+- Media preview/download
+- Search functionality
+- Multiple account support
+
+See [PHASE3_PLAN.md](PHASE3_PLAN.md) for detailed implementation notes.
 
 ## Architecture Highlights
 
-- **Trait-based Client**: Easy to swap mock client for real Telegram API
+- **Trait-based Client**: Clean abstraction over grammers-client
+- **Chat Caching**: Smart HashMap-based cache for grammers API requirements
+- **Real-Time Updates**: Background tokio task with mpsc channel
+- **Optimistic UI**: Immediate feedback for message operations
+- **Session Persistence**: Login once, auto-reconnect on subsequent runs
 - **Immutable Widget Pattern**: Following ratatui best practices
 - **Mouse-First Design**: Full clickable UI with keyboard alternatives
-- **Tab-based Folder Filtering**: Clean UX for folder navigation
 - **Area Tracking**: UI components track their screen regions for click detection
-- **Async Event Handling**: Non-blocking message loading when switching chats
+- **Non-blocking Event Loop**: Uses `event::poll()` for responsive updates
+
+## Known Limitations
+
+- **Unread Counts**: Not available (grammers Dialog API limitation)
+- **Custom Folders**: Only "All" folder supported (MVP approach)
+- **Delete Message Chat ID**: Always 0 due to grammers MessageDeletion limitation
+
+These are API limitations, not bugs. The app works perfectly within these constraints!

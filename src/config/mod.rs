@@ -4,4 +4,4 @@ pub mod theme;
 pub mod telegram;
 
 pub use theme::Theme;
-pub use telegram::{Config, TelegramConfig};
+pub use telegram::Config;

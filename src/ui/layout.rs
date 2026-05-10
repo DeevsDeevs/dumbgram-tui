@@ -9,16 +9,26 @@ use crate::{app::App, config::Theme};
 use super::{render_folders, render_chats, render_messages, render_input};
 
 pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
-    let error_height = if app.state.error_message.is_some() { 2 } else { 0 };
+    let has_error = app.state.error_message.is_some();
     
-    let main_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(3),
-            Constraint::Length(error_height),
-        ])
-        .split(frame.area());
+    let main_chunks = if has_error {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(3),
+                Constraint::Length(3),
+            ])
+            .split(frame.area())
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(3),
+            ])
+            .split(frame.area())
+    };
 
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -46,8 +56,8 @@ pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
     render_messages(frame, horizontal_chunks[1], app, theme);
     render_input(frame, main_chunks[1], app, theme);
     
-    if app.state.error_message.is_some() {
-        render_error_banner(frame, main_chunks[2], &app.state.error_message.as_ref().unwrap());
+    if has_error {
+        render_error_banner(frame, main_chunks[2], app.state.error_message.as_ref().unwrap());
     }
 }
 
