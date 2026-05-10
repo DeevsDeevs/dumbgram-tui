@@ -1,4 +1,11 @@
+use crate::text::truncate_with_ellipsis;
 use chrono::{DateTime, Utc};
+
+pub const LAST_MESSAGE_PREVIEW_WIDTH: usize = 50;
+
+pub fn message_preview(content: &str) -> String {
+    truncate_with_ellipsis(content, LAST_MESSAGE_PREVIEW_WIDTH)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageStatus {
@@ -26,11 +33,6 @@ pub enum Update {
         user_name: String,
         is_typing: bool,
     },
-    MessageStatusUpdate {
-        chat_id: i64,
-        message_id: i32,
-        status: MessageStatus,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -55,12 +57,10 @@ pub struct Message {
     pub id: i32,
     pub chat_id: i64,
     pub sender_name: String,
-    pub sender_id: i64,
     pub content: String,
     pub timestamp: DateTime<Utc>,
     pub is_own: bool,
     pub is_edited: bool,
-    pub reply_to_id: Option<i32>,
     pub reply_to_content: Option<String>,
     pub status: MessageStatus,
     pub can_edit: bool,
@@ -68,10 +68,22 @@ pub struct Message {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct User {
-    pub id: i64,
-    pub username: Option<String>,
-    pub first_name: String,
-    pub last_name: Option<String>,
+#[cfg(test)]
+mod tests {
+    use super::{LAST_MESSAGE_PREVIEW_WIDTH, message_preview};
+    use crate::text::display_width;
+
+    #[test]
+    fn message_preview_leaves_short_text_unchanged() {
+        assert_eq!(message_preview("short message"), "short message");
+    }
+
+    #[test]
+    fn message_preview_truncates_by_display_width() {
+        let text = "好".repeat(40);
+        let preview = message_preview(&text);
+
+        assert!(preview.ends_with('…'));
+        assert!(display_width(&preview) <= LAST_MESSAGE_PREVIEW_WIDTH);
+    }
 }

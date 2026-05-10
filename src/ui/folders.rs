@@ -31,7 +31,12 @@ pub fn render_folders(frame: &mut Frame, area: ratatui::layout::Rect, app: &App,
             Style::default().fg(theme.foreground)
         };
 
-        spans.push(Span::styled(format!(" {} ", folder.name), style));
+        let label = if folder.unread_count > 0 {
+            format!(" {} ({}) ", folder.name, folder.unread_count)
+        } else {
+            format!(" {} ", folder.name)
+        };
+        spans.push(Span::styled(label, style));
     }
 
     if has_right {

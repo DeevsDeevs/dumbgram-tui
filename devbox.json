@@ -23,6 +23,18 @@
       "run": [
         "cargo run"
       ],
+      "run:mock": [
+        "cargo run -- --mock"
+      ],
+      "smoke": [
+        "cargo run -- --mock --smoke"
+      ],
+      "check-config": [
+        "cargo run -- --check-config"
+      ],
+      "check-auth": [
+        "cargo run -- --check-auth"
+      ],
       "fmt": [
         "cargo fmt"
       ],

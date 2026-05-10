@@ -7,6 +7,12 @@ pub trait TelegramClient {
     async fn get_folders(&self) -> Result<Vec<Folder>>;
     async fn get_chats(&self, folder_id: Option<i32>) -> Result<Vec<Chat>>;
     async fn get_messages(&self, chat_id: i64, limit: usize) -> Result<Vec<Message>>;
+    async fn get_messages_before(
+        &self,
+        chat_id: i64,
+        before_message_id: i32,
+        limit: usize,
+    ) -> Result<Vec<Message>>;
     async fn send_message(&self, chat_id: i64, content: String) -> Result<Message>;
     async fn edit_message(&self, chat_id: i64, message_id: i32, content: String) -> Result<()>;
     async fn reply_to_message(

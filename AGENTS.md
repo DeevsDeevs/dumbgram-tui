@@ -29,6 +29,10 @@ devbox run fmt         # cargo fmt
 devbox run fmt:check   # cargo fmt -- --check
 devbox run clippy      # cargo clippy --all-targets --all-features
 devbox run run         # cargo run
+devbox run run:mock    # cargo run -- --mock
+devbox run smoke       # cargo run -- --mock --smoke
+devbox run check-config # cargo run -- --check-config
+devbox run check-auth   # cargo run -- --check-auth
 ```
 
 For an interactive shell:
@@ -54,13 +58,37 @@ devbox shell
    session_file = "session.dat"
    ```
 
-3. Start the client:
+3. Start the real Telegram client:
 
    ```bash
    devbox run run
    ```
 
-On the first run, the app prompts for phone number, login code, and a 2FA password when required. The session is saved to `session.dat` for later runs.
+   Or launch the UI with built-in mock data, which does not require credentials:
+
+   ```bash
+   devbox run run:mock
+   ```
+
+   For automated credential-free validation, render the mock-only UI off-screen and exercise keyboard/mouse interactions:
+
+   ```bash
+   devbox run smoke
+   ```
+
+   Validate real Telegram configuration without connecting or entering the TUI:
+
+   ```bash
+   devbox run check-config
+   ```
+
+   Explicitly connect and verify that the saved Telegram session is authorized without entering the TUI or starting login:
+
+   ```bash
+   devbox run check-auth
+   ```
+
+On the first real Telegram run, the app prompts for phone number, login code, and a 2FA password when required. The session is saved to `session.dat` for later runs.
 
 ## Important files
 
@@ -79,5 +107,9 @@ On the first run, the app prompts for phone number, login code, and a 2FA passwo
 - Do not commit `config.toml`, `session.dat`, `*.dat`, `target/`, or `.devbox/`.
 - Treat Telegram API credentials and session files as secrets.
 - Prefer small, focused changes and verify with `devbox run check` at minimum.
+- Use `devbox run run:mock` for manual credential-free UI smoke testing.
+- Use `devbox run smoke` for automated credential-free render and keyboard/mouse interaction validation, including the on-screen controls help bar, status/error banners, chat/message position indicators, selected-chat typing indicator, per-chat drafts, unread reconciliation, mouse wheel chat/message scrolling, delete-confirmation mouse blocking, and edit-cancel draft restoration. `--smoke` is mock-only and must not touch real Telegram data.
+- Use `devbox run check-config` before real Telegram runs to validate local credentials and session path without network access.
+- Use `devbox run check-auth` only when explicitly opting into a Telegram connection; it verifies an existing saved session without starting login or the TUI.
 - If changing Rust source, run `devbox run fmt` before final validation.
 - Keep README and docs factual. Avoid claiming unreleased features as stable.

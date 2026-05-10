@@ -5,3 +5,4 @@ pub mod types;
 
 pub use client::TelegramClient;
 pub use grammers::GrammersClient;
+pub use mock::MockTelegramClient;

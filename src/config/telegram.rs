@@ -1,12 +1,37 @@
 use color_eyre::Result;
-use serde::Deserialize;
-use std::fs;
+use serde::{Deserialize, Deserializer};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TelegramConfig {
+    #[serde(deserialize_with = "deserialize_api_id")]
     pub api_id: i32,
     pub api_hash: String,
+    #[serde(alias = "session_path")]
     pub session_file: String,
+}
+
+fn deserialize_api_id<'de, D>(deserializer: D) -> std::result::Result<i32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ApiId {
+        Number(i32),
+        String(String),
+    }
+
+    match ApiId::deserialize(deserializer)? {
+        ApiId::Number(value) => Ok(value),
+        ApiId::String(value) => value
+            .trim()
+            .parse::<i32>()
+            .map_err(|_| serde::de::Error::custom("telegram.api_id must be an integer")),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -22,6 +47,25 @@ impl Config {
     }
 }
 
+impl TelegramConfig {
+    pub fn session_path(&self) -> PathBuf {
+        expand_tilde(&self.session_file)
+    }
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    expand_tilde_with_home(path, home.as_deref())
+}
+
+fn expand_tilde_with_home(path: &str, home: Option<&Path>) -> PathBuf {
+    match (path, home) {
+        ("~", Some(home)) => home.to_path_buf(),
+        (path, Some(home)) if path.starts_with("~/") => home.join(&path[2..]),
+        _ => PathBuf::from(path),
+    }
+}
+
 impl Default for TelegramConfig {
     fn default() -> Self {
         Self {
@@ -29,5 +73,85 @@ impl Default for TelegramConfig {
             api_hash: String::new(),
             session_file: "session.dat".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, expand_tilde_with_home};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn telegram_config_accepts_numeric_api_id_and_session_file() {
+        let config: Config = toml::from_str(
+            r#"
+            [telegram]
+            api_id = 12345
+            api_hash = "hash"
+            session_file = "session.dat"
+            "#,
+        )
+        .expect("current config format should parse");
+
+        assert_eq!(config.telegram.api_id, 12345);
+        assert_eq!(config.telegram.api_hash, "hash");
+        assert_eq!(config.telegram.session_file, "session.dat");
+    }
+
+    #[test]
+    fn telegram_config_accepts_string_api_id_and_session_path_alias() {
+        let config: Config = toml::from_str(
+            r#"
+            [telegram]
+            api_id = "12345"
+            api_hash = "hash"
+            session_path = "legacy-session.dat"
+            "#,
+        )
+        .expect("docs-style config format should parse");
+
+        assert_eq!(config.telegram.api_id, 12345);
+        assert_eq!(config.telegram.session_file, "legacy-session.dat");
+    }
+
+    #[test]
+    fn telegram_config_rejects_non_integer_api_id_string() {
+        let error = toml::from_str::<Config>(
+            r#"
+            [telegram]
+            api_id = "not-a-number"
+            api_hash = "hash"
+            session_file = "session.dat"
+            "#,
+        )
+        .expect_err("invalid api_id should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("telegram.api_id must be an integer")
+        );
+    }
+
+    #[test]
+    fn session_path_expands_home_prefix() {
+        let home = Path::new("/home/alice");
+
+        assert_eq!(
+            expand_tilde_with_home("~/.config/dumbgram/session.dat", Some(home)),
+            PathBuf::from("/home/alice/.config/dumbgram/session.dat")
+        );
+        assert_eq!(
+            expand_tilde_with_home("~", Some(home)),
+            PathBuf::from("/home/alice")
+        );
+        assert_eq!(
+            expand_tilde_with_home("session.dat", Some(home)),
+            PathBuf::from("session.dat")
+        );
+        assert_eq!(
+            expand_tilde_with_home("~/.config/dumbgram/session.dat", None),
+            PathBuf::from("~/.config/dumbgram/session.dat")
+        );
     }
 }

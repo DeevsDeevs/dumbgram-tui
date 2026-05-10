@@ -1,13 +1,13 @@
 use chrono::{DateTime, Utc};
 use color_eyre::Result;
-use grammers_client::{Client, Config, InitParams, InputMessage};
+use grammers_client::{Client, Config, InitParams, InputMessage, grammers_tl_types as tl};
 use grammers_session::Session;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use super::client::TelegramClient;
-use super::types::{Chat, Folder, Message, MessageStatus, Update};
+use super::types::{Chat, Folder, Message, MessageStatus, Update, message_preview};
 
 pub struct GrammersClient {
     client: Client,
@@ -68,12 +68,10 @@ fn convert_message(msg: grammers_client::types::Message) -> Message {
             .sender()
             .map(|s| s.name().to_string())
             .unwrap_or_else(|| "Unknown".to_string()),
-        sender_id: msg.sender().map(|s| s.id()).unwrap_or(0),
         content: msg.text().to_string(),
         timestamp: msg.date(),
         is_own: msg.outgoing(),
         is_edited: msg.edit_date().is_some(),
-        reply_to_id: msg.reply_to_message_id(),
         reply_to_content: None,
         status: if msg.outgoing() {
             MessageStatus::Sent
@@ -89,6 +87,39 @@ fn convert_message(msg: grammers_client::types::Message) -> Message {
 fn is_within_edit_window(date: DateTime<Utc>) -> bool {
     let now = chrono::Utc::now();
     (now - date).num_hours() < 48
+}
+
+fn dialog_unread_count(dialog: &grammers_client::types::Dialog) -> usize {
+    match &dialog.raw {
+        tl::enums::Dialog::Dialog(raw) => raw.unread_count.max(0) as usize,
+        tl::enums::Dialog::Folder(raw) => {
+            (raw.unread_muted_messages_count + raw.unread_unmuted_messages_count).max(0) as usize
+        }
+    }
+}
+
+fn dialog_folder_id(dialog: &grammers_client::types::Dialog) -> Option<i32> {
+    match &dialog.raw {
+        tl::enums::Dialog::Dialog(raw) => raw.folder_id,
+        tl::enums::Dialog::Folder(_) => None,
+    }
+}
+
+async fn collect_message_page(
+    mut iter: grammers_client::client::messages::MessageIter,
+    limit: usize,
+) -> Result<Vec<Message>> {
+    let mut messages = Vec::new();
+
+    while let Some(msg) = iter.next().await? {
+        messages.push(convert_message(msg));
+        if messages.len() >= limit {
+            break;
+        }
+    }
+
+    messages.reverse();
+    Ok(messages)
 }
 
 impl TelegramClient for GrammersClient {
@@ -143,25 +174,33 @@ impl TelegramClient for GrammersClient {
         let chat = self
             .get_chat(chat_id)
             .ok_or_else(|| color_eyre::eyre::eyre!("Chat not found in cache"))?;
-        let mut iter = self.client.iter_messages(chat);
-        let mut messages = Vec::new();
-
-        while let Some(msg) = iter.next().await? {
-            messages.push(convert_message(msg));
-            if messages.len() >= limit {
-                break;
-            }
-        }
-
-        messages.reverse();
-        Ok(messages)
+        let iter = self.client.iter_messages(chat);
+        collect_message_page(iter, limit).await
     }
 
-    async fn get_chats(&self, _folder_id: Option<i32>) -> Result<Vec<Chat>> {
+    async fn get_messages_before(
+        &self,
+        chat_id: i64,
+        before_message_id: i32,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let chat = self
+            .get_chat(chat_id)
+            .ok_or_else(|| color_eyre::eyre::eyre!("Chat not found in cache"))?;
+        let iter = self.client.iter_messages(chat).offset_id(before_message_id);
+        collect_message_page(iter, limit).await
+    }
+
+    async fn get_chats(&self, folder_id: Option<i32>) -> Result<Vec<Chat>> {
         let mut iter = self.client.iter_dialogs();
         let mut chats = Vec::new();
 
         while let Some(dialog) = iter.next().await? {
+            let dialog_folder_id = dialog_folder_id(&dialog);
+            if folder_id.is_some() && dialog_folder_id != folder_id {
+                continue;
+            }
+
             let chat = dialog.chat();
             self.cache_chat(chat.clone());
 
@@ -171,10 +210,10 @@ impl TelegramClient for GrammersClient {
                 last_message: dialog
                     .last_message
                     .as_ref()
-                    .map(|m| m.text().chars().take(50).collect()),
-                unread_count: 0,
+                    .map(|m| message_preview(m.text())),
+                unread_count: dialog_unread_count(&dialog),
                 is_group: matches!(chat, grammers_client::types::Chat::Group(_)),
-                folder_id: None,
+                folder_id: dialog_folder_id,
             });
         }
 
@@ -222,10 +261,10 @@ impl TelegramClient for GrammersClient {
                             _ => None,
                         };
 
-                        if let Some(update) = our_update {
-                            if tx.send(update).is_err() {
-                                break;
-                            }
+                        if let Some(update) = our_update
+                            && tx.send(update).is_err()
+                        {
+                            break;
                         }
                     }
                     Err(e) => {

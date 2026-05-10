@@ -9,7 +9,6 @@ pub struct Theme {
     pub own_message: Color,
     pub other_message: Color,
     pub error: Color,
-    pub success: Color,
     pub border: Color,
     pub border_focused: Color,
 }
@@ -25,7 +24,6 @@ impl Theme {
             own_message: Color::Rgb(137, 180, 250),
             other_message: Color::Rgb(205, 214, 244),
             error: Color::Rgb(243, 139, 168),
-            success: Color::Rgb(166, 227, 161),
             border: Color::Rgb(88, 91, 112),
             border_focused: Color::Rgb(203, 166, 247),
         }
