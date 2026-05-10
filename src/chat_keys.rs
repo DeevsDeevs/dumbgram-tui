@@ -1,5 +1,5 @@
 use crate::state::{AppState, FocusedPanel};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatKeyOutcome {
@@ -15,7 +15,15 @@ pub fn handle_chat_key(state: &mut AppState, key: KeyEvent) -> ChatKeyOutcome {
     }
 
     match key.code {
-        KeyCode::Down => ChatKeyOutcome::OpenNextChat,
+        KeyCode::Down
+            if state
+                .selected_chat_index
+                .checked_add(1)
+                .is_some_and(|next_index| next_index < state.chats.len()) =>
+        {
+            ChatKeyOutcome::OpenNextChat
+        }
+        KeyCode::Down => ChatKeyOutcome::Handled,
         KeyCode::Up => {
             if state.chats.is_empty() || state.selected_chat_index == 0 {
                 state.focused_panel = FocusedPanel::Folders;
@@ -31,6 +39,13 @@ pub fn handle_chat_key(state: &mut AppState, key: KeyEvent) -> ChatKeyOutcome {
         KeyCode::Right => {
             state.focused_panel = FocusedPanel::Messages;
             ChatKeyOutcome::Handled
+        }
+        KeyCode::Char(prefix)
+            if key.modifiers == KeyModifiers::NONE && !prefix.eq_ignore_ascii_case(&'q') =>
+        {
+            state
+                .next_chat_index_starting_with(prefix)
+                .map_or(ChatKeyOutcome::Ignored, ChatKeyOutcome::OpenChatAt)
         }
         _ => ChatKeyOutcome::Ignored,
     }
@@ -48,9 +63,13 @@ mod tests {
     }
 
     fn chat(id: i64) -> Chat {
+        named_chat(id, &format!("Chat {id}"))
+    }
+
+    fn named_chat(id: i64, name: &str) -> Chat {
         Chat {
             id,
-            name: format!("Chat {id}"),
+            name: name.to_string(),
             last_message: None,
             unread_count: 0,
             is_group: false,
@@ -59,11 +78,11 @@ mod tests {
     }
 
     #[test]
-    fn chat_keys_request_opening_next_or_previous_chat() {
+    fn chat_keys_request_opening_next_or_previous_chat_without_wrapping() {
         let mut state = AppState::new();
         state.focused_panel = FocusedPanel::Chats;
         state.chats = vec![chat(1), chat(2), chat(3)];
-        state.selected_chat_index = 2;
+        state.selected_chat_index = 1;
 
         assert_eq!(
             handle_chat_key(&mut state, key(KeyCode::Down)),
@@ -71,8 +90,34 @@ mod tests {
         );
         assert_eq!(
             handle_chat_key(&mut state, key(KeyCode::Up)),
-            ChatKeyOutcome::OpenChatAt(1)
+            ChatKeyOutcome::OpenChatAt(0)
         );
+
+        state.selected_chat_index = 2;
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Down)),
+            ChatKeyOutcome::Handled
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Chats);
+    }
+
+    #[test]
+    fn chat_keys_handle_down_when_no_alternate_chat_exists() {
+        let mut state = AppState::new();
+        state.focused_panel = FocusedPanel::Chats;
+
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Down)),
+            ChatKeyOutcome::Handled
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Chats);
+
+        state.chats = vec![chat(1)];
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Down)),
+            ChatKeyOutcome::Handled
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Chats);
     }
 
     #[test]
@@ -129,6 +174,39 @@ mod tests {
         state.focused_panel = FocusedPanel::Chats;
         assert_eq!(
             handle_chat_key(&mut state, key(KeyCode::Char('x'))),
+            ChatKeyOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn chat_keys_jump_to_next_chat_by_first_letter_without_intercepting_quit() {
+        let mut state = AppState::new();
+        state.focused_panel = FocusedPanel::Chats;
+        state.chats = vec![
+            named_chat(1, "General"),
+            named_chat(2, "Random"),
+            named_chat(3, "Release"),
+        ];
+        state.selected_chat_index = 0;
+
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Char('r'))),
+            ChatKeyOutcome::OpenChatAt(1)
+        );
+
+        state.selected_chat_index = 1;
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Char('r'))),
+            ChatKeyOutcome::OpenChatAt(2)
+        );
+
+        state.selected_chat_index = 2;
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Char('r'))),
+            ChatKeyOutcome::OpenChatAt(1)
+        );
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Char('q'))),
             ChatKeyOutcome::Ignored
         );
     }

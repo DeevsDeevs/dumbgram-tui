@@ -18,8 +18,10 @@ target
 
 # Local agent/mission state
 .missions/
+.chains/
 
-# Config and session files
+# Config, session, and local runtime files
 config.toml
 session.dat
 *.dat
+*.log

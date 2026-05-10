@@ -19,6 +19,10 @@ pub fn handle_app_key(state: &mut AppState, key: KeyEvent) -> AppKeyOutcome {
             state.adjust_split_right();
             AppKeyOutcome::Handled
         }
+        KeyCode::Char('?') => {
+            state.toggle_help_bar();
+            AppKeyOutcome::Handled
+        }
         _ => AppKeyOutcome::Ignored,
     }
 }
@@ -44,6 +48,23 @@ mod tests {
         );
 
         assert_eq!(state.split_ratio, split_ratio);
+    }
+
+    #[test]
+    fn app_keys_toggle_help_bar() {
+        let mut state = AppState::new();
+
+        assert!(state.show_help_bar);
+        assert_eq!(
+            handle_app_key(&mut state, key(KeyCode::Char('?'))),
+            AppKeyOutcome::Handled
+        );
+        assert!(!state.show_help_bar);
+        assert_eq!(
+            handle_app_key(&mut state, key(KeyCode::Char('?'))),
+            AppKeyOutcome::Handled
+        );
+        assert!(state.show_help_bar);
     }
 
     #[test]

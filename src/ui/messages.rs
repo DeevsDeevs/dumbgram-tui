@@ -1,3 +1,4 @@
+use super::{SELECTED_ROW_SYMBOL, list_text_width, selected_list_index};
 use crate::{
     app::App,
     config::Theme,
@@ -13,64 +14,83 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
+pub(crate) const MESSAGE_PANEL_LABEL: &str = "Messages";
+pub(crate) const MESSAGE_EMPTY_NO_CHAT_LABEL: &str = "No chat selected";
+pub(crate) const MESSAGE_EMPTY_NO_MESSAGES_LABEL: &str = "No messages loaded";
+pub(crate) const MESSAGE_METADATA_SEPARATOR: &str = " · ";
+pub(crate) const EDITED_METADATA_LABEL: &str = "edited";
+pub(crate) const REPLY_LINE_PREFIX: &str = "   ";
+pub(crate) const REPLY_MARKER: &str = "└─ Reply:";
+pub(crate) const REPLY_MARKER_SEPARATOR: &str = " ";
+pub(crate) const DELETE_CONFIRMATION_TEXT: &str = " Delete? y yes · n/Esc/Ctrl-C cancel ";
+pub(crate) const DELETE_CONFIRMATION_TITLE: &str = " Confirm ";
+pub(crate) const DELETE_CONFIRMATION_POPUP_WIDTH_PERCENT: u16 = 60;
+pub(crate) const DELETE_CONFIRMATION_POPUP_HEIGHT_PERCENT: u16 = 20;
+pub(crate) const MESSAGE_TITLE_BORDER_RESERVED_COLUMNS: u16 = 2;
+
 pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
-    let text_width = area.width.saturating_sub(5) as usize;
+    let text_width = list_text_width(area.width);
 
-    let items: Vec<ListItem> = app
-        .state
-        .messages
-        .iter()
-        .map(|msg| {
-            let time_str = msg.timestamp.format("%H:%M").to_string();
+    let items: Vec<ListItem> = if app.state.messages.is_empty() {
+        vec![ListItem::new(Line::from(Span::raw(
+            message_empty_placeholder(app.state.selected_chat_id().is_some()),
+        )))]
+    } else {
+        app.state
+            .messages
+            .iter()
+            .map(|msg| {
+                let time_str = msg.timestamp.format("%H:%M").to_string();
 
-            let status_label = message_status_label(&msg.status, msg.is_own);
+                let status_label = message_status_label(&msg.status, msg.is_own);
 
-            let metadata =
-                message_metadata(&time_str, msg.is_edited, status_label, msg.error.as_deref());
+                let metadata =
+                    message_metadata(&time_str, msg.is_edited, status_label, msg.error.as_deref());
 
-            let msg_color = if msg.status == MessageStatus::Failed {
-                ratatui::style::Color::Red
-            } else if msg.is_own {
-                theme.own_message
-            } else {
-                theme.other_message
-            };
+                let msg_color = if msg.status == MessageStatus::Failed {
+                    ratatui::style::Color::Red
+                } else if msg.is_own {
+                    theme.own_message
+                } else {
+                    theme.other_message
+                };
 
-            let sender = format!("{}: ", msg.sender_name);
-            let content_width = text_width
-                .saturating_sub(display_width(&sender) + display_width(&metadata))
-                .max(1);
-            let content = truncate_with_ellipsis(&msg.content, content_width);
+                let sender = format!("{}: ", msg.sender_name);
+                let content_width = text_width
+                    .saturating_sub(display_width(&sender) + display_width(&metadata))
+                    .max(1);
+                let content = truncate_with_ellipsis(&msg.content, content_width);
 
-            let main_line = Line::from(vec![
-                Span::styled(sender, Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(content, Style::default().fg(msg_color)),
-                Span::raw(metadata),
-            ]);
+                let main_line = Line::from(vec![
+                    Span::styled(sender, Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(content, Style::default().fg(msg_color)),
+                    Span::raw(metadata),
+                ]);
 
-            if let Some(reply_content) = &msg.reply_to_content {
-                let reply_line = Line::from(vec![Span::styled(
-                    format!(
-                        "   └─ Reply: {}",
-                        truncate_with_ellipsis(reply_content, text_width.saturating_sub(13))
-                    ),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                )]);
-                ListItem::new(vec![main_line, reply_line])
-            } else {
-                ListItem::new(main_line)
-            }
-        })
-        .collect();
+                if let Some(reply_content) = &msg.reply_to_content {
+                    let reply_line = Line::from(vec![Span::styled(
+                        format!(
+                            "{REPLY_LINE_PREFIX}{REPLY_MARKER}{REPLY_MARKER_SEPARATOR}{}",
+                            truncate_with_ellipsis(reply_content, reply_content_width(text_width))
+                        ),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )]);
+                    ListItem::new(vec![main_line, reply_line])
+                } else {
+                    ListItem::new(main_line)
+                }
+            })
+            .collect()
+    };
 
     let chat_name = app
         .state
         .chats
         .get(app.state.selected_chat_index)
         .map(|c| c.name.as_str())
-        .unwrap_or("Messages");
+        .unwrap_or(MESSAGE_PANEL_LABEL);
     let position_label = selected_message_position(app);
     let typing_label = selected_chat_typing_label(app);
     let title = message_panel_title(chat_name, &position_label, &typing_label, area.width);
@@ -91,17 +111,10 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
                 .bg(theme.selection)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol(SELECTED_ROW_SYMBOL);
 
-    let selected_index = if app.state.messages.is_empty() {
-        None
-    } else {
-        Some(
-            app.state
-                .selected_message_index
-                .min(app.state.messages.len().saturating_sub(1)),
-        )
-    };
+    let selected_index =
+        selected_list_index(app.state.selected_message_index, app.state.messages.len());
 
     let mut list_state = ListState::default()
         .with_offset(app.state.message_scroll_offset)
@@ -109,16 +122,32 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
     frame.render_stateful_widget(list, area, &mut list_state);
 
     if app.state.delete_confirmation.is_some() {
-        let popup_area = centered_rect(60, 20, area);
-        let confirmation = Paragraph::new(" Delete this message? (y/n) ")
-            .block(Block::default().borders(Borders::ALL).title(" Confirm "))
+        let popup_area = centered_rect(
+            DELETE_CONFIRMATION_POPUP_WIDTH_PERCENT,
+            DELETE_CONFIRMATION_POPUP_HEIGHT_PERCENT,
+            area,
+        );
+        let confirmation = Paragraph::new(DELETE_CONFIRMATION_TEXT)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(DELETE_CONFIRMATION_TITLE),
+            )
             .style(Style::default().bg(Color::Black).fg(Color::Red));
         frame.render_widget(Clear, popup_area);
         frame.render_widget(confirmation, popup_area);
     }
 }
 
-fn message_status_label(status: &MessageStatus, is_own: bool) -> &'static str {
+pub(crate) fn message_empty_placeholder(has_selected_chat: bool) -> &'static str {
+    if has_selected_chat {
+        MESSAGE_EMPTY_NO_MESSAGES_LABEL
+    } else {
+        MESSAGE_EMPTY_NO_CHAT_LABEL
+    }
+}
+
+pub(crate) fn message_status_label(status: &MessageStatus, is_own: bool) -> &'static str {
     if !is_own {
         return "";
     }
@@ -132,6 +161,14 @@ fn message_status_label(status: &MessageStatus, is_own: bool) -> &'static str {
     }
 }
 
+fn reply_content_width(text_width: usize) -> usize {
+    text_width.saturating_sub(
+        display_width(REPLY_LINE_PREFIX)
+            + display_width(REPLY_MARKER)
+            + display_width(REPLY_MARKER_SEPARATOR),
+    )
+}
+
 fn message_metadata(
     time_str: &str,
     is_edited: bool,
@@ -140,7 +177,7 @@ fn message_metadata(
 ) -> String {
     let mut parts = vec![time_str.to_string()];
     if is_edited {
-        parts.push("edited".to_string());
+        parts.push(EDITED_METADATA_LABEL.to_string());
     }
     if !status_label.is_empty() {
         parts.push(status_label.to_string());
@@ -149,20 +186,21 @@ fn message_metadata(
         parts.push(format!("error: {error}"));
     }
 
-    format!(" {}", parts.join(" · "))
+    format!(" {}", parts.join(MESSAGE_METADATA_SEPARATOR))
 }
 
 fn selected_message_position(app: &App) -> String {
-    if app.state.messages.is_empty() {
+    message_position_label(app.state.selected_message_index, app.state.messages.len())
+}
+
+pub(crate) fn message_position_label(selected_index: usize, message_count: usize) -> String {
+    if message_count == 0 {
         "0/0".to_string()
     } else {
         format!(
             "{}/{}",
-            app.state
-                .selected_message_index
-                .min(app.state.messages.len() - 1)
-                + 1,
-            app.state.messages.len()
+            selected_index.min(message_count - 1) + 1,
+            message_count
         )
     }
 }
@@ -175,11 +213,15 @@ fn selected_chat_typing_label(app: &App) -> String {
         .unwrap_or_default()
 }
 
-fn typing_label(users: &[String]) -> String {
+pub(crate) fn typing_label(users: &[String]) -> String {
     match users {
         [] => String::new(),
-        [user] => format!(" · {} typing", truncate_with_ellipsis(user, 18)),
-        _ => format!(" · {} typing", users.len()),
+        [user] => format!(
+            "{}{} typing",
+            MESSAGE_METADATA_SEPARATOR,
+            truncate_with_ellipsis(user, 18)
+        ),
+        _ => format!("{}{} typing", MESSAGE_METADATA_SEPARATOR, users.len()),
     }
 }
 
@@ -189,7 +231,7 @@ fn message_panel_title(
     typing_label: &str,
     area_width: u16,
 ) -> String {
-    let max_title_width = area_width.saturating_sub(2) as usize;
+    let max_title_width = message_title_width(area_width);
     if max_title_width == 0 {
         return String::new();
     }
@@ -205,6 +247,10 @@ fn message_panel_title(
     );
 
     truncate_with_ellipsis(&title, max_title_width)
+}
+
+fn message_title_width(area_width: u16) -> usize {
+    area_width.saturating_sub(MESSAGE_TITLE_BORDER_RESERVED_COLUMNS) as usize
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -230,9 +276,46 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::{
-        display_width, message_metadata, message_panel_title, message_status_label, typing_label,
+        DELETE_CONFIRMATION_POPUP_HEIGHT_PERCENT, DELETE_CONFIRMATION_POPUP_WIDTH_PERCENT,
+        DELETE_CONFIRMATION_TEXT, DELETE_CONFIRMATION_TITLE, MESSAGE_EMPTY_NO_CHAT_LABEL,
+        MESSAGE_EMPTY_NO_MESSAGES_LABEL, MESSAGE_TITLE_BORDER_RESERVED_COLUMNS, REPLY_LINE_PREFIX,
+        REPLY_MARKER, REPLY_MARKER_SEPARATOR, display_width, message_empty_placeholder,
+        message_metadata, message_panel_title, message_position_label, message_status_label,
+        message_title_width, reply_content_width, typing_label,
     };
     use crate::telegram::types::MessageStatus;
+
+    #[test]
+    fn message_position_label_shows_clamped_position() {
+        assert_eq!(message_position_label(0, 0), "0/0");
+        assert_eq!(message_position_label(0, 3), "1/3");
+        assert_eq!(message_position_label(99, 3), "3/3");
+    }
+
+    #[test]
+    fn message_empty_placeholder_distinguishes_missing_chat_from_empty_history() {
+        assert_eq!(
+            message_empty_placeholder(false),
+            MESSAGE_EMPTY_NO_CHAT_LABEL
+        );
+        assert_eq!(
+            message_empty_placeholder(true),
+            MESSAGE_EMPTY_NO_MESSAGES_LABEL
+        );
+    }
+
+    #[test]
+    fn delete_confirmation_text_stays_plain_and_keyboard_discoverable() {
+        assert_eq!(DELETE_CONFIRMATION_TITLE, " Confirm ");
+        assert_eq!(
+            DELETE_CONFIRMATION_TEXT,
+            " Delete? y yes · n/Esc/Ctrl-C cancel "
+        );
+        assert_eq!(DELETE_CONFIRMATION_POPUP_WIDTH_PERCENT, 60);
+        assert_eq!(DELETE_CONFIRMATION_POPUP_HEIGHT_PERCENT, 20);
+        assert!(DELETE_CONFIRMATION_TEXT.contains("y yes"));
+        assert!(DELETE_CONFIRMATION_TEXT.contains("n/Esc/Ctrl-C cancel"));
+    }
 
     #[test]
     fn message_status_labels_are_explicit_and_non_emoji() {
@@ -264,6 +347,17 @@ mod tests {
     }
 
     #[test]
+    fn reply_content_width_reserves_visible_reply_prefix() {
+        let prefix_width = display_width(REPLY_LINE_PREFIX)
+            + display_width(REPLY_MARKER)
+            + display_width(REPLY_MARKER_SEPARATOR);
+
+        assert_eq!(prefix_width, 13);
+        assert_eq!(reply_content_width(30), 17);
+        assert_eq!(reply_content_width(8), 0);
+    }
+
+    #[test]
     fn message_metadata_uses_plain_unicode_separators() {
         let metadata = message_metadata("12:34", true, "read", Some("network down"));
 
@@ -275,6 +369,13 @@ mod tests {
     #[test]
     fn message_metadata_keeps_incoming_messages_unlabeled() {
         assert_eq!(message_metadata("12:34", false, "", None), " 12:34");
+    }
+
+    #[test]
+    fn message_title_width_reserves_border_columns() {
+        assert_eq!(MESSAGE_TITLE_BORDER_RESERVED_COLUMNS, 2);
+        assert_eq!(message_title_width(24), 22);
+        assert_eq!(message_title_width(1), 0);
     }
 
     #[test]

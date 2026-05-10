@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmKeyOutcome {
@@ -10,6 +10,9 @@ pub enum ConfirmKeyOutcome {
 pub fn handle_confirm_key(key: KeyEvent) -> ConfirmKeyOutcome {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => ConfirmKeyOutcome::Confirm,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            ConfirmKeyOutcome::Cancel
+        }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => ConfirmKeyOutcome::Cancel,
         _ => ConfirmKeyOutcome::Ignored,
     }
@@ -22,6 +25,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
     #[test]
@@ -37,7 +44,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_keys_cancel_with_no_or_escape() {
+    fn confirm_keys_cancel_with_no_escape_or_ctrl_c() {
         assert_eq!(
             handle_confirm_key(key(KeyCode::Char('n'))),
             ConfirmKeyOutcome::Cancel
@@ -50,6 +57,7 @@ mod tests {
             handle_confirm_key(key(KeyCode::Esc)),
             ConfirmKeyOutcome::Cancel
         );
+        assert_eq!(handle_confirm_key(ctrl('c')), ConfirmKeyOutcome::Cancel);
     }
 
     #[test]

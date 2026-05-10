@@ -1,5 +1,13 @@
 use super::{render_chats, render_folders, render_input, render_messages};
-use crate::{app::App, config::Theme, state::FocusedPanel, telegram::types::MessageStatus};
+use crate::{
+    app::App,
+    config::Theme,
+    diagnostics,
+    state::{AppState, FocusedPanel},
+    telegram::types::{Message, MessageStatus},
+};
+use std::time::Instant;
+
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -8,7 +16,31 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+pub(crate) const HELP_SEPARATOR: &str = " · ";
+pub(crate) const LEGACY_HELP_SEPARATOR: &str = " | ";
+pub(crate) const FOCUS_LABEL_PREFIX: &str = "Focus:";
+pub(crate) const STATUS_BANNER_PREFIX: &str = "OK";
+pub(crate) const ERROR_BANNER_PREFIX: &str = "!";
+pub(crate) const FOLDERS_HELP_LABEL: &str = "Folders: Left/Right switch";
+pub(crate) const SINGLE_FOLDER_HELP_LABEL: &str = "Folders: no other folders";
+pub(crate) const CHATS_HELP_LABEL: &str = "Chats: Up/Down choose";
+pub(crate) const SINGLE_CHAT_HELP_LABEL: &str = "Chats: no other chats";
+pub(crate) const NO_CHAT_INPUT_HELP_LABEL: &str = "Input: no chat selected";
+pub(crate) const EMPTY_INPUT_HELP_LABEL: &str = "Input: type a message";
+pub(crate) const EMPTY_EDIT_HELP_LABEL: &str = "Editing: type replacement text";
+pub(crate) const EMPTY_REPLY_HELP_LABEL: &str = "Replying: type a reply";
+pub(crate) const NO_MESSAGE_HELP_LABEL: &str = "Messages: no message selected";
+pub(crate) const MAIN_CONTENT_MIN_HEIGHT: u16 = 1;
+pub(crate) const INPUT_PANEL_HEIGHT: u16 = 3;
+pub(crate) const HELP_BAR_HEIGHT: u16 = 1;
+pub(crate) const HIDE_HELP_CONTROL_LABEL: &str = "? hide help";
+pub(crate) const BANNER_HEIGHT: u16 = 3;
+pub(crate) const FOLDERS_PANEL_HEIGHT: u16 = 3;
+const SLOW_RENDER_LOG_THRESHOLD_MS: u128 = 100;
+
 pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
+    let render_started = diagnostics::enabled().then(Instant::now);
+
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.background)),
         frame.area(),
@@ -16,26 +48,22 @@ pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
 
     let has_banner = app.state.error_message.is_some() || app.state.status_message.is_some();
 
-    let main_chunks = if has_banner {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(3),
-                Constraint::Length(1),
-                Constraint::Length(3),
-            ])
-            .split(frame.area())
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(3),
-                Constraint::Length(1),
-            ])
-            .split(frame.area())
-    };
+    let show_help_bar = app.state.show_help_bar;
+    let mut vertical_constraints = vec![
+        Constraint::Min(MAIN_CONTENT_MIN_HEIGHT),
+        Constraint::Length(INPUT_PANEL_HEIGHT),
+    ];
+    if show_help_bar {
+        vertical_constraints.push(Constraint::Length(HELP_BAR_HEIGHT));
+    }
+    if has_banner {
+        vertical_constraints.push(Constraint::Length(BANNER_HEIGHT));
+    }
+
+    let main_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vertical_constraints)
+        .split(frame.area());
 
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -47,7 +75,10 @@ pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
 
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(FOLDERS_PANEL_HEIGHT),
+            Constraint::Min(MAIN_CONTENT_MIN_HEIGHT),
+        ])
         .split(horizontal_chunks[0]);
 
     app.state.folders_area = left_chunks[0];
@@ -59,28 +90,45 @@ pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
     render_chats(frame, left_chunks[1], app, theme);
     render_messages(frame, horizontal_chunks[1], app, theme);
     render_input(frame, main_chunks[1], app, theme);
-    render_help_bar(frame, main_chunks[2], app, theme);
+    if show_help_bar {
+        render_help_bar(frame, main_chunks[2], app, theme);
+    }
 
+    let banner_index = 2 + usize::from(show_help_bar);
     if let Some(error) = app.state.error_message.as_ref() {
-        render_error_banner(frame, main_chunks[3], error, theme);
+        render_error_banner(frame, main_chunks[banner_index], error, theme);
     } else if let Some(status) = app.state.status_message.as_ref() {
-        render_status_banner(frame, main_chunks[3], status, theme);
+        render_status_banner(frame, main_chunks[banner_index], status, theme);
+    }
+
+    if let Some(started) = render_started {
+        let elapsed_ms = started.elapsed().as_millis();
+        if elapsed_ms >= SLOW_RENDER_LOG_THRESHOLD_MS {
+            diagnostics::event(
+                "slow_render",
+                format!(
+                    "elapsed_ms={elapsed_ms} folders={} chats={} messages={} focused={} help_bar={} terminal={}x{}",
+                    app.state.folders.len(),
+                    app.state.chats.len(),
+                    app.state.messages.len(),
+                    app.state.focused_panel.label(),
+                    app.state.show_help_bar,
+                    frame.area().width,
+                    frame.area().height
+                ),
+            );
+        }
     }
 }
 
 fn render_help_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let focus = match app.state.focused_panel {
-        FocusedPanel::Folders => "Folders",
-        FocusedPanel::Chats => "Chats",
-        FocusedPanel::Messages => "Messages",
-        FocusedPanel::Input => "Input",
-    };
+    let focus = app.state.focused_panel.label();
 
     let controls = help_bar_controls(app);
 
     let help = Paragraph::new(Line::from(vec![
         Span::styled(
-            format!(" Focus: {} ", focus),
+            format!(" {} {} ", FOCUS_LABEL_PREFIX, focus),
             Style::default()
                 .fg(theme.border_focused)
                 .add_modifier(Modifier::BOLD),
@@ -92,36 +140,223 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     frame.render_widget(help, area);
 }
 
-fn help_bar_controls(app: &App) -> &'static str {
+fn help_bar_controls(app: &App) -> String {
     if app.state.delete_confirmation.is_some() {
-        "Confirm delete: y yes · n/Esc cancel"
+        join_help_controls(&["Confirm delete: y yes", "n/Esc/Ctrl-C cancel"])
     } else if app.state.editing_message_id.is_some() {
-        "Editing: Tab focus · Enter save · Ctrl-A/E/B/F/D/U/K/W edit · Esc/Ctrl-C cancel"
+        if app.state.focused_panel != FocusedPanel::Input {
+            let edit_label = if app.state.input_has_submit_text() {
+                "Editing: focus Input to save"
+            } else {
+                "Editing: focus Input to type"
+            };
+            join_help_controls(&[
+                edit_label,
+                "Tab focus",
+                "Esc/Ctrl-C cancel",
+                HIDE_HELP_CONTROL_LABEL,
+            ])
+        } else if !app.state.input_has_submit_text() {
+            join_help_controls(&[
+                EMPTY_EDIT_HELP_LABEL,
+                "Ctrl-A/E/B/F/D/U/K/W edit",
+                "Esc/Ctrl-C cancel",
+            ])
+        } else {
+            join_help_controls(&[
+                "Editing: Tab focus",
+                "Enter save",
+                "Ctrl-A/E/B/F/D/U/K/W edit",
+                "Esc/Ctrl-C cancel",
+            ])
+        }
     } else if app.state.replying_to_message_id.is_some() {
-        "Replying: Tab focus · Enter send · Ctrl-A/E/B/F/D/U/K/W edit · Esc/Ctrl-C cancel"
+        if app.state.focused_panel != FocusedPanel::Input {
+            let reply_label = if app.state.input_has_submit_text() {
+                "Replying: focus Input to send"
+            } else {
+                "Replying: focus Input to type"
+            };
+            join_help_controls(&[
+                reply_label,
+                "Tab focus",
+                "Esc/Ctrl-C cancel",
+                HIDE_HELP_CONTROL_LABEL,
+            ])
+        } else if !app.state.input_has_submit_text() {
+            join_help_controls(&[
+                EMPTY_REPLY_HELP_LABEL,
+                "Ctrl-A/E/B/F/D/U/K/W edit",
+                "Esc/Ctrl-C cancel",
+            ])
+        } else {
+            join_help_controls(&[
+                "Replying: Tab focus",
+                "Enter send",
+                "Ctrl-A/E/B/F/D/U/K/W edit",
+                "Esc/Ctrl-C cancel",
+            ])
+        }
     } else if app.state.focused_panel == FocusedPanel::Input {
-        "Input: Tab focus · Enter send · Ctrl-A/E/B/F/D/U/K/W edit · Esc cancel"
+        if app.state.selected_chat_id().is_none() {
+            join_help_controls(&[
+                NO_CHAT_INPUT_HELP_LABEL,
+                "Tab focus",
+                "Ctrl-A/E/B/F/D/U/K/W edit",
+                "Esc/Ctrl-C cancel",
+                "choose a chat before sending",
+            ])
+        } else if !app.state.input_has_submit_text() {
+            join_help_controls(&[
+                EMPTY_INPUT_HELP_LABEL,
+                "Ctrl-A/E/B/F/D/U/K/W edit",
+                "Esc/Ctrl-C cancel",
+            ])
+        } else {
+            join_help_controls(&[
+                "Input: Tab focus",
+                "Enter send",
+                "Ctrl-A/E/B/F/D/U/K/W edit",
+                "Esc/Ctrl-C cancel",
+            ])
+        }
+    } else if app.state.focused_panel == FocusedPanel::Folders {
+        let folder_label = if app.state.folders.len() > 1 {
+            FOLDERS_HELP_LABEL
+        } else {
+            SINGLE_FOLDER_HELP_LABEL
+        };
+        join_help_controls(&[
+            folder_label,
+            "Down chats",
+            "Tab focus",
+            "q quit",
+            "</> split",
+            HIDE_HELP_CONTROL_LABEL,
+        ])
+    } else if app.state.focused_panel == FocusedPanel::Chats {
+        let chats_label = if app.state.chats.len() > 1 {
+            CHATS_HELP_LABEL
+        } else {
+            SINGLE_CHAT_HELP_LABEL
+        };
+        let mut controls = vec![chats_label];
+        if app.state.chats.len() > 1 {
+            controls.push("letters jump");
+        }
+        controls.extend([
+            "Right messages",
+            "Left folders",
+            "Tab focus",
+            "q quit",
+            "</> split",
+            HIDE_HELP_CONTROL_LABEL,
+        ]);
+        join_help_controls(&controls)
+    } else if app.state.focused_panel == FocusedPanel::Messages
+        && app.state.selected_message().is_none()
+    {
+        join_help_controls(&[
+            NO_MESSAGE_HELP_LABEL,
+            "Left chats",
+            "Tab focus",
+            "q quit",
+            "</> split",
+            HIDE_HELP_CONTROL_LABEL,
+        ])
     } else if app.state.focused_panel == FocusedPanel::Messages
         && app
             .state
             .selected_message()
             .is_some_and(|message| message.status == MessageStatus::Sending)
     {
-        "Sending: waiting for Telegram · edit/delete/reply disabled"
+        join_help_controls(&[
+            "Sending: waiting for Telegram",
+            "edit/delete/reply disabled",
+            "Left chats",
+            "Tab focus",
+            "q quit",
+            "</> split",
+            HIDE_HELP_CONTROL_LABEL,
+        ])
     } else if app.state.focused_panel == FocusedPanel::Messages
         && app
             .state
             .selected_message()
             .is_some_and(|message| message.status == MessageStatus::Failed)
     {
-        "Failed send: d dismiss · edit restored input then Enter retry"
+        join_help_controls(&[
+            "Failed send: d dismiss",
+            "Input restored: Enter retry",
+            "Left chats",
+            "Tab focus",
+            "q quit",
+            "</> split",
+            HIDE_HELP_CONTROL_LABEL,
+        ])
+    } else if app.state.focused_panel == FocusedPanel::Messages {
+        app.state
+            .selected_message()
+            .map(|message| selected_message_help_controls(&app.state, message))
+            .unwrap_or_else(|| {
+                join_help_controls(&[
+                    NO_MESSAGE_HELP_LABEL,
+                    "Left chats",
+                    "Tab focus",
+                    HIDE_HELP_CONTROL_LABEL,
+                ])
+            })
     } else {
-        "q quit · Tab focus · arrows/Pg/Home/End move · e edit · r reply · d delete · </> split"
+        join_help_controls(&["q quit", "Tab focus", "</> split", HIDE_HELP_CONTROL_LABEL])
     }
 }
 
+fn selected_message_help_controls(state: &AppState, message: &Message) -> String {
+    let has_messages = !state.messages.is_empty();
+    let at_loaded_top = state.selected_message_index == 0 && has_messages;
+    let at_loaded_bottom = state.selected_message_is_last() && has_messages;
+    let movement_label =
+        if at_loaded_top && at_loaded_bottom && state.selected_chat_older_history_exhausted() {
+            "Messages: no older history · Down input · Pg/Home/End move"
+        } else if at_loaded_top && state.selected_chat_older_history_exhausted() {
+            "Messages: no older history · Down/PgDn/Home/End move"
+        } else if at_loaded_top && at_loaded_bottom {
+            "Messages: Up/PgUp older · Down input · Pg/Home/End move"
+        } else if at_loaded_top {
+            "Messages: Up/PgUp older · Down/PgDn/Home/End move"
+        } else if at_loaded_bottom {
+            "Messages: Up/Pg/Home/End move · Down input"
+        } else {
+            "Messages: Up/Down/Pg/Home/End move"
+        };
+    let mut controls = vec![movement_label];
+
+    if message.is_own && message.can_edit {
+        controls.push("e edit");
+    }
+
+    controls.push("r reply");
+
+    if message.is_own && message.can_delete {
+        controls.push("d delete");
+    }
+
+    controls.extend([
+        "Left chats",
+        "Tab focus",
+        "q quit",
+        "</> split",
+        HIDE_HELP_CONTROL_LABEL,
+    ]);
+    join_help_controls(&controls)
+}
+
+fn join_help_controls(parts: &[&str]) -> String {
+    parts.join(HELP_SEPARATOR)
+}
+
 fn render_error_banner(frame: &mut Frame, area: Rect, error: &str, theme: &Theme) {
-    let error_widget = Paragraph::new(Span::raw(format!(" ! {}", error)))
+    let error_widget = Paragraph::new(Span::raw(format!(" {} {}", ERROR_BANNER_PREFIX, error)))
         .style(Style::default().fg(theme.error).bg(theme.background))
         .block(
             Block::default()
@@ -133,7 +368,7 @@ fn render_error_banner(frame: &mut Frame, area: Rect, error: &str, theme: &Theme
 }
 
 fn render_status_banner(frame: &mut Frame, area: Rect, status: &str, theme: &Theme) {
-    let status_widget = Paragraph::new(Span::raw(format!(" OK {}", status)))
+    let status_widget = Paragraph::new(Span::raw(format!(" {} {}", STATUS_BANNER_PREFIX, status)))
         .style(
             Style::default()
                 .fg(theme.border_focused)
@@ -150,17 +385,43 @@ fn render_status_banner(frame: &mut Frame, area: Rect, status: &str, theme: &The
 
 #[cfg(test)]
 mod tests {
-    use super::help_bar_controls;
+    use super::{
+        BANNER_HEIGHT, ERROR_BANNER_PREFIX, FOCUS_LABEL_PREFIX, FOLDERS_PANEL_HEIGHT,
+        HELP_BAR_HEIGHT, HELP_SEPARATOR, INPUT_PANEL_HEIGHT, LEGACY_HELP_SEPARATOR,
+        MAIN_CONTENT_MIN_HEIGHT, STATUS_BANNER_PREFIX, help_bar_controls,
+    };
     use crate::app::App;
     use crate::state::{DeleteConfirmation, FocusedPanel};
-    use crate::telegram::types::{Message, MessageStatus};
+    use crate::telegram::types::{
+        Chat, Folder, Message, MessageStatus, OWN_SENDER_NAME, all_folder,
+    };
+    use crate::ui::render_app_to_string_for_test;
     use chrono::Utc;
+
+    fn folder(id: i32, name: &str) -> Folder {
+        Folder {
+            id,
+            name: name.to_string(),
+            unread_count: 0,
+        }
+    }
+
+    fn chat(id: i64, name: &str) -> Chat {
+        Chat {
+            id,
+            name: name.to_string(),
+            last_message: None,
+            unread_count: 0,
+            is_group: false,
+            folder_id: None,
+        }
+    }
 
     fn message_with_status(status: MessageStatus) -> Message {
         Message {
             id: -1,
             chat_id: 10,
-            sender_name: "You".to_string(),
+            sender_name: OWN_SENDER_NAME.to_string(),
             content: "failed draft".to_string(),
             timestamp: Utc::now(),
             is_own: true,
@@ -175,12 +436,57 @@ mod tests {
 
     fn assert_unicode_separators(label: &str) {
         assert!(
-            label.contains('·'),
+            label.contains(HELP_SEPARATOR),
             "missing Unicode separator in {label:?}"
         );
         assert!(
-            !label.contains(" | "),
+            !label.contains(LEGACY_HELP_SEPARATOR),
             "ASCII pipe separator should not render in {label:?}"
+        );
+    }
+
+    #[test]
+    fn fixed_layout_heights_are_explicit() {
+        assert_eq!(MAIN_CONTENT_MIN_HEIGHT, 1);
+        assert_eq!(INPUT_PANEL_HEIGHT, 3);
+        assert_eq!(HELP_BAR_HEIGHT, 1);
+        assert_eq!(BANNER_HEIGHT, 3);
+        assert_eq!(FOLDERS_PANEL_HEIGHT, 3);
+    }
+
+    #[test]
+    fn layout_renders_error_banner_before_status_banner() {
+        let mut app = App::new();
+        app.state.error_message = Some("network down".to_string());
+        app.state.status_message = Some("saved".to_string());
+
+        let rendered = render_app_to_string_for_test(&mut app);
+
+        assert!(
+            rendered.contains(&format!("{ERROR_BANNER_PREFIX} network down")),
+            "missing error banner"
+        );
+        assert!(
+            !rendered.contains(&format!("{STATUS_BANNER_PREFIX} saved")),
+            "status banner should not render while an error is active"
+        );
+    }
+
+    #[test]
+    fn layout_can_hide_help_bar_without_hiding_status_banner() {
+        let mut app = App::new();
+        app.state.show_help_bar = false;
+        app.state.status_message = Some("ready".to_string());
+
+        let rendered = render_app_to_string_for_test(&mut app);
+
+        assert!(
+            !rendered.contains(FOCUS_LABEL_PREFIX),
+            "hidden help bar should omit focus controls"
+        );
+        assert!(
+            rendered.contains(&format!("{STATUS_BANNER_PREFIX} ready")),
+            "hidden help bar should not hide the status banner"
         );
     }
 
@@ -194,12 +500,31 @@ mod tests {
 
         let mut editing = App::new();
         editing.state.editing_message_id = Some(20);
+        editing.state.input_buffer = "replacement".to_string();
 
         let mut replying = App::new();
         replying.state.replying_to_message_id = Some(20);
+        replying.state.input_buffer = "reply".to_string();
 
         let mut input = App::new();
         input.state.focused_panel = FocusedPanel::Input;
+        input.state.chats = vec![crate::telegram::types::Chat {
+            id: 10,
+            name: "General".to_string(),
+            last_message: None,
+            unread_count: 0,
+            is_group: false,
+            folder_id: None,
+        }];
+
+        let mut folders = App::new();
+        folders.state.focused_panel = FocusedPanel::Folders;
+
+        let mut chats = App::new();
+        chats.state.focused_panel = FocusedPanel::Chats;
+
+        let mut empty_messages = App::new();
+        empty_messages.state.focused_panel = FocusedPanel::Messages;
 
         let mut sending = App::new();
         sending.state.focused_panel = FocusedPanel::Messages;
@@ -212,12 +537,205 @@ mod tests {
         let mut normal = App::new();
         normal.state.focused_panel = FocusedPanel::Messages;
         normal.state.messages = vec![message_with_status(MessageStatus::Sent)];
+        normal.state.messages[0].can_edit = true;
+        normal.state.messages[0].can_delete = true;
 
         for app in [
-            &confirm, &editing, &replying, &input, &sending, &failed, &normal,
+            &confirm,
+            &editing,
+            &replying,
+            &input,
+            &folders,
+            &chats,
+            &empty_messages,
+            &sending,
+            &failed,
+            &normal,
         ] {
-            assert_unicode_separators(help_bar_controls(app));
+            assert_unicode_separators(&help_bar_controls(app));
         }
+    }
+
+    #[test]
+    fn help_bar_omits_submit_when_compose_input_is_empty() {
+        let mut editing = App::new();
+        editing.state.focused_panel = FocusedPanel::Input;
+        editing.state.editing_message_id = Some(20);
+        assert_eq!(
+            help_bar_controls(&editing),
+            "Editing: type replacement text · Ctrl-A/E/B/F/D/U/K/W edit · Esc/Ctrl-C cancel"
+        );
+
+        editing.state.input_buffer = "   ".to_string();
+        assert_eq!(
+            help_bar_controls(&editing),
+            "Editing: type replacement text · Ctrl-A/E/B/F/D/U/K/W edit · Esc/Ctrl-C cancel"
+        );
+
+        editing.state.input_buffer = "replacement".to_string();
+        assert_eq!(
+            help_bar_controls(&editing),
+            "Editing: Tab focus · Enter save · Ctrl-A/E/B/F/D/U/K/W edit · Esc/Ctrl-C cancel"
+        );
+
+        let mut replying = App::new();
+        replying.state.focused_panel = FocusedPanel::Input;
+        replying.state.replying_to_message_id = Some(20);
+        assert_eq!(
+            help_bar_controls(&replying),
+            "Replying: type a reply · Ctrl-A/E/B/F/D/U/K/W edit · Esc/Ctrl-C cancel"
+        );
+
+        replying.state.input_buffer = "   ".to_string();
+        assert_eq!(
+            help_bar_controls(&replying),
+            "Replying: type a reply · Ctrl-A/E/B/F/D/U/K/W edit · Esc/Ctrl-C cancel"
+        );
+
+        replying.state.input_buffer = "reply".to_string();
+        assert_eq!(
+            help_bar_controls(&replying),
+            "Replying: Tab focus · Enter send · Ctrl-A/E/B/F/D/U/K/W edit · Esc/Ctrl-C cancel"
+        );
+    }
+
+    #[test]
+    fn help_bar_uses_focus_aware_compose_controls_outside_input() {
+        let mut editing = App::new();
+        editing.state.focused_panel = FocusedPanel::Messages;
+        editing.state.editing_message_id = Some(20);
+        assert_eq!(
+            help_bar_controls(&editing),
+            "Editing: focus Input to type · Tab focus · Esc/Ctrl-C cancel · ? hide help"
+        );
+
+        editing.state.input_buffer = "replacement".to_string();
+        assert_eq!(
+            help_bar_controls(&editing),
+            "Editing: focus Input to save · Tab focus · Esc/Ctrl-C cancel · ? hide help"
+        );
+
+        let mut replying = App::new();
+        replying.state.focused_panel = FocusedPanel::Messages;
+        replying.state.replying_to_message_id = Some(20);
+        assert_eq!(
+            help_bar_controls(&replying),
+            "Replying: focus Input to type · Tab focus · Esc/Ctrl-C cancel · ? hide help"
+        );
+
+        replying.state.input_buffer = "reply".to_string();
+        assert_eq!(
+            help_bar_controls(&replying),
+            "Replying: focus Input to send · Tab focus · Esc/Ctrl-C cancel · ? hide help"
+        );
+    }
+
+    #[test]
+    fn help_bar_omits_send_when_input_is_empty() {
+        let mut app = App::new();
+        app.state.focused_panel = FocusedPanel::Input;
+        app.state.chats = vec![crate::telegram::types::Chat {
+            id: 10,
+            name: "General".to_string(),
+            last_message: None,
+            unread_count: 0,
+            is_group: false,
+            folder_id: None,
+        }];
+
+        assert_eq!(
+            help_bar_controls(&app),
+            "Input: type a message · Ctrl-A/E/B/F/D/U/K/W edit · Esc/Ctrl-C cancel"
+        );
+
+        app.state.input_buffer = "   ".to_string();
+        assert_eq!(
+            help_bar_controls(&app),
+            "Input: type a message · Ctrl-A/E/B/F/D/U/K/W edit · Esc/Ctrl-C cancel"
+        );
+
+        app.state.input_buffer = "draft".to_string();
+        assert_eq!(
+            help_bar_controls(&app),
+            "Input: Tab focus · Enter send · Ctrl-A/E/B/F/D/U/K/W edit · Esc/Ctrl-C cancel"
+        );
+    }
+
+    #[test]
+    fn help_bar_omits_send_when_input_has_no_selected_chat() {
+        let mut app = App::new();
+        app.state.focused_panel = FocusedPanel::Input;
+
+        assert_eq!(
+            help_bar_controls(&app),
+            "Input: no chat selected · Tab focus · Ctrl-A/E/B/F/D/U/K/W edit · Esc/Ctrl-C cancel · choose a chat before sending"
+        );
+
+        app.state.input_buffer = "draft".to_string();
+        assert_eq!(
+            help_bar_controls(&app),
+            "Input: no chat selected · Tab focus · Ctrl-A/E/B/F/D/U/K/W edit · Esc/Ctrl-C cancel · choose a chat before sending"
+        );
+    }
+
+    #[test]
+    fn help_bar_uses_panel_specific_controls_for_folders_and_chats() {
+        let mut folders = App::new();
+        folders.state.focused_panel = FocusedPanel::Folders;
+        assert_eq!(
+            help_bar_controls(&folders),
+            "Folders: no other folders · Down chats · Tab focus · q quit · </> split · ? hide help"
+        );
+
+        folders.state.folders = vec![all_folder(0), folder(2, "Work")];
+        assert_eq!(
+            help_bar_controls(&folders),
+            "Folders: Left/Right switch · Down chats · Tab focus · q quit · </> split · ? hide help"
+        );
+
+        let mut chats = App::new();
+        chats.state.focused_panel = FocusedPanel::Chats;
+        assert_eq!(
+            help_bar_controls(&chats),
+            "Chats: no other chats · Right messages · Left folders · Tab focus · q quit · </> split · ? hide help"
+        );
+
+        chats.state.chats = vec![crate::telegram::types::Chat {
+            id: 10,
+            name: "General".to_string(),
+            last_message: None,
+            unread_count: 0,
+            is_group: false,
+            folder_id: None,
+        }];
+        assert_eq!(
+            help_bar_controls(&chats),
+            "Chats: no other chats · Right messages · Left folders · Tab focus · q quit · </> split · ? hide help"
+        );
+
+        chats.state.chats.push(crate::telegram::types::Chat {
+            id: 11,
+            name: "Random".to_string(),
+            last_message: None,
+            unread_count: 0,
+            is_group: false,
+            folder_id: None,
+        });
+        assert_eq!(
+            help_bar_controls(&chats),
+            "Chats: Up/Down choose · letters jump · Right messages · Left folders · Tab focus · q quit · </> split · ? hide help"
+        );
+    }
+
+    #[test]
+    fn help_bar_omits_message_actions_when_no_message_is_selected() {
+        let mut app = App::new();
+        app.state.focused_panel = FocusedPanel::Messages;
+
+        assert_eq!(
+            help_bar_controls(&app),
+            "Messages: no message selected · Left chats · Tab focus · q quit · </> split · ? hide help"
+        );
     }
 
     #[test]
@@ -228,7 +746,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&app),
-            "Sending: waiting for Telegram · edit/delete/reply disabled"
+            "Sending: waiting for Telegram · edit/delete/reply disabled · Left chats · Tab focus · q quit · </> split · ? hide help"
         );
     }
 
@@ -240,19 +758,64 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&app),
-            "Failed send: d dismiss · edit restored input then Enter retry"
+            "Failed send: d dismiss · Input restored: Enter retry · Left chats · Tab focus · q quit · </> split · ? hide help"
         );
     }
 
     #[test]
-    fn help_bar_uses_normal_message_controls_for_non_failed_rows() {
+    fn help_bar_uses_capability_aware_controls_for_selected_messages() {
+        let mut reply_only = App::new();
+        reply_only.state.focused_panel = FocusedPanel::Messages;
+        reply_only.state.messages = vec![message_with_status(MessageStatus::Sent)];
+
+        assert_eq!(
+            help_bar_controls(&reply_only),
+            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · Left chats · Tab focus · q quit · </> split · ? hide help"
+        );
+
+        reply_only
+            .state
+            .messages
+            .push(message_with_status(MessageStatus::Sent));
+        reply_only.state.selected_message_index = 1;
+        assert_eq!(
+            help_bar_controls(&reply_only),
+            "Messages: Up/Pg/Home/End move · Down input · r reply · Left chats · Tab focus · q quit · </> split · ? hide help"
+        );
+
+        reply_only
+            .state
+            .messages
+            .push(message_with_status(MessageStatus::Sent));
+        reply_only.state.selected_message_index = 1;
+        assert_eq!(
+            help_bar_controls(&reply_only),
+            "Messages: Up/Down/Pg/Home/End move · r reply · Left chats · Tab focus · q quit · </> split · ? hide help"
+        );
+
+        let mut full_actions = App::new();
+        full_actions.state.focused_panel = FocusedPanel::Messages;
+        full_actions.state.messages = vec![message_with_status(MessageStatus::Sent)];
+        full_actions.state.messages[0].can_edit = true;
+        full_actions.state.messages[0].can_delete = true;
+
+        assert_eq!(
+            help_bar_controls(&full_actions),
+            "Messages: Up/PgUp older · Down input · Pg/Home/End move · e edit · r reply · d delete · Left chats · Tab focus · q quit · </> split · ? hide help"
+        );
+    }
+
+    #[test]
+    fn help_bar_stops_advertising_older_history_when_exhausted() {
         let mut app = App::new();
         app.state.focused_panel = FocusedPanel::Messages;
+        app.state.chats = vec![chat(10, "General")];
         app.state.messages = vec![message_with_status(MessageStatus::Sent)];
+        app.state.mark_selected_chat_older_history_exhausted();
 
         assert_eq!(
             help_bar_controls(&app),
-            "q quit · Tab focus · arrows/Pg/Home/End move · e edit · r reply · d delete · </> split"
+            "Messages: no older history · Down input · Pg/Home/End move · r reply · Left chats · Tab focus · q quit · </> split · ? hide help"
         );
     }
 }

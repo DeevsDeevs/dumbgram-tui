@@ -1,9 +1,86 @@
-use crate::telegram::types::{Chat, Folder, Message, MessageStatus, Update, message_preview};
+use crate::diagnostics;
+use crate::telegram::types::{
+    Chat, Folder, Message, MessageStatus, OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID, Update,
+    is_all_folder, message_preview,
+};
 use crate::text::display_width;
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
 use unicode_segmentation::UnicodeSegmentation;
+
+pub(crate) const FOLDER_LEFT_SCROLL_INDICATOR: &str = "◀ ";
+pub(crate) const FOLDER_SEPARATOR: &str = " │ ";
+pub(crate) const FOLDER_RIGHT_SCROLL_INDICATOR: &str = " ▶";
+pub(crate) const FOLDER_LABEL_HORIZONTAL_PADDING: &str = "  ";
+pub(crate) const NO_CHAT_SELECTED_ERROR: &str = "No chat selected";
+pub(crate) const MESSAGE_EDITED_STATUS: &str = "Message edited";
+pub(crate) const REPLY_SENT_STATUS: &str = "Reply sent";
+pub(crate) const MESSAGE_DELETED_STATUS: &str = "Message deleted";
+pub(crate) const EDIT_FAILED_PREFIX: &str = "Edit failed";
+pub(crate) const REPLY_FAILED_PREFIX: &str = "Reply failed";
+pub(crate) const SEND_FAILED_PREFIX: &str = "Send failed";
+pub(crate) const DELETE_FAILED_PREFIX: &str = "Delete failed";
+pub(crate) const CANNOT_EDIT_MESSAGE_ERROR: &str = "Cannot edit this message";
+pub(crate) const CANNOT_REPLY_UNSENT_MESSAGE_ERROR: &str = "Cannot reply to unsent message";
+pub(crate) const CANNOT_DELETE_MESSAGE_ERROR: &str = "Cannot delete this message";
+pub(crate) const FAILED_SEND_DISMISSED_STATUS: &str = "Failed send dismissed";
+pub(crate) const REMOTE_EDIT_WHILE_EDITING_STATUS: &str = "Message updated remotely while editing";
+pub(crate) const DEFAULT_SPLIT_RATIO: f32 = 0.3;
+pub(crate) const SPLIT_RATIO_STEP: f32 = 0.05;
+pub(crate) const MIN_SPLIT_RATIO: f32 = 0.1;
+pub(crate) const MAX_SPLIT_RATIO: f32 = 0.9;
+pub(crate) const NOTIFICATION_TIMEOUT_SECONDS: i64 = 5;
+pub(crate) const PANEL_BORDER_RESERVED_COLUMNS: u16 = 2;
+pub(crate) const PANEL_BORDER_RESERVED_ROWS: u16 = 2;
+pub(crate) const CHAT_LIST_ITEM_HEIGHT: u16 = 2;
+pub(crate) const FOLDER_VIEWPORT_RESERVED_COLUMNS: u16 = 4;
+pub(crate) const MESSAGE_ROW_HEIGHT: usize = 1;
+pub(crate) const REPLY_MESSAGE_ROW_HEIGHT: usize = 2;
+
+fn last_index(item_count: usize) -> usize {
+    item_count.saturating_sub(1)
+}
+
+fn message_visible_row_height(message: &Message) -> usize {
+    if message.reply_to_content.is_some() {
+        REPLY_MESSAGE_ROW_HEIGHT
+    } else {
+        MESSAGE_ROW_HEIGHT
+    }
+}
+
+fn chat_name_starts_with(name: &str, prefix: char) -> bool {
+    let Some(first) = name.trim_start().chars().next() else {
+        return false;
+    };
+
+    first.to_lowercase().to_string() == prefix.to_lowercase().to_string()
+}
+
+fn action_failed_error(prefix: &str, error: impl std::fmt::Display) -> String {
+    format!("{prefix}: {error}")
+}
+
+pub(crate) fn edit_failed_error(error: impl std::fmt::Display) -> String {
+    action_failed_error(EDIT_FAILED_PREFIX, error)
+}
+
+pub(crate) fn reply_failed_error(error: impl std::fmt::Display) -> String {
+    action_failed_error(REPLY_FAILED_PREFIX, error)
+}
+
+pub(crate) fn send_failed_error(error: impl std::fmt::Display) -> String {
+    action_failed_error(SEND_FAILED_PREFIX, error)
+}
+
+pub(crate) fn delete_failed_error(error: impl std::fmt::Display) -> String {
+    action_failed_error(DELETE_FAILED_PREFIX, error)
+}
+
+fn delete_update_matches_chat(update_chat_id: i64, chat_id: i64) -> bool {
+    update_chat_id == UNKNOWN_DELETE_UPDATE_CHAT_ID || update_chat_id == chat_id
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusedPanel {
@@ -11,6 +88,17 @@ pub enum FocusedPanel {
     Chats,
     Messages,
     Input,
+}
+
+impl FocusedPanel {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Folders => "Folders",
+            Self::Chats => "Chats",
+            Self::Messages => "Messages",
+            Self::Input => "Input",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,8 +139,10 @@ pub struct AppState {
     pub input_cursor: usize,
     pub input_scroll_offset: usize,
     pub chat_drafts: HashMap<i64, String>,
+    cached_folder_chats: HashMap<Option<i32>, Vec<Chat>>,
     older_history_exhausted_chats: HashSet<i64>,
     pub split_ratio: f32,
+    pub show_help_bar: bool,
     pub folders_area: Rect,
     pub chats_area: Rect,
     pub messages_area: Rect,
@@ -84,8 +174,10 @@ impl AppState {
             input_cursor: 0,
             input_scroll_offset: 0,
             chat_drafts: HashMap::new(),
+            cached_folder_chats: HashMap::new(),
             older_history_exhausted_chats: HashSet::new(),
-            split_ratio: 0.3,
+            split_ratio: DEFAULT_SPLIT_RATIO,
+            show_help_bar: true,
             folders_area: Rect::default(),
             chats_area: Rect::default(),
             messages_area: Rect::default(),
@@ -102,6 +194,10 @@ impl AppState {
         }
     }
 
+    pub fn toggle_help_bar(&mut self) {
+        self.show_help_bar = !self.show_help_bar;
+    }
+
     fn folder_label_display_width(folder: &Folder) -> usize {
         let unread_width = if folder.unread_count > 0 {
             display_width(&format!(" ({})", folder.unread_count))
@@ -109,7 +205,7 @@ impl AppState {
             0
         };
 
-        display_width(&folder.name) + unread_width + display_width("  ")
+        display_width(&folder.name) + unread_width + display_width(FOLDER_LABEL_HORIZONTAL_PADDING)
     }
 
     fn visible_folder_count_from_offset(&self, offset: usize) -> usize {
@@ -117,22 +213,25 @@ impl AppState {
             return 0;
         }
 
-        let available_width = self.folders_area.width.saturating_sub(4) as usize;
+        let available_width =
+            self.folders_area
+                .width
+                .saturating_sub(FOLDER_VIEWPORT_RESERVED_COLUMNS) as usize;
         let mut visible_count = 0usize;
         let mut current_width = 0usize;
 
         if offset > 0 {
-            current_width += display_width("◀ ");
+            current_width += display_width(FOLDER_LEFT_SCROLL_INDICATOR);
         }
 
         for (relative_idx, folder) in self.folders.iter().skip(offset).enumerate() {
             let separator_width = if visible_count == 0 {
                 0
             } else {
-                display_width(" │ ")
+                display_width(FOLDER_SEPARATOR)
             };
             let right_indicator_width = if offset + relative_idx + 1 < self.folders.len() {
-                display_width(" ▶")
+                display_width(FOLDER_RIGHT_SCROLL_INDICATOR)
             } else {
                 0
             };
@@ -175,7 +274,7 @@ impl AppState {
 
         let mut current_column = 0usize;
         if has_left_scroll {
-            let indicator_width = display_width("◀ ");
+            let indicator_width = display_width(FOLDER_LEFT_SCROLL_INDICATOR);
             if column < current_column + indicator_width {
                 return None;
             }
@@ -184,7 +283,7 @@ impl AppState {
 
         for (idx, folder) in visible_folders.iter().enumerate() {
             if idx > 0 {
-                let separator_width = display_width(" │ ");
+                let separator_width = display_width(FOLDER_SEPARATOR);
                 if column < current_column + separator_width {
                     return None;
                 }
@@ -210,10 +309,10 @@ impl AppState {
 
         self.selected_folder_index = self
             .selected_folder_index
-            .min(self.folders.len().saturating_sub(1));
+            .min(last_index(self.folders.len()));
         self.folder_scroll_offset = self
             .folder_scroll_offset
-            .min(self.folders.len().saturating_sub(1));
+            .min(last_index(self.folders.len()));
 
         if self.selected_folder_index < self.folder_scroll_offset {
             self.folder_scroll_offset = self.selected_folder_index;
@@ -222,7 +321,7 @@ impl AppState {
         while self.folder_scroll_offset > 0 {
             let candidate = self.folder_scroll_offset - 1;
             let visible_count = self.visible_folder_count_from_offset(candidate);
-            let max_visible_index = candidate + visible_count.saturating_sub(1);
+            let max_visible_index = candidate + last_index(visible_count);
             if visible_count > 0 && self.selected_folder_index <= max_visible_index {
                 self.folder_scroll_offset = candidate;
             } else {
@@ -231,11 +330,11 @@ impl AppState {
         }
 
         let visible_count = self.visible_folder_count_from_offset(self.folder_scroll_offset);
-        let max_visible_index = self.folder_scroll_offset + visible_count.saturating_sub(1);
+        let max_visible_index = self.folder_scroll_offset + last_index(visible_count);
         if visible_count == 0 || self.selected_folder_index > max_visible_index {
             self.folder_scroll_offset = self
                 .selected_folder_index
-                .saturating_sub(visible_count.saturating_sub(1));
+                .saturating_sub(last_index(visible_count));
         }
     }
 
@@ -253,6 +352,17 @@ impl AppState {
         }
     }
 
+    pub fn next_chat_index_starting_with(&self, prefix: char) -> Option<usize> {
+        if self.chats.len() <= 1 || !prefix.is_alphanumeric() {
+            return None;
+        }
+
+        let start = self.selected_chat_index.saturating_add(1);
+        (start..self.chats.len())
+            .chain(0..self.selected_chat_index.min(self.chats.len()))
+            .find(|&index| chat_name_starts_with(&self.chats[index].name, prefix))
+    }
+
     pub fn selected_chat_id(&self) -> Option<i64> {
         self.chats.get(self.selected_chat_index).map(|chat| chat.id)
     }
@@ -260,7 +370,34 @@ impl AppState {
     pub fn selected_folder_filter_id(&self) -> Option<i32> {
         self.folders
             .get(self.selected_folder_index)
-            .and_then(|folder| (folder.name != "All").then_some(folder.id))
+            .and_then(|folder| (!is_all_folder(folder)).then_some(folder.id))
+    }
+
+    fn folder_cache_key_at(&self, folder_index: usize) -> Option<Option<i32>> {
+        self.folders
+            .get(folder_index)
+            .map(|folder| (!is_all_folder(folder)).then_some(folder.id))
+    }
+
+    pub fn cache_folder_chats_at(&mut self, folder_index: usize) {
+        let Some(folder_id) = self.folder_cache_key_at(folder_index) else {
+            return;
+        };
+        self.cached_folder_chats
+            .insert(folder_id, self.chats.clone());
+    }
+
+    pub fn cache_selected_folder_chats(&mut self) {
+        self.cache_folder_chats_at(self.selected_folder_index);
+    }
+
+    pub fn restore_cached_folder_chats(&mut self, folder_id: Option<i32>) -> bool {
+        let Some(chats) = self.cached_folder_chats.get(&folder_id).cloned() else {
+            return false;
+        };
+        self.chats = chats;
+        self.reset_chat_selection();
+        true
     }
 
     pub fn apply_loaded_selected_chat_messages(&mut self, messages: Vec<Message>) {
@@ -327,11 +464,17 @@ impl AppState {
     }
 
     fn input_visible_capacity(&self) -> usize {
-        self.input_area.width.saturating_sub(2) as usize
+        self.input_area
+            .width
+            .saturating_sub(PANEL_BORDER_RESERVED_COLUMNS) as usize
     }
 
     fn input_len(&self) -> usize {
         self.input_buffer.graphemes(true).count()
+    }
+
+    pub(crate) fn input_has_submit_text(&self) -> bool {
+        !self.input_buffer.trim().is_empty()
     }
 
     pub fn input_cursor(&self) -> usize {
@@ -372,7 +515,7 @@ impl AppState {
 
         let cursor = self.input_cursor();
         let grapheme_count = self.input_len();
-        let max_cursor_column = visible.saturating_sub(1);
+        let max_cursor_column = last_index(visible);
         let mut offset = self.input_scroll_offset.min(grapheme_count);
 
         if self.input_display_width_between(0, grapheme_count) <= visible {
@@ -422,7 +565,7 @@ impl AppState {
         }
 
         self.input_display_width_between(self.effective_input_scroll_offset(), self.input_cursor())
-            .min(visible.saturating_sub(1))
+            .min(last_index(visible))
     }
 
     pub fn ensure_input_cursor_visible(&mut self) {
@@ -608,7 +751,7 @@ impl AppState {
         let selected_folder = self
             .folders
             .get(self.selected_folder_index)
-            .map(|folder| (folder.id, folder.name == "All"));
+            .map(|folder| (folder.id, is_all_folder(folder)));
         let Some((selected_folder_id, is_all_selected)) = selected_folder else {
             return;
         };
@@ -619,7 +762,7 @@ impl AppState {
                 continue;
             }
 
-            folder.unread_count = if folder.name == "All" {
+            folder.unread_count = if is_all_folder(folder) {
                 self.chats.iter().map(|chat| chat.unread_count).sum()
             } else {
                 self.chats
@@ -635,10 +778,27 @@ impl AppState {
         match update {
             Update::NewMessage(msg) => {
                 let current_chat_id = self.chats.get(self.selected_chat_index).map(|c| c.id);
-
                 if current_chat_id == Some(msg.chat_id)
-                    && !self.messages.iter().any(|m| m.id == msg.id)
+                    && self
+                        .messages
+                        .iter()
+                        .any(|message| message.chat_id == msg.chat_id && message.id >= msg.id)
                 {
+                    diagnostics::event(
+                        "new_message_update_ignored",
+                        format!(
+                            "reason=stale_loaded_message chat_id={} message_id={} loaded_count={}",
+                            msg.chat_id,
+                            msg.id,
+                            self.messages.len()
+                        ),
+                    );
+                    return;
+                }
+
+                self.clear_typing_user(msg.chat_id, &msg.sender_name);
+
+                if current_chat_id == Some(msg.chat_id) {
                     self.messages.push(msg.clone());
                 }
 
@@ -673,14 +833,14 @@ impl AppState {
                 if self.editing_message_id == Some(message_id)
                     && self.selected_chat_id() == Some(chat_id)
                 {
-                    self.set_status("Message updated remotely while editing");
+                    self.set_status(REMOTE_EDIT_WHILE_EDITING_STATUS);
                 }
             }
             Update::DeleteMessage {
                 chat_id,
                 message_id,
             } => {
-                if chat_id == 0 {
+                if chat_id == UNKNOWN_DELETE_UPDATE_CHAT_ID {
                     self.messages.retain(|m| m.id != message_id);
                 } else {
                     self.messages
@@ -689,7 +849,7 @@ impl AppState {
 
                 if self.delete_confirmation.is_some_and(|confirmation| {
                     confirmation.message_id == message_id
-                        && (chat_id == 0 || confirmation.chat_id == chat_id)
+                        && delete_update_matches_chat(chat_id, confirmation.chat_id)
                 }) {
                     self.delete_confirmation = None;
                 }
@@ -699,7 +859,9 @@ impl AppState {
                     self.selected_message_index = self.messages.len() - 1;
                 }
                 self.ensure_selected_message_visible();
-                if chat_id == 0 || self.selected_chat_id() == Some(chat_id) {
+                if self.selected_chat_id().is_some_and(|selected_chat_id| {
+                    delete_update_matches_chat(chat_id, selected_chat_id)
+                }) {
                     self.refresh_selected_chat_last_message_from_loaded_messages();
                 }
             }
@@ -713,22 +875,31 @@ impl AppState {
                     if !users.contains(&user_name) {
                         users.push(user_name);
                     }
-                } else if let Some(users) = self.typing_users.get_mut(&chat_id) {
-                    users.retain(|u| u != &user_name);
-                    if users.is_empty() {
-                        self.typing_users.remove(&chat_id);
-                    }
+                } else {
+                    self.clear_typing_user(chat_id, &user_name);
                 }
+            }
+            Update::Error(error) => self.set_error(error),
+        }
+    }
+
+    fn clear_typing_user(&mut self, chat_id: i64, user_name: &str) {
+        if let Some(users) = self.typing_users.get_mut(&chat_id) {
+            users.retain(|user| user != user_name);
+            if users.is_empty() {
+                self.typing_users.remove(&chat_id);
             }
         }
     }
 
+    #[cfg(test)]
     pub fn select_next_folder(&mut self) {
         if !self.folders.is_empty() {
             self.selected_folder_index = (self.selected_folder_index + 1) % self.folders.len();
         }
     }
 
+    #[cfg(test)]
     pub fn select_prev_folder(&mut self) {
         if !self.folders.is_empty() {
             self.selected_folder_index = if self.selected_folder_index == 0 {
@@ -740,7 +911,12 @@ impl AppState {
     }
 
     pub fn chat_visible_capacity(&self) -> usize {
-        (self.chats_area.height.saturating_sub(2) / 2).max(1) as usize
+        (self
+            .chats_area
+            .height
+            .saturating_sub(PANEL_BORDER_RESERVED_ROWS)
+            / CHAT_LIST_ITEM_HEIGHT)
+            .max(1) as usize
     }
 
     pub fn ensure_selected_chat_visible(&mut self) {
@@ -750,9 +926,7 @@ impl AppState {
             return;
         }
 
-        self.selected_chat_index = self
-            .selected_chat_index
-            .min(self.chats.len().saturating_sub(1));
+        self.selected_chat_index = self.selected_chat_index.min(last_index(self.chats.len()));
         let capacity = self.chat_visible_capacity();
         let max_scroll_offset = self.chats.len().saturating_sub(capacity);
         self.chat_scroll_offset = self.chat_scroll_offset.min(max_scroll_offset);
@@ -769,7 +943,10 @@ impl AppState {
     }
 
     pub fn message_visible_capacity(&self) -> usize {
-        self.messages_area.height.saturating_sub(2).max(1) as usize
+        self.messages_area
+            .height
+            .saturating_sub(PANEL_BORDER_RESERVED_ROWS)
+            .max(1) as usize
     }
 
     pub fn ensure_selected_message_visible(&mut self) {
@@ -781,7 +958,7 @@ impl AppState {
 
         self.selected_message_index = self
             .selected_message_index
-            .min(self.messages.len().saturating_sub(1));
+            .min(last_index(self.messages.len()));
         let capacity = self.message_visible_capacity();
         let max_scroll_offset = self.messages.len().saturating_sub(capacity);
         self.message_scroll_offset = self.message_scroll_offset.min(max_scroll_offset);
@@ -801,6 +978,10 @@ impl AppState {
         self.messages.get(self.selected_message_index)
     }
 
+    pub fn selected_message_is_last(&self) -> bool {
+        self.messages.is_empty() || self.selected_message_index >= last_index(self.messages.len())
+    }
+
     pub fn select_message_at_visible_row(&mut self, row: usize) {
         if self.messages.is_empty() {
             return;
@@ -813,11 +994,7 @@ impl AppState {
             .enumerate()
             .skip(self.message_scroll_offset)
         {
-            let message_height = if message.reply_to_content.is_some() {
-                2
-            } else {
-                1
-            };
+            let message_height = message_visible_row_height(message);
             if row < current_row + message_height {
                 self.selected_message_index = idx;
                 self.ensure_selected_message_visible();
@@ -849,7 +1026,7 @@ impl AppState {
                 self.save_current_draft();
                 self.enter_edit_mode(message_id, content);
             } else {
-                self.set_error("Cannot edit this message".to_string());
+                self.set_error(CANNOT_EDIT_MESSAGE_ERROR.to_string());
             }
         }
     }
@@ -863,7 +1040,7 @@ impl AppState {
                 self.save_current_draft();
                 self.enter_reply_mode(message_id);
             } else {
-                self.set_error("Cannot reply to unsent message".to_string());
+                self.set_error(CANNOT_REPLY_UNSENT_MESSAGE_ERROR.to_string());
             }
         }
     }
@@ -888,7 +1065,7 @@ impl AppState {
                 message_id,
             });
         } else {
-            self.set_error("Cannot delete this message".to_string());
+            self.set_error(CANNOT_DELETE_MESSAGE_ERROR.to_string());
         }
     }
 
@@ -901,7 +1078,7 @@ impl AppState {
         self.ensure_selected_message_visible();
         self.refresh_selected_chat_last_message_from_loaded_messages();
         self.delete_confirmation = None;
-        self.set_status("Failed send dismissed");
+        self.set_status(FAILED_SEND_DISMISSED_STATUS);
     }
 
     pub fn select_next_message(&mut self) {
@@ -952,11 +1129,11 @@ impl AppState {
     }
 
     pub fn adjust_split_left(&mut self) {
-        self.split_ratio = (self.split_ratio - 0.05).max(0.1);
+        self.split_ratio = (self.split_ratio - SPLIT_RATIO_STEP).max(MIN_SPLIT_RATIO);
     }
 
     pub fn adjust_split_right(&mut self) {
-        self.split_ratio = (self.split_ratio + 0.05).min(0.9);
+        self.split_ratio = (self.split_ratio + SPLIT_RATIO_STEP).min(MAX_SPLIT_RATIO);
     }
 
     pub fn focus_next_panel(&mut self) {
@@ -998,12 +1175,12 @@ impl AppState {
     }
 
     pub fn prepare_message_submit(&mut self) -> Option<MessageSubmitAction> {
-        if self.input_buffer.is_empty() {
+        if !self.input_has_submit_text() {
             return None;
         }
 
         let Some(chat_id) = self.selected_chat_id() else {
-            self.set_error("No chat selected".to_string());
+            self.set_error(NO_CHAT_SELECTED_ERROR.to_string());
             return None;
         };
 
@@ -1046,31 +1223,31 @@ impl AppState {
             msg.is_edited = true;
         }
         self.refresh_selected_chat_last_message_from_loaded_messages();
-        self.set_status("Message edited");
+        self.set_status(MESSAGE_EDITED_STATUS);
         self.finish_compose_mode();
     }
 
     pub fn apply_edit_failure(&mut self, error: String) {
-        self.set_error(format!("Edit failed: {}", error));
+        self.set_error(edit_failed_error(error));
     }
 
     pub fn apply_reply_success(&mut self, message: Message) {
         self.messages.push(message);
         self.select_last_message();
         self.refresh_selected_chat_last_message_from_loaded_messages();
-        self.set_status("Reply sent");
+        self.set_status(REPLY_SENT_STATUS);
         self.finish_compose_mode();
     }
 
     pub fn apply_reply_failure(&mut self, error: String) {
-        self.set_error(format!("Reply failed: {}", error));
+        self.set_error(reply_failed_error(error));
     }
 
     pub fn apply_send_pending(&mut self, temp_id: i32, chat_id: i64, content: String) {
         self.messages.push(Message {
             id: temp_id,
             chat_id,
-            sender_name: "You".to_string(),
+            sender_name: OWN_SENDER_NAME.to_string(),
             content,
             timestamp: Utc::now(),
             is_own: true,
@@ -1090,11 +1267,18 @@ impl AppState {
     }
 
     pub fn apply_send_success(&mut self, temp_id: i32, sent_message: Message) {
+        let chat_id = sent_message.chat_id;
         if let Some(idx) = self.messages.iter().position(|m| m.id == temp_id) {
             self.messages[idx] = sent_message;
         }
+        if self.selected_chat_id() == Some(chat_id)
+            && let Some(chat) = self.chats.get_mut(self.selected_chat_index)
+        {
+            chat.unread_count = 0;
+        }
         self.refresh_selected_chat_last_message_from_loaded_messages();
-        self.set_status("Message sent");
+        self.sync_folder_unread_counts_from_loaded_chats();
+        self.clear_status();
     }
 
     pub fn apply_send_failure(&mut self, temp_id: i32, error: String) {
@@ -1114,7 +1298,7 @@ impl AppState {
             self.focused_panel = FocusedPanel::Input;
             self.save_current_draft();
         }
-        self.set_error(format!("Send failed: {}", error));
+        self.set_error(send_failed_error(error));
     }
 
     pub fn apply_delete_success(&mut self, confirmation: DeleteConfirmation) {
@@ -1125,12 +1309,12 @@ impl AppState {
         }
         self.ensure_selected_message_visible();
         self.refresh_selected_chat_last_message_from_loaded_messages();
-        self.set_status("Message deleted");
+        self.set_status(MESSAGE_DELETED_STATUS);
         self.delete_confirmation = None;
     }
 
     pub fn apply_delete_failure(&mut self, error: String) {
-        self.set_error(format!("Delete failed: {}", error));
+        self.set_error(delete_failed_error(error));
         self.delete_confirmation = None;
     }
 
@@ -1139,7 +1323,9 @@ impl AppState {
     }
 
     pub fn clear_compose_for_deleted_message(&mut self, chat_id: i64, message_id: i32) -> bool {
-        let current_chat_matches = chat_id == 0 || self.selected_chat_id() == Some(chat_id);
+        let current_chat_matches = self
+            .selected_chat_id()
+            .is_some_and(|selected_chat_id| delete_update_matches_chat(chat_id, selected_chat_id));
         let compose_target_matches = self.editing_message_id == Some(message_id)
             || self.replying_to_message_id == Some(message_id);
 
@@ -1188,13 +1374,15 @@ impl AppState {
 
     pub fn check_notification_timeout(&mut self) {
         if let Some(timestamp) = self.error_timestamp
-            && Utc::now().signed_duration_since(timestamp).num_seconds() > 5
+            && Utc::now().signed_duration_since(timestamp).num_seconds()
+                > NOTIFICATION_TIMEOUT_SECONDS
         {
             self.clear_error();
         }
 
         if let Some(timestamp) = self.status_timestamp
-            && Utc::now().signed_duration_since(timestamp).num_seconds() > 5
+            && Utc::now().signed_duration_since(timestamp).num_seconds()
+                > NOTIFICATION_TIMEOUT_SECONDS
         {
             self.clear_status();
         }
@@ -1209,10 +1397,61 @@ impl Default for AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, DeleteConfirmation, FocusedPanel, MessageSubmitAction};
-    use crate::telegram::types::{Chat, Folder, Message, MessageStatus, Update};
+    use super::{
+        AppState, CANNOT_DELETE_MESSAGE_ERROR, CANNOT_EDIT_MESSAGE_ERROR,
+        CANNOT_REPLY_UNSENT_MESSAGE_ERROR, CHAT_LIST_ITEM_HEIGHT, DEFAULT_SPLIT_RATIO,
+        DeleteConfirmation, FAILED_SEND_DISMISSED_STATUS, FOLDER_VIEWPORT_RESERVED_COLUMNS,
+        FocusedPanel, MAX_SPLIT_RATIO, MESSAGE_DELETED_STATUS, MESSAGE_EDITED_STATUS,
+        MESSAGE_ROW_HEIGHT, MIN_SPLIT_RATIO, MessageSubmitAction, NO_CHAT_SELECTED_ERROR,
+        NOTIFICATION_TIMEOUT_SECONDS, PANEL_BORDER_RESERVED_COLUMNS, PANEL_BORDER_RESERVED_ROWS,
+        REMOTE_EDIT_WHILE_EDITING_STATUS, REPLY_MESSAGE_ROW_HEIGHT, REPLY_SENT_STATUS,
+        SPLIT_RATIO_STEP, delete_failed_error, delete_update_matches_chat, edit_failed_error,
+        last_index, message_visible_row_height, reply_failed_error, send_failed_error,
+    };
+    use crate::telegram::types::{
+        Chat, Folder, Message, MessageStatus, OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID,
+        Update, all_folder,
+    };
     use chrono::{Duration, Utc};
     use ratatui::layout::Rect;
+
+    const TEST_MESSAGE_AREA_WIDTH: u16 = 80;
+    const TEST_VISIBLE_ROW_MESSAGE_AREA_WIDTH: u16 = 40;
+    const TEST_SHORT_MESSAGE_AREA_HEIGHT: u16 = 5;
+    const TEST_PAGED_MESSAGE_AREA_HEIGHT: u16 = 6;
+    const TEST_TALL_MESSAGE_AREA_HEIGHT: u16 = 20;
+    const TEST_BLANK_ROW_MESSAGE_AREA_HEIGHT: u16 = 8;
+    const TEST_FOLDER_AREA_HEIGHT: u16 = 3;
+    const TEST_NARROW_FOLDER_AREA_WIDTH: u16 = 14;
+    const TEST_UNREAD_FOLDER_AREA_WIDTH: u16 = 15;
+    const TEST_WIDE_FOLDER_AREA_WIDTH: u16 = 40;
+    const TEST_EXPANDED_FOLDER_AREA_WIDTH: u16 = 80;
+    const TEST_INPUT_AREA_HEIGHT: u16 = 3;
+    const TEST_NARROW_INPUT_AREA_WIDTH: u16 = 8;
+    const TEST_EXPANDED_INPUT_AREA_WIDTH: u16 = 20;
+    const TEST_CHAT_AREA_WIDTH: u16 = 40;
+    const TEST_SHORT_CHAT_AREA_HEIGHT: u16 = 6;
+    const TEST_TALL_CHAT_AREA_HEIGHT: u16 = 20;
+
+    fn message_area(height: u16) -> Rect {
+        message_area_with_width(TEST_MESSAGE_AREA_WIDTH, height)
+    }
+
+    fn message_area_with_width(width: u16, height: u16) -> Rect {
+        Rect::new(0, 0, width, height)
+    }
+
+    fn folder_area(width: u16) -> Rect {
+        Rect::new(0, 0, width, TEST_FOLDER_AREA_HEIGHT)
+    }
+
+    fn input_area(width: u16) -> Rect {
+        Rect::new(0, 0, width, TEST_INPUT_AREA_HEIGHT)
+    }
+
+    fn chat_area(height: u16) -> Rect {
+        Rect::new(0, 0, TEST_CHAT_AREA_WIDTH, height)
+    }
 
     fn chat(id: i64, name: &str) -> Chat {
         chat_with_unread(id, name, 0, None)
@@ -1258,7 +1497,7 @@ mod tests {
         Message {
             id,
             chat_id,
-            sender_name: if is_own { "You" } else { "Alice" }.to_string(),
+            sender_name: if is_own { OWN_SENDER_NAME } else { "Alice" }.to_string(),
             content: content.to_string(),
             timestamp: Utc::now(),
             is_own,
@@ -1279,7 +1518,7 @@ mod tests {
 
     fn state_with_many_chats() -> AppState {
         let mut state = AppState::new();
-        state.chats_area = Rect::new(0, 0, 40, 6);
+        state.chats_area = chat_area(TEST_SHORT_CHAT_AREA_HEIGHT);
         state.chats = (0..8)
             .map(|idx| chat(100 + idx, &format!("Chat {}", idx)))
             .collect();
@@ -1287,9 +1526,36 @@ mod tests {
     }
 
     #[test]
+    fn viewport_capacity_constants_are_explicit() {
+        assert_eq!(PANEL_BORDER_RESERVED_COLUMNS, 2);
+        assert_eq!(PANEL_BORDER_RESERVED_ROWS, 2);
+        assert_eq!(CHAT_LIST_ITEM_HEIGHT, 2);
+        assert_eq!(FOLDER_VIEWPORT_RESERVED_COLUMNS, 4);
+        assert_eq!(MESSAGE_ROW_HEIGHT, 1);
+        assert_eq!(REPLY_MESSAGE_ROW_HEIGHT, 2);
+    }
+
+    #[test]
+    fn message_visible_row_height_accounts_for_reply_preview_rows() {
+        let plain = message(10);
+        let mut reply = message(20);
+        reply.reply_to_content = Some("quoted".to_string());
+
+        assert_eq!(message_visible_row_height(&plain), MESSAGE_ROW_HEIGHT);
+        assert_eq!(message_visible_row_height(&reply), REPLY_MESSAGE_ROW_HEIGHT);
+    }
+
+    #[test]
+    fn last_index_saturates_empty_counts_for_collection_and_viewport_tails() {
+        assert_eq!(last_index(0), 0);
+        assert_eq!(last_index(1), 0);
+        assert_eq!(last_index(3), 2);
+    }
+
+    #[test]
     fn visible_folders_use_display_width_for_wide_names() {
         let mut state = AppState::new();
-        state.folders_area = Rect::new(0, 0, 14, 3);
+        state.folders_area = folder_area(TEST_NARROW_FOLDER_AREA_WIDTH);
         state.folders = vec![folder(1, "好好好", 0), folder(2, "Later", 0)];
 
         let (visible, has_left, has_right) = state.get_visible_folders();
@@ -1303,7 +1569,7 @@ mod tests {
     #[test]
     fn visible_folders_account_for_unread_suffix_width() {
         let mut state = AppState::new();
-        state.folders_area = Rect::new(0, 0, 15, 3);
+        state.folders_area = folder_area(TEST_UNREAD_FOLDER_AREA_WIDTH);
         state.folders = vec![folder(1, "好", 12), folder(2, "Later", 0)];
 
         let (visible, _, has_right) = state.get_visible_folders();
@@ -1316,18 +1582,14 @@ mod tests {
     #[test]
     fn folder_selection_clamps_scroll_offset_when_viewport_grows() {
         let mut state = AppState::new();
-        state.folders_area = Rect::new(0, 0, 14, 3);
-        state.folders = vec![
-            folder(1, "All", 0),
-            folder(2, "Work", 0),
-            folder(3, "Later", 0),
-        ];
+        state.folders_area = folder_area(TEST_NARROW_FOLDER_AREA_WIDTH);
+        state.folders = vec![all_folder(0), folder(2, "Work", 0), folder(3, "Later", 0)];
 
         state.select_folder(2);
         assert_eq!(state.selected_folder_index, 2);
         assert_eq!(state.folder_scroll_offset, 2);
 
-        state.folders_area = Rect::new(0, 0, 80, 3);
+        state.folders_area = folder_area(TEST_EXPANDED_FOLDER_AREA_WIDTH);
         state.ensure_selected_folder_visible();
 
         assert_eq!(state.selected_folder_index, 2);
@@ -1337,7 +1599,7 @@ mod tests {
     #[test]
     fn folder_index_at_visible_column_matches_rendered_label_widths() {
         let mut state = AppState::new();
-        state.folders_area = Rect::new(0, 0, 40, 3);
+        state.folders_area = folder_area(TEST_WIDE_FOLDER_AREA_WIDTH);
         state.folders = vec![folder(1, "好", 0), folder(2, "Work", 0)];
 
         assert_eq!(state.folder_index_at_visible_column(0), Some(0));
@@ -1350,12 +1612,8 @@ mod tests {
     #[test]
     fn folder_index_at_visible_column_ignores_scroll_indicators() {
         let mut state = AppState::new();
-        state.folders_area = Rect::new(0, 0, 40, 3);
-        state.folders = vec![
-            folder(1, "All", 0),
-            folder(2, "好", 0),
-            folder(3, "Work", 0),
-        ];
+        state.folders_area = folder_area(TEST_WIDE_FOLDER_AREA_WIDTH);
+        state.folders = vec![all_folder(0), folder(2, "好", 0), folder(3, "Work", 0)];
         state.folder_scroll_offset = 1;
 
         assert_eq!(state.folder_index_at_visible_column(0), None);
@@ -1366,7 +1624,7 @@ mod tests {
     #[test]
     fn incoming_message_in_active_chat_does_not_increment_unread() {
         let mut state = AppState::new();
-        state.folders = vec![folder(1, "All", 99), folder(2, "Personal", 99)];
+        state.folders = vec![all_folder(99), folder(2, "Personal", 99)];
         state.chats = vec![
             chat_with_unread(1, "Chat 1", 3, Some(2)),
             chat_with_unread(2, "Chat 2", 0, Some(2)),
@@ -1389,9 +1647,56 @@ mod tests {
     }
 
     #[test]
+    fn stale_incoming_message_for_active_chat_does_not_append_or_replace_preview() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(0), folder(2, "Personal", 0)];
+        state.chats = vec![chat_with_unread(1, "Chat 1", 0, Some(2))];
+        state.chats[0].last_message = Some("latest loaded".to_string());
+        state.messages = vec![
+            update_message(20, 1, "older loaded", false),
+            update_message(30, 1, "latest loaded", false),
+        ];
+
+        state.apply_update(Update::NewMessage(update_message(
+            25,
+            1,
+            "hours old catch-up",
+            false,
+        )));
+
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.messages[1].content, "latest loaded");
+        assert_eq!(
+            state.chats[0].last_message.as_deref(),
+            Some("latest loaded")
+        );
+        assert_eq!(state.chats[0].unread_count, 0);
+        assert_eq!(state.folders[0].unread_count, 0);
+        assert_eq!(state.folders[1].unread_count, 0);
+    }
+
+    #[test]
+    fn incoming_message_clears_sender_typing_indicator() {
+        let mut state = AppState::new();
+        state.chats = vec![chat_with_unread(1, "Chat 1", 0, Some(2))];
+        state
+            .typing_users
+            .insert(1, vec!["Alice".to_string(), "Bob".to_string()]);
+
+        state.apply_update(Update::NewMessage(update_message(
+            10,
+            1,
+            "open chat",
+            false,
+        )));
+
+        assert_eq!(state.typing_users.get(&1), Some(&vec!["Bob".to_string()]));
+    }
+
+    #[test]
     fn incoming_message_in_background_chat_increments_unread() {
         let mut state = AppState::new();
-        state.folders = vec![folder(1, "All", 99), folder(2, "Personal", 99)];
+        state.folders = vec![all_folder(99), folder(2, "Personal", 99)];
         state.chats = vec![
             chat_with_unread(1, "Chat 1", 0, Some(2)),
             chat_with_unread(2, "Chat 2", 4, Some(2)),
@@ -1432,7 +1737,7 @@ mod tests {
         assert_eq!(state.input_buffer, "local edit in progress");
         assert_eq!(
             state.status_message.as_deref(),
-            Some("Message updated remotely while editing")
+            Some(REMOTE_EDIT_WHILE_EDITING_STATUS)
         );
     }
 
@@ -1456,6 +1761,28 @@ mod tests {
         assert_eq!(state.chats[0].last_message.as_deref(), Some("new remote"));
         assert!(state.status_message.is_none());
         assert_eq!(state.editing_message_id, Some(21));
+    }
+
+    #[test]
+    fn delete_update_wildcard_matches_any_loaded_chat() {
+        assert!(delete_update_matches_chat(UNKNOWN_DELETE_UPDATE_CHAT_ID, 1));
+        assert!(delete_update_matches_chat(UNKNOWN_DELETE_UPDATE_CHAT_ID, 2));
+        assert!(delete_update_matches_chat(1, 1));
+        assert!(!delete_update_matches_chat(1, 2));
+    }
+
+    #[test]
+    fn error_update_sets_error_banner_state() {
+        let mut state = AppState::new();
+        state.set_status("Connected");
+
+        state.apply_update(Update::Error("Update error: network down".to_string()));
+
+        assert_eq!(
+            state.error_message.as_deref(),
+            Some("Update error: network down")
+        );
+        assert!(state.status_message.is_none());
     }
 
     #[test]
@@ -1771,7 +2098,7 @@ mod tests {
     #[test]
     fn long_input_scrolls_to_keep_cursor_visible() {
         let mut state = AppState::new();
-        state.input_area = Rect::new(0, 0, 8, 3);
+        state.input_area = input_area(TEST_NARROW_INPUT_AREA_WIDTH);
 
         for c in "abcdefgh".chars() {
             state.insert_input_char(c);
@@ -1795,7 +2122,7 @@ mod tests {
     #[test]
     fn input_scroll_offset_clamps_when_viewport_grows() {
         let mut state = AppState::new();
-        state.input_area = Rect::new(0, 0, 8, 3);
+        state.input_area = input_area(TEST_NARROW_INPUT_AREA_WIDTH);
 
         for c in "abcdefgh".chars() {
             state.insert_input_char(c);
@@ -1804,7 +2131,7 @@ mod tests {
         assert_eq!(state.effective_input_scroll_offset(), 3);
         assert_eq!(state.visible_input_text(), "defgh");
 
-        state.input_area = Rect::new(0, 0, 20, 3);
+        state.input_area = input_area(TEST_EXPANDED_INPUT_AREA_WIDTH);
         state.ensure_input_cursor_visible();
 
         assert_eq!(state.effective_input_scroll_offset(), 0);
@@ -1815,7 +2142,7 @@ mod tests {
     #[test]
     fn wide_input_scrolls_by_display_width_not_character_count() {
         let mut state = AppState::new();
-        state.input_area = Rect::new(0, 0, 8, 3);
+        state.input_area = input_area(TEST_NARROW_INPUT_AREA_WIDTH);
 
         for c in "好好好好".chars() {
             state.insert_input_char(c);
@@ -1839,7 +2166,7 @@ mod tests {
     #[test]
     fn input_cursor_moves_to_clicked_visible_display_column() {
         let mut state = AppState::new();
-        state.input_area = Rect::new(0, 0, 8, 3);
+        state.input_area = input_area(TEST_NARROW_INPUT_AREA_WIDTH);
         state.input_buffer = "a好b".to_string();
 
         state.move_input_cursor_to_visible_column(3);
@@ -1852,7 +2179,7 @@ mod tests {
     #[test]
     fn input_cursor_click_uses_current_scroll_offset() {
         let mut state = AppState::new();
-        state.input_area = Rect::new(0, 0, 8, 3);
+        state.input_area = input_area(TEST_NARROW_INPUT_AREA_WIDTH);
         state.input_buffer = "abcdefghi".to_string();
         state.move_input_cursor_to_end();
 
@@ -1927,6 +2254,10 @@ mod tests {
 
         assert_eq!(state.prepare_message_submit(), None);
         assert!(state.error_message.is_none());
+
+        state.input_buffer = "   \t".to_string();
+        assert_eq!(state.prepare_message_submit(), None);
+        assert!(state.error_message.is_none());
     }
 
     #[test]
@@ -1935,7 +2266,7 @@ mod tests {
         state.input_buffer = "hello".to_string();
 
         assert_eq!(state.prepare_message_submit(), None);
-        assert_eq!(state.error_message.as_deref(), Some("No chat selected"));
+        assert_eq!(state.error_message.as_deref(), Some(NO_CHAT_SELECTED_ERROR));
     }
 
     #[test]
@@ -1982,6 +2313,26 @@ mod tests {
     }
 
     #[test]
+    fn message_action_failure_errors_use_shared_prefixes() {
+        assert_eq!(
+            edit_failed_error("network down"),
+            "Edit failed: network down"
+        );
+        assert_eq!(
+            reply_failed_error("network down"),
+            "Reply failed: network down"
+        );
+        assert_eq!(
+            send_failed_error("network down"),
+            "Send failed: network down"
+        );
+        assert_eq!(
+            delete_failed_error("network down"),
+            "Delete failed: network down"
+        );
+    }
+
+    #[test]
     fn apply_edit_success_updates_message_and_finishes_compose() {
         let mut state = state_with_chats();
         state.messages = vec![update_message(42, 10, "old text", true)];
@@ -1996,7 +2347,7 @@ mod tests {
         assert!(state.editing_message_id.is_none());
         assert_eq!(state.input_buffer, "plain draft");
         assert_eq!(state.chats[0].last_message.as_deref(), Some("new text"));
-        assert_eq!(state.status_message.as_deref(), Some("Message edited"));
+        assert_eq!(state.status_message.as_deref(), Some(MESSAGE_EDITED_STATUS));
     }
 
     #[test]
@@ -2010,7 +2361,7 @@ mod tests {
         assert_eq!(state.input_buffer, "edited draft");
         assert_eq!(
             state.error_message.as_deref(),
-            Some("Edit failed: network down")
+            Some(edit_failed_error("network down").as_str())
         );
     }
 
@@ -2031,7 +2382,7 @@ mod tests {
         assert!(state.replying_to_message_id.is_none());
         assert_eq!(state.input_buffer, "plain draft");
         assert_eq!(state.chats[0].last_message.as_deref(), Some("new reply"));
-        assert_eq!(state.status_message.as_deref(), Some("Reply sent"));
+        assert_eq!(state.status_message.as_deref(), Some(REPLY_SENT_STATUS));
     }
 
     #[test]
@@ -2046,7 +2397,7 @@ mod tests {
         assert_eq!(state.input_buffer, "reply draft");
         assert_eq!(
             state.error_message.as_deref(),
-            Some("Reply failed: network down")
+            Some(reply_failed_error("network down").as_str())
         );
     }
 
@@ -2072,8 +2423,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_send_success_replaces_pending_message_and_sets_status() {
+    fn apply_send_success_replaces_pending_message_clears_progress_and_preserves_read_state() {
         let mut state = state_with_chats();
+        state.chats[0].unread_count = 2;
+        state.folders = vec![all_folder(2)];
+        state.set_status("Sending message…");
         state.apply_send_pending(-1, 10, "plain send".to_string());
 
         let mut sent_message = update_message(42, 10, "plain send", true);
@@ -2084,7 +2438,9 @@ mod tests {
         assert_eq!(state.messages[0].id, 42);
         assert_eq!(state.messages[0].status, MessageStatus::Sent);
         assert_eq!(state.chats[0].last_message.as_deref(), Some("plain send"));
-        assert_eq!(state.status_message.as_deref(), Some("Message sent"));
+        assert_eq!(state.chats[0].unread_count, 0);
+        assert_eq!(state.folders[0].unread_count, 0);
+        assert!(state.status_message.is_none());
     }
 
     #[test]
@@ -2103,7 +2459,7 @@ mod tests {
         assert_eq!(state.focused_panel, FocusedPanel::Input);
         assert_eq!(
             state.error_message.as_deref(),
-            Some("Send failed: network down")
+            Some(send_failed_error("network down").as_str())
         );
     }
 
@@ -2114,7 +2470,7 @@ mod tests {
             chat_id: 10,
             message_id: 42,
         };
-        state.messages_area = Rect::new(0, 0, 80, 5);
+        state.messages_area = message_area(TEST_SHORT_MESSAGE_AREA_HEIGHT);
         state.messages = vec![
             update_message(41, 10, "keep", true),
             update_message(42, 10, "delete", true),
@@ -2130,7 +2486,10 @@ mod tests {
         assert_eq!(state.message_scroll_offset, 0);
         assert_eq!(state.chats[0].last_message.as_deref(), Some("keep"));
         assert!(state.delete_confirmation.is_none());
-        assert_eq!(state.status_message.as_deref(), Some("Message deleted"));
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some(MESSAGE_DELETED_STATUS)
+        );
     }
 
     #[test]
@@ -2163,7 +2522,7 @@ mod tests {
         assert!(state.delete_confirmation.is_none());
         assert_eq!(
             state.error_message.as_deref(),
-            Some("Delete failed: network down")
+            Some(delete_failed_error("network down").as_str())
         );
     }
 
@@ -2184,15 +2543,15 @@ mod tests {
     fn status_and_error_notifications_are_managed_separately() {
         let mut state = AppState::new();
 
-        state.set_status("Message sent");
-        assert_eq!(state.status_message.as_deref(), Some("Message sent"));
+        state.set_status("Status ok");
+        assert_eq!(state.status_message.as_deref(), Some("Status ok"));
 
         state.set_error("Send failed".to_string());
         assert_eq!(state.error_message.as_deref(), Some("Send failed"));
         assert!(state.status_message.is_none());
 
-        state.set_status("Message sent");
-        assert_eq!(state.status_message.as_deref(), Some("Message sent"));
+        state.set_status("Status ok");
+        assert_eq!(state.status_message.as_deref(), Some("Status ok"));
         assert!(state.error_message.is_none());
         assert!(state.error_timestamp.is_none());
     }
@@ -2200,10 +2559,12 @@ mod tests {
     #[test]
     fn stale_notifications_are_cleared() {
         let mut state = AppState::new();
-        state.set_status("Message sent");
+        state.set_status("Status ok");
         state.set_error("Send failed".to_string());
-        state.status_timestamp = Some(Utc::now() - Duration::seconds(6));
-        state.error_timestamp = Some(Utc::now() - Duration::seconds(6));
+        state.status_timestamp =
+            Some(Utc::now() - Duration::seconds(NOTIFICATION_TIMEOUT_SECONDS + 1));
+        state.error_timestamp =
+            Some(Utc::now() - Duration::seconds(NOTIFICATION_TIMEOUT_SECONDS + 1));
 
         state.check_notification_timeout();
 
@@ -2261,7 +2622,7 @@ mod tests {
     #[test]
     fn selected_folder_filter_id_ignores_all_folder() {
         let mut state = AppState::new();
-        state.folders = vec![folder(1, "All", 0), folder(2, "Personal", 0)];
+        state.folders = vec![all_folder(0), folder(2, "Personal", 0)];
 
         assert_eq!(state.selected_folder_filter_id(), None);
 
@@ -2270,9 +2631,34 @@ mod tests {
     }
 
     #[test]
+    fn selected_folder_filter_id_allows_telegram_folder_one() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(0), folder(1, "Archived", 0)];
+        state.selected_folder_index = 1;
+
+        assert_eq!(state.selected_folder_filter_id(), Some(1));
+    }
+
+    #[test]
+    fn sync_folder_unread_counts_does_not_update_all_for_telegram_folder_one() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(99), folder(1, "Archived", 99)];
+        state.selected_folder_index = 1;
+        state.chats = vec![
+            chat_with_unread(10, "Archived A", 1, Some(1)),
+            chat_with_unread(20, "Archived B", 2, Some(1)),
+        ];
+
+        state.sync_folder_unread_counts_from_loaded_chats();
+
+        assert_eq!(state.folders[0].unread_count, 99);
+        assert_eq!(state.folders[1].unread_count, 3);
+    }
+
+    #[test]
     fn apply_loaded_selected_chat_messages_selects_latest_unread_and_restores_draft() {
         let mut state = AppState::new();
-        state.folders = vec![folder(1, "All", 99), folder(2, "Personal", 99)];
+        state.folders = vec![all_folder(99), folder(2, "Personal", 99)];
         state.chats = vec![chat_with_unread(10, "Alice", 3, Some(2))];
         state.input_buffer = "saved draft".to_string();
         state.save_current_draft();
@@ -2337,7 +2723,7 @@ mod tests {
     #[test]
     fn sync_folder_unread_counts_updates_all_loaded_folders_when_all_selected() {
         let mut state = AppState::new();
-        state.folders = vec![folder(1, "All", 99), folder(2, "Personal", 99)];
+        state.folders = vec![all_folder(99), folder(2, "Personal", 99)];
         state.selected_folder_index = 0;
         state.chats = vec![
             chat_with_unread(10, "Alice", 2, Some(2)),
@@ -2354,7 +2740,7 @@ mod tests {
     #[test]
     fn sync_folder_unread_counts_only_updates_selected_folder_for_filtered_view() {
         let mut state = AppState::new();
-        state.folders = vec![folder(1, "All", 99), folder(2, "Personal", 99)];
+        state.folders = vec![all_folder(99), folder(2, "Personal", 99)];
         state.selected_folder_index = 1;
         state.chats = vec![
             chat_with_unread(10, "Alice", 1, Some(2)),
@@ -2390,7 +2776,7 @@ mod tests {
         state.select_chat(7);
         assert_eq!(state.chat_scroll_offset, 6);
 
-        state.chats_area = Rect::new(0, 0, 40, 20);
+        state.chats_area = chat_area(TEST_TALL_CHAT_AREA_HEIGHT);
         state.ensure_selected_chat_visible();
 
         assert_eq!(state.selected_chat_index, 7);
@@ -2412,7 +2798,10 @@ mod tests {
     #[test]
     fn select_message_at_visible_row_accounts_for_reply_rows_and_scroll_offset() {
         let mut state = AppState::new();
-        state.messages_area = Rect::new(0, 0, 40, 5);
+        state.messages_area = message_area_with_width(
+            TEST_VISIBLE_ROW_MESSAGE_AREA_WIDTH,
+            TEST_SHORT_MESSAGE_AREA_HEIGHT,
+        );
         state.messages = vec![message(1), message(2), message(3), message(4)];
         state.messages[1].reply_to_content = Some("earlier".to_string());
         state.message_scroll_offset = 1;
@@ -2430,7 +2819,10 @@ mod tests {
     #[test]
     fn select_message_at_visible_row_ignores_blank_rows() {
         let mut state = AppState::new();
-        state.messages_area = Rect::new(0, 0, 40, 8);
+        state.messages_area = message_area_with_width(
+            TEST_VISIBLE_ROW_MESSAGE_AREA_WIDTH,
+            TEST_BLANK_ROW_MESSAGE_AREA_HEIGHT,
+        );
         state.messages = vec![message(1), message(2)];
         state.selected_message_index = 1;
 
@@ -2449,6 +2841,22 @@ mod tests {
 
         state.selected_message_index = 99;
         assert!(state.selected_message().is_none());
+    }
+
+    #[test]
+    fn selected_message_is_last_treats_empty_or_clamped_tail_as_end() {
+        let mut state = AppState::new();
+        assert!(state.selected_message_is_last());
+
+        state.messages = vec![message(10), message(20)];
+        state.selected_message_index = 0;
+        assert!(!state.selected_message_is_last());
+
+        state.selected_message_index = 1;
+        assert!(state.selected_message_is_last());
+
+        state.selected_message_index = 99;
+        assert!(state.selected_message_is_last());
     }
 
     #[test]
@@ -2481,7 +2889,7 @@ mod tests {
         assert!(state.editing_message_id.is_none());
         assert_eq!(
             state.error_message.as_deref(),
-            Some("Cannot edit this message")
+            Some(CANNOT_EDIT_MESSAGE_ERROR)
         );
     }
 
@@ -2497,7 +2905,7 @@ mod tests {
         assert!(state.editing_message_id.is_none());
         assert_eq!(
             state.error_message.as_deref(),
-            Some("Cannot edit this message")
+            Some(CANNOT_EDIT_MESSAGE_ERROR)
         );
     }
 
@@ -2531,7 +2939,7 @@ mod tests {
         assert!(state.replying_to_message_id.is_none());
         assert_eq!(
             state.error_message.as_deref(),
-            Some("Cannot reply to unsent message")
+            Some(CANNOT_REPLY_UNSENT_MESSAGE_ERROR)
         );
     }
 
@@ -2562,7 +2970,7 @@ mod tests {
         assert!(state.delete_confirmation.is_none());
         assert_eq!(
             state.error_message.as_deref(),
-            Some("Cannot delete this message")
+            Some(CANNOT_DELETE_MESSAGE_ERROR)
         );
     }
 
@@ -2578,7 +2986,7 @@ mod tests {
         assert!(state.delete_confirmation.is_none());
         assert_eq!(
             state.error_message.as_deref(),
-            Some("Cannot delete this message")
+            Some(CANNOT_DELETE_MESSAGE_ERROR)
         );
     }
 
@@ -2605,7 +3013,7 @@ mod tests {
         assert_eq!(state.input_buffer, "failed draft");
         assert_eq!(
             state.status_message.as_deref(),
-            Some("Failed send dismissed")
+            Some(FAILED_SEND_DISMISSED_STATUS)
         );
         assert!(state.error_message.is_none());
     }
@@ -2613,7 +3021,7 @@ mod tests {
     #[test]
     fn message_selection_keeps_scroll_offset_visible() {
         let mut state = AppState::new();
-        state.messages_area = Rect::new(0, 0, 80, 5);
+        state.messages_area = message_area(TEST_SHORT_MESSAGE_AREA_HEIGHT);
         state.messages = (0..10).map(message).collect();
 
         state.select_last_message();
@@ -2632,12 +3040,12 @@ mod tests {
     #[test]
     fn message_selection_clamps_scroll_offset_when_viewport_grows() {
         let mut state = AppState::new();
-        state.messages_area = Rect::new(0, 0, 80, 5);
+        state.messages_area = message_area(TEST_SHORT_MESSAGE_AREA_HEIGHT);
         state.messages = (0..10).map(message).collect();
         state.select_last_message();
         assert_eq!(state.message_scroll_offset, 7);
 
-        state.messages_area = Rect::new(0, 0, 80, 20);
+        state.messages_area = message_area(TEST_TALL_MESSAGE_AREA_HEIGHT);
         state.ensure_selected_message_visible();
 
         assert_eq!(state.selected_message_index, 9);
@@ -2647,7 +3055,7 @@ mod tests {
     #[test]
     fn page_message_navigation_moves_by_visible_capacity() {
         let mut state = AppState::new();
-        state.messages_area = Rect::new(0, 0, 80, 6);
+        state.messages_area = message_area(TEST_PAGED_MESSAGE_AREA_HEIGHT);
         state.messages = (0..10).map(message).collect();
 
         state.page_messages_down();
@@ -2666,7 +3074,7 @@ mod tests {
     #[test]
     fn reset_message_selection_clears_scroll() {
         let mut state = AppState::new();
-        state.messages_area = Rect::new(0, 0, 80, 5);
+        state.messages_area = message_area(TEST_SHORT_MESSAGE_AREA_HEIGHT);
         state.messages = (0..10).map(message).collect();
         state.select_last_message();
 
@@ -2674,6 +3082,31 @@ mod tests {
 
         assert_eq!(state.selected_message_index, 0);
         assert_eq!(state.message_scroll_offset, 0);
+    }
+
+    #[test]
+    fn split_ratio_uses_shared_default_step_and_bounds() {
+        let mut state = AppState::new();
+        assert_eq!(state.split_ratio, DEFAULT_SPLIT_RATIO);
+
+        state.adjust_split_left();
+        assert_eq!(state.split_ratio, DEFAULT_SPLIT_RATIO - SPLIT_RATIO_STEP);
+
+        state.split_ratio = MIN_SPLIT_RATIO;
+        state.adjust_split_left();
+        assert_eq!(state.split_ratio, MIN_SPLIT_RATIO);
+
+        state.split_ratio = MAX_SPLIT_RATIO;
+        state.adjust_split_right();
+        assert_eq!(state.split_ratio, MAX_SPLIT_RATIO);
+    }
+
+    #[test]
+    fn focused_panel_labels_match_rendered_names() {
+        assert_eq!(FocusedPanel::Folders.label(), "Folders");
+        assert_eq!(FocusedPanel::Chats.label(), "Chats");
+        assert_eq!(FocusedPanel::Messages.label(), "Messages");
+        assert_eq!(FocusedPanel::Input.label(), "Input");
     }
 
     #[test]

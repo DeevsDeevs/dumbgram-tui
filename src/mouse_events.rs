@@ -5,8 +5,6 @@ use ratatui::layout::Position;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseScrollOutcome {
     Handled,
-    OpenNextChat,
-    OpenPreviousChat,
     Ignored,
 }
 
@@ -22,13 +20,11 @@ pub fn handle_mouse_scroll(state: &mut AppState, mouse_event: MouseEvent) -> Mou
     let position = Position::new(mouse_event.column, mouse_event.row);
 
     match mouse_event.kind {
-        MouseEventKind::ScrollDown if state.chats_area.contains(position) => {
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+            if state.chats_area.contains(position) =>
+        {
             state.focused_panel = FocusedPanel::Chats;
-            MouseScrollOutcome::OpenNextChat
-        }
-        MouseEventKind::ScrollUp if state.chats_area.contains(position) => {
-            state.focused_panel = FocusedPanel::Chats;
-            MouseScrollOutcome::OpenPreviousChat
+            MouseScrollOutcome::Handled
         }
         MouseEventKind::ScrollDown if state.messages_area.contains(position) => {
             state.focused_panel = FocusedPanel::Messages;
@@ -58,7 +54,11 @@ pub fn handle_mouse_click(state: &mut AppState, mouse_event: MouseEvent) -> Mous
 
         let relative_x = x.saturating_sub(state.folders_area.x + 1) as usize;
         if let Some(folder_index) = state.folder_index_at_visible_column(relative_x) {
-            MouseClickOutcome::OpenFolderAt(folder_index)
+            if folder_index == state.selected_folder_index {
+                MouseClickOutcome::Handled
+            } else {
+                MouseClickOutcome::OpenFolderAt(folder_index)
+            }
         } else {
             MouseClickOutcome::Handled
         }
@@ -72,9 +72,12 @@ pub fn handle_mouse_click(state: &mut AppState, mouse_event: MouseEvent) -> Mous
         let border_offset = 1;
         let relative_y = y.saturating_sub(state.chats_area.y + border_offset);
         let height_per_chat = 2;
-        MouseClickOutcome::OpenChatAt(
-            state.chat_scroll_offset + (relative_y / height_per_chat) as usize,
-        )
+        let chat_index = state.chat_scroll_offset + (relative_y / height_per_chat) as usize;
+        if chat_index >= state.chats.len() || chat_index == state.selected_chat_index {
+            MouseClickOutcome::Handled
+        } else {
+            MouseClickOutcome::OpenChatAt(chat_index)
+        }
     } else if state.messages_area.contains(position) {
         state.focused_panel = FocusedPanel::Messages;
         let relative_y = y.saturating_sub(state.messages_area.y + 1) as usize;
@@ -94,7 +97,7 @@ pub fn handle_mouse_click(state: &mut AppState, mouse_event: MouseEvent) -> Mous
 mod tests {
     use super::{MouseClickOutcome, MouseScrollOutcome, handle_mouse_click, handle_mouse_scroll};
     use crate::state::{AppState, FocusedPanel};
-    use crate::telegram::types::{Folder, Message, MessageStatus};
+    use crate::telegram::types::{Chat, Folder, Message, MessageStatus, all_folder};
     use chrono::Utc;
     use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
@@ -105,6 +108,17 @@ mod tests {
             column,
             row,
             modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn chat(id: i64, name: &str) -> Chat {
+        Chat {
+            id,
+            name: name.to_string(),
+            last_message: None,
+            unread_count: 0,
+            is_group: false,
+            folder_id: None,
         }
     }
 
@@ -134,21 +148,46 @@ mod tests {
     }
 
     #[test]
-    fn chat_scroll_requests_chat_open_actions_and_focuses_chats() {
+    fn chat_scroll_focuses_chats_without_opening_or_loading_chat() {
+        let mut state = AppState::new();
+        state.chats_area = Rect::new(10, 5, 20, 8);
+        state.chats = vec![chat(1, "Chat 1"), chat(2, "Chat 2")];
+        state.focused_panel = FocusedPanel::Messages;
+
+        assert_eq!(
+            handle_mouse_scroll(&mut state, mouse(MouseEventKind::ScrollDown, 11, 6)),
+            MouseScrollOutcome::Handled
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Chats);
+        assert_eq!(state.selected_chat_index, 0);
+
+        state.selected_chat_index = 1;
+        state.focused_panel = FocusedPanel::Messages;
+        assert_eq!(
+            handle_mouse_scroll(&mut state, mouse(MouseEventKind::ScrollUp, 11, 6)),
+            MouseScrollOutcome::Handled
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Chats);
+        assert_eq!(state.selected_chat_index, 1);
+    }
+
+    #[test]
+    fn chat_scroll_is_handled_without_opening_chat_when_no_alternate_chat_exists() {
         let mut state = AppState::new();
         state.chats_area = Rect::new(10, 5, 20, 8);
         state.focused_panel = FocusedPanel::Messages;
 
         assert_eq!(
             handle_mouse_scroll(&mut state, mouse(MouseEventKind::ScrollDown, 11, 6)),
-            MouseScrollOutcome::OpenNextChat
+            MouseScrollOutcome::Handled
         );
         assert_eq!(state.focused_panel, FocusedPanel::Chats);
 
         state.focused_panel = FocusedPanel::Messages;
+        state.chats = vec![chat(1, "Chat 1")];
         assert_eq!(
             handle_mouse_scroll(&mut state, mouse(MouseEventKind::ScrollUp, 11, 6)),
-            MouseScrollOutcome::OpenPreviousChat
+            MouseScrollOutcome::Handled
         );
         assert_eq!(state.focused_panel, FocusedPanel::Chats);
     }
@@ -193,7 +232,8 @@ mod tests {
     fn folder_click_requests_opening_clicked_visible_folder() {
         let mut state = AppState::new();
         state.folders_area = Rect::new(0, 0, 80, 3);
-        state.folders = vec![folder(1, "All"), folder(2, "Work")];
+        state.folders = vec![all_folder(0), folder(2, "Work")];
+        state.selected_folder_index = 1;
 
         assert_eq!(
             handle_mouse_click(
@@ -205,6 +245,26 @@ mod tests {
                 )
             ),
             MouseClickOutcome::OpenFolderAt(0)
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Folders);
+    }
+
+    #[test]
+    fn selected_folder_click_is_handled_without_opening_folder() {
+        let mut state = AppState::new();
+        state.folders_area = Rect::new(0, 0, 80, 3);
+        state.folders = vec![all_folder(0), folder(2, "Work")];
+
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    2,
+                    1
+                )
+            ),
+            MouseClickOutcome::Handled
         );
         assert_eq!(state.focused_panel, FocusedPanel::Folders);
     }
@@ -245,14 +305,13 @@ mod tests {
     fn chat_click_requests_opening_clicked_chat() {
         let mut state = AppState::new();
         state.chats_area = Rect::new(0, 5, 30, 8);
-        state.chats = vec![crate::telegram::types::Chat {
-            id: 1,
-            name: "Chat".to_string(),
-            last_message: None,
-            unread_count: 0,
-            is_group: false,
-            folder_id: None,
-        }];
+        state.chats = vec![
+            chat(1, "Chat 1"),
+            chat(2, "Chat 2"),
+            chat(3, "Chat 3"),
+            chat(4, "Chat 4"),
+            chat(5, "Chat 5"),
+        ];
         state.chat_scroll_offset = 3;
 
         assert_eq!(
@@ -267,6 +326,39 @@ mod tests {
             MouseClickOutcome::OpenChatAt(4)
         );
         assert_eq!(state.focused_panel, FocusedPanel::Chats);
+    }
+
+    #[test]
+    fn selected_or_out_of_range_chat_click_is_handled_without_opening_chat() {
+        let mut state = AppState::new();
+        state.chats_area = Rect::new(0, 5, 30, 8);
+        state.chats = vec![chat(1, "Chat 1"), chat(2, "Chat 2")];
+        state.selected_chat_index = 1;
+
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    2,
+                    8
+                )
+            ),
+            MouseClickOutcome::Handled
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Chats);
+
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    2,
+                    12
+                )
+            ),
+            MouseClickOutcome::Handled
+        );
     }
 
     #[test]

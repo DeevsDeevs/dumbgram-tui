@@ -11,31 +11,34 @@ pub fn char_display_width(ch: char) -> usize {
 const TRUNCATION_MARKER: &str = "…";
 
 pub fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
-    if display_width(text) <= max_width {
-        return text.to_string();
-    }
-
-    let marker_width = display_width(TRUNCATION_MARKER);
     if max_width == 0 {
         return String::new();
     }
-    if max_width <= marker_width {
-        return TRUNCATION_MARKER.to_string();
-    }
 
-    let prefix_width = max_width - marker_width;
-    let mut output = String::new();
-    let mut width = 0;
+    let marker_width = display_width(TRUNCATION_MARKER);
+    let prefix_width = max_width.saturating_sub(marker_width);
+    let mut prefix = String::new();
+    let mut prefix_display_width = 0;
+    let mut text_display_width = 0;
+
     for ch in text.chars() {
         let char_width = char_display_width(ch);
-        if width + char_width > prefix_width {
-            break;
+        if text_display_width + char_width > max_width {
+            if max_width <= marker_width {
+                return TRUNCATION_MARKER.to_string();
+            }
+            prefix.push_str(TRUNCATION_MARKER);
+            return prefix;
         }
-        output.push(ch);
-        width += char_width;
+
+        text_display_width += char_width;
+        if prefix_display_width + char_width <= prefix_width {
+            prefix.push(ch);
+            prefix_display_width += char_width;
+        }
     }
-    output.push_str(TRUNCATION_MARKER);
-    output
+
+    text.to_string()
 }
 
 #[cfg(test)]
@@ -65,6 +68,13 @@ mod tests {
     #[test]
     fn truncates_on_char_boundaries() {
         assert_eq!(truncate_with_ellipsis("héllo", 4), "hél…");
+    }
+
+    #[test]
+    fn truncates_long_text_without_scanning_full_content() {
+        let text = format!("{}tail", "a".repeat(1_000_000));
+
+        assert_eq!(truncate_with_ellipsis(&text, 4), "aaa…");
     }
 
     #[test]

@@ -10,16 +10,72 @@ pub use input::render_input;
 pub use layout::render_layout;
 pub use messages::render_messages;
 
+pub(crate) const SELECTED_ROW_SYMBOL: &str = "▶ ";
+pub(crate) const LEGACY_SELECTED_ROW_SYMBOL: &str = ">>";
+pub(crate) const LIST_TEXT_WIDTH_RESERVED_COLUMNS: u16 = 5;
+
+pub(crate) fn list_text_width(area_width: u16) -> usize {
+    area_width.saturating_sub(LIST_TEXT_WIDTH_RESERVED_COLUMNS) as usize
+}
+
+pub(crate) fn selected_list_index(selected_index: usize, item_count: usize) -> Option<usize> {
+    if item_count == 0 {
+        None
+    } else {
+        Some(selected_index.min(item_count - 1))
+    }
+}
+
+#[cfg(test)]
+const TEST_RENDER_WIDTH: u16 = 80;
+#[cfg(test)]
+const TEST_RENDER_HEIGHT: u16 = 24;
+
+#[cfg(test)]
+pub(crate) fn render_app_to_string_for_test(app: &mut crate::app::App) -> String {
+    let theme = crate::config::Theme::default();
+    let backend = ratatui::backend::TestBackend::new(TEST_RENDER_WIDTH, TEST_RENDER_HEIGHT);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal should initialize");
+
+    terminal
+        .draw(|frame| render_layout(frame, app, &theme))
+        .expect("layout should render in test backend");
+
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::render_layout;
+    use super::{
+        LEGACY_SELECTED_ROW_SYMBOL, LIST_TEXT_WIDTH_RESERVED_COLUMNS, SELECTED_ROW_SYMBOL, chats,
+        folders, input, list_text_width, messages, render_app_to_string_for_test,
+        selected_list_index,
+    };
     use crate::{
         app::App,
-        config::Theme,
         telegram::types::{Chat, Message, MessageStatus},
     };
     use chrono::Utc;
-    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn list_text_width_reserves_border_and_selection_columns() {
+        assert_eq!(LIST_TEXT_WIDTH_RESERVED_COLUMNS, 5);
+        assert_eq!(list_text_width(80), 75);
+        assert_eq!(list_text_width(3), 0);
+    }
+
+    #[test]
+    fn selected_list_index_omits_empty_lists_and_clamps_to_last_item() {
+        assert_eq!(selected_list_index(0, 0), None);
+        assert_eq!(selected_list_index(0, 3), Some(0));
+        assert_eq!(selected_list_index(99, 3), Some(2));
+    }
 
     #[test]
     fn layout_uses_unicode_borders_without_emoji_status_glyphs() {
@@ -46,27 +102,17 @@ mod tests {
             can_delete: false,
             error: None,
         }];
-        let theme = Theme::default();
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal
-            .draw(|frame| render_layout(frame, &mut app, &theme))
-            .unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        let rendered = render_app_to_string_for_test(&mut app);
 
         for border in ["┌", "┐", "└", "┘", "─", "│"] {
             assert!(rendered.contains(border), "missing border glyph {border}");
         }
-        assert!(rendered.contains("▶"), "missing selected-row arrow glyph");
         assert!(
-            !rendered.contains(">>"),
+            rendered.contains(SELECTED_ROW_SYMBOL),
+            "missing selected-row arrow glyph"
+        );
+        assert!(
+            !rendered.contains(LEGACY_SELECTED_ROW_SYMBOL),
             "ASCII selected-row marker should not render"
         );
 
@@ -86,6 +132,24 @@ mod tests {
             assert!(
                 !rendered.contains(emoji_like),
                 "rendered emoji-like glyph {emoji_like}"
+            );
+        }
+    }
+
+    #[test]
+    fn layout_renders_empty_state_placeholders() {
+        let mut app = App::new();
+        let rendered = render_app_to_string_for_test(&mut app);
+
+        for placeholder in [
+            folders::FOLDER_EMPTY_LABEL.trim(),
+            chats::CHAT_EMPTY_NO_FOLDER_LABEL,
+            messages::MESSAGE_EMPTY_NO_CHAT_LABEL,
+            input::INPUT_EMPTY_PLACEHOLDER_LABEL,
+        ] {
+            assert!(
+                rendered.contains(placeholder),
+                "missing empty-state placeholder {placeholder}"
             );
         }
     }

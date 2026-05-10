@@ -20,8 +20,9 @@ pub fn handle_folder_key(state: &mut AppState, key: KeyEvent) -> FolderKeyOutcom
             FolderKeyOutcome::Handled
         }
         KeyCode::Up => FolderKeyOutcome::Handled,
-        KeyCode::Left => FolderKeyOutcome::OpenPreviousFolder,
-        KeyCode::Right => FolderKeyOutcome::OpenNextFolder,
+        KeyCode::Left if state.folders.len() > 1 => FolderKeyOutcome::OpenPreviousFolder,
+        KeyCode::Right if state.folders.len() > 1 => FolderKeyOutcome::OpenNextFolder,
+        KeyCode::Left | KeyCode::Right => FolderKeyOutcome::Handled,
         _ => FolderKeyOutcome::Ignored,
     }
 }
@@ -29,11 +30,22 @@ pub fn handle_folder_key(state: &mut AppState, key: KeyEvent) -> FolderKeyOutcom
 #[cfg(test)]
 mod tests {
     use super::{FolderKeyOutcome, handle_folder_key};
-    use crate::state::{AppState, FocusedPanel};
+    use crate::{
+        state::{AppState, FocusedPanel},
+        telegram::types::{Folder, all_folder},
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn folder(id: i32, name: &str) -> Folder {
+        Folder {
+            id,
+            name: name.to_string(),
+            unread_count: 0,
+        }
     }
 
     #[test]
@@ -50,9 +62,10 @@ mod tests {
     }
 
     #[test]
-    fn folder_keys_request_previous_or_next_folder() {
+    fn folder_keys_request_previous_or_next_folder_when_alternates_exist() {
         let mut state = AppState::new();
         state.focused_panel = FocusedPanel::Folders;
+        state.folders = vec![all_folder(0), folder(2, "Work")];
 
         assert_eq!(
             handle_folder_key(&mut state, key(KeyCode::Left)),
@@ -61,6 +74,31 @@ mod tests {
         assert_eq!(
             handle_folder_key(&mut state, key(KeyCode::Right)),
             FolderKeyOutcome::OpenNextFolder
+        );
+    }
+
+    #[test]
+    fn folder_keys_handle_previous_or_next_when_no_alternate_folder_exists() {
+        let mut state = AppState::new();
+        state.focused_panel = FocusedPanel::Folders;
+
+        assert_eq!(
+            handle_folder_key(&mut state, key(KeyCode::Left)),
+            FolderKeyOutcome::Handled
+        );
+        assert_eq!(
+            handle_folder_key(&mut state, key(KeyCode::Right)),
+            FolderKeyOutcome::Handled
+        );
+
+        state.folders = vec![all_folder(0)];
+        assert_eq!(
+            handle_folder_key(&mut state, key(KeyCode::Left)),
+            FolderKeyOutcome::Handled
+        );
+        assert_eq!(
+            handle_folder_key(&mut state, key(KeyCode::Right)),
+            FolderKeyOutcome::Handled
         );
     }
 

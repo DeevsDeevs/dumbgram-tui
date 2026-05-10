@@ -81,17 +81,20 @@ mod tests {
     use super::{Config, expand_tilde_with_home};
     use std::path::{Path, PathBuf};
 
+    fn parse_test_config(config: &str) -> Config {
+        toml::from_str(config).expect("Telegram test config should parse")
+    }
+
     #[test]
     fn telegram_config_accepts_numeric_api_id_and_session_file() {
-        let config: Config = toml::from_str(
+        let config = parse_test_config(
             r#"
             [telegram]
             api_id = 12345
             api_hash = "hash"
             session_file = "session.dat"
             "#,
-        )
-        .expect("current config format should parse");
+        );
 
         assert_eq!(config.telegram.api_id, 12345);
         assert_eq!(config.telegram.api_hash, "hash");
@@ -100,15 +103,14 @@ mod tests {
 
     #[test]
     fn telegram_config_accepts_string_api_id_and_session_path_alias() {
-        let config: Config = toml::from_str(
+        let config = parse_test_config(
             r#"
             [telegram]
             api_id = "12345"
             api_hash = "hash"
             session_path = "legacy-session.dat"
             "#,
-        )
-        .expect("docs-style config format should parse");
+        );
 
         assert_eq!(config.telegram.api_id, 12345);
         assert_eq!(config.telegram.session_file, "legacy-session.dat");

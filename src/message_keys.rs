@@ -18,9 +18,7 @@ pub fn handle_message_key(state: &mut AppState, key: KeyEvent) -> MessageKeyOutc
         KeyCode::Home => state.select_first_message(),
         KeyCode::End => state.select_last_message(),
         KeyCode::Down => {
-            if state.messages.is_empty()
-                || state.selected_message_index == state.messages.len().saturating_sub(1)
-            {
+            if state.selected_message_is_last() {
                 state.focused_panel = FocusedPanel::Input;
             } else {
                 state.select_next_message();

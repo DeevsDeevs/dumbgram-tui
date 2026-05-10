@@ -1,5 +1,5 @@
 use crate::state::{AppState, FocusedPanel};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalKeyOutcome {
@@ -13,7 +13,10 @@ pub fn handle_global_key(state: &mut AppState, key: KeyEvent) -> GlobalKeyOutcom
         return GlobalKeyOutcome::Handled;
     }
 
-    if key.code == KeyCode::Esc
+    let is_cancel_key = key.code == KeyCode::Esc
+        || matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL));
+
+    if is_cancel_key
         && state.focused_panel != FocusedPanel::Input
         && (state.editing_message_id.is_some() || state.replying_to_message_id.is_some())
     {
@@ -32,6 +35,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
     #[test]
@@ -65,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels_compose_mode_outside_input() {
+    fn escape_or_ctrl_c_cancels_compose_mode_outside_input() {
         let mut state = AppState::new();
         state.focused_panel = FocusedPanel::Messages;
         state.editing_message_id = Some(42);
@@ -77,6 +84,18 @@ mod tests {
         );
 
         assert!(state.editing_message_id.is_none());
+        assert_eq!(state.focused_panel, FocusedPanel::Messages);
+        assert!(state.input_buffer.is_empty());
+
+        state.replying_to_message_id = Some(42);
+        state.input_buffer = "reply".to_string();
+
+        assert_eq!(
+            handle_global_key(&mut state, ctrl('c')),
+            GlobalKeyOutcome::Handled
+        );
+
+        assert!(state.replying_to_message_id.is_none());
         assert_eq!(state.focused_panel, FocusedPanel::Messages);
         assert!(state.input_buffer.is_empty());
     }
