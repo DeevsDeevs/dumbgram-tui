@@ -1,0 +1,6 @@
+[telegram]
+# Get these from https://my.telegram.org
+api_id = 0
+api_hash = ""
+# Relative paths are resolved next to config.toml.
+session_file = "session.dat"

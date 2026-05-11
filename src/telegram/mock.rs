@@ -1,0 +1,489 @@
+use super::client::{DownloadedMedia, TelegramClient};
+use super::types::{
+    Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, Update, all_folder,
+};
+use base64::Engine;
+use chrono::Utc;
+use color_eyre::Result;
+use std::{path::PathBuf, time::Duration};
+use tokio::sync::mpsc;
+
+#[derive(Clone)]
+pub struct MockTelegramClient {
+    connected: bool,
+}
+
+impl MockTelegramClient {
+    pub fn new() -> Self {
+        Self { connected: false }
+    }
+}
+
+const MOCK_IMAGE_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAKAAAABQCAIAAAARP+ljAAAA2klEQVR42u3bMQ0AIAxFwYpABBKRiKuioVMTegnzG/6tJdbJ0su7S0+/tx8GAgwAMADA+oD1AesD1gcM2ECAAQAGAFgfsD5gfcBjgQ36dx8wYACAAQDWB6wPWB+wPmDABgIMADAAwPqA9QHrA54LbFAXHQAAAwCsD1gfsD5gfcCADQQYAGAAgPUB6wPWBwzYQP4HG9RFBwDA+oD1AesD1gcMGABgAID1AesD1gesDxiwgQAD8D8YmIsOfcD6gPUBAzYQYACAAQDWB6wPWB+wPmDABgIMALB+a/8BI+/vC6JSYoIAAAAASUVORK5CYII=";
+
+fn mock_image_path() -> Option<PathBuf> {
+    let path = std::env::temp_dir()
+        .join("dumbgram-tui-media")
+        .join("mock")
+        .join("photo.png");
+
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(MOCK_IMAGE_PNG_BASE64)
+        .ok()?;
+    std::fs::write(&path, bytes).ok()?;
+    Some(path)
+}
+
+fn mock_photo_media() -> MessageMedia {
+    mock_image_path().map_or_else(MessageMedia::photo, |path| {
+        MessageMedia::photo().with_local_path(path)
+    })
+}
+
+impl Default for MockTelegramClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TelegramClient for MockTelegramClient {
+    async fn connect(&mut self) -> Result<()> {
+        self.connected = true;
+        Ok(())
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn get_folders(&self) -> impl std::future::Future<Output = Result<Vec<Folder>>> + Send + '_ {
+        async move {
+            Ok(vec![
+                all_folder(5),
+                Folder {
+                    id: 2,
+                    name: "Personal".to_string(),
+                    unread_count: 3,
+                },
+                Folder {
+                    id: 3,
+                    name: "Work".to_string(),
+                    unread_count: 2,
+                },
+            ])
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn download_message_media(
+        &self,
+        _chat_id: i64,
+        message_id: i32,
+        destination_dir: PathBuf,
+    ) -> impl std::future::Future<Output = Result<DownloadedMedia>> + Send + '_ {
+        async move {
+            std::fs::create_dir_all(&destination_dir)?;
+            let path = destination_dir.join(format!("dumbgram-mock-message-{message_id}.png"));
+            let bytes = base64::engine::general_purpose::STANDARD.decode(MOCK_IMAGE_PNG_BASE64)?;
+            std::fs::write(&path, &bytes)?;
+            Ok(DownloadedMedia {
+                path,
+                bytes: bytes.len() as u64,
+            })
+        }
+    }
+
+    async fn get_chats(&self, folder_id: Option<i32>, limit: usize) -> Result<Vec<Chat>> {
+        let all_chats = vec![
+            Chat {
+                id: 1,
+                name: "Alice".to_string(),
+                last_message: Some("Hey! How are you?".to_string()),
+                unread_count: 2,
+                is_group: false,
+                folder_id: Some(2),
+            },
+            Chat {
+                id: 2,
+                name: "Bob".to_string(),
+                last_message: Some("See you tomorrow!".to_string()),
+                unread_count: 0,
+                is_group: false,
+                folder_id: Some(2),
+            },
+            Chat {
+                id: 3,
+                name: "Work Team".to_string(),
+                last_message: Some("Meeting at 3 PM".to_string()),
+                unread_count: 1,
+                is_group: true,
+                folder_id: Some(3),
+            },
+            Chat {
+                id: 4,
+                name: "Project Alpha".to_string(),
+                last_message: Some("Deploy is ready".to_string()),
+                unread_count: 1,
+                is_group: true,
+                folder_id: Some(3),
+            },
+        ];
+
+        let chats = if let Some(fid) = folder_id {
+            all_chats
+                .into_iter()
+                .filter(|c| c.folder_id == Some(fid))
+                .collect::<Vec<_>>()
+        } else {
+            all_chats
+        };
+        Ok(chats.into_iter().take(limit).collect())
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn get_messages(
+        &self,
+        chat_id: i64,
+        _limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<Message>>> + Send + '_ {
+        async move {
+            match chat_id {
+                1 => Ok(vec![
+                    Message {
+                        id: 1,
+                        chat_id,
+                        sender_name: "Alice".to_string(),
+                        content: "Hey! How are you?".to_string(),
+                        timestamp: Utc::now(),
+                        is_own: false,
+                        is_edited: false,
+                        reply_to_content: None,
+                        media: None,
+                        status: MessageStatus::Delivered,
+                        can_edit: false,
+                        can_delete: false,
+                        error: None,
+                    },
+                    Message {
+                        id: 2,
+                        chat_id,
+                        sender_name: OWN_SENDER_NAME.to_string(),
+                        content: "I'm doing great! How about you?".to_string(),
+                        timestamp: Utc::now(),
+                        is_own: true,
+                        is_edited: false,
+                        reply_to_content: None,
+                        media: None,
+                        status: MessageStatus::Read,
+                        can_edit: true,
+                        can_delete: true,
+                        error: None,
+                    },
+                    Message {
+                        id: 3,
+                        chat_id,
+                        sender_name: "Alice".to_string(),
+                        content: "Pretty good! Want to grab coffee later?".to_string(),
+                        timestamp: Utc::now(),
+                        is_own: false,
+                        is_edited: false,
+                        reply_to_content: Some("I'm doing great! How about you?".to_string()),
+                        media: None,
+                        status: MessageStatus::Delivered,
+                        can_edit: false,
+                        can_delete: false,
+                        error: None,
+                    },
+                ]),
+                2 => Ok(vec![
+                    Message {
+                        id: 1,
+                        chat_id,
+                        sender_name: "Bob".to_string(),
+                        content: "Did you see the game last night?".to_string(),
+                        timestamp: Utc::now(),
+                        is_own: false,
+                        is_edited: false,
+                        reply_to_content: None,
+                        media: None,
+                        status: MessageStatus::Delivered,
+                        can_edit: false,
+                        can_delete: false,
+                        error: None,
+                    },
+                    Message {
+                        id: 2,
+                        chat_id,
+                        sender_name: OWN_SENDER_NAME.to_string(),
+                        content: "Yeah! It was incredible!".to_string(),
+                        timestamp: Utc::now(),
+                        is_own: true,
+                        is_edited: false,
+                        reply_to_content: None,
+                        media: None,
+                        status: MessageStatus::Read,
+                        can_edit: true,
+                        can_delete: true,
+                        error: None,
+                    },
+                ]),
+                3 => Ok(vec![
+                    Message {
+                        id: 1,
+                        chat_id,
+                        sender_name: "Manager".to_string(),
+                        content: "Team meeting at 3 PM today".to_string(),
+                        timestamp: Utc::now(),
+                        is_own: false,
+                        is_edited: false,
+                        reply_to_content: None,
+                        media: None,
+                        status: MessageStatus::Delivered,
+                        can_edit: false,
+                        can_delete: false,
+                        error: None,
+                    },
+                    Message {
+                        id: 2,
+                        chat_id,
+                        sender_name: OWN_SENDER_NAME.to_string(),
+                        content: "Got it, I'll be there".to_string(),
+                        timestamp: Utc::now(),
+                        is_own: true,
+                        is_edited: false,
+                        reply_to_content: None,
+                        media: None,
+                        status: MessageStatus::Sent,
+                        can_edit: true,
+                        can_delete: true,
+                        error: None,
+                    },
+                    Message {
+                        id: 3,
+                        chat_id,
+                        sender_name: "Colleague".to_string(),
+                        content: "Should I prepare the slides?".to_string(),
+                        timestamp: Utc::now(),
+                        is_own: false,
+                        is_edited: false,
+                        reply_to_content: None,
+                        media: None,
+                        status: MessageStatus::Delivered,
+                        can_edit: false,
+                        can_delete: false,
+                        error: None,
+                    },
+                ]),
+                4 => Ok(vec![
+                    Message {
+                        id: 1,
+                        chat_id,
+                        sender_name: "Developer".to_string(),
+                        content: "Deploy is ready for staging".to_string(),
+                        timestamp: Utc::now(),
+                        is_own: false,
+                        is_edited: false,
+                        reply_to_content: None,
+                        media: Some(mock_photo_media()),
+                        status: MessageStatus::Delivered,
+                        can_edit: false,
+                        can_delete: false,
+                        error: None,
+                    },
+                    Message {
+                        id: 2,
+                        chat_id,
+                        sender_name: OWN_SENDER_NAME.to_string(),
+                        content: "Great! Let's review it first".to_string(),
+                        timestamp: Utc::now(),
+                        is_own: true,
+                        is_edited: true,
+                        reply_to_content: None,
+                        media: None,
+                        status: MessageStatus::Delivered,
+                        can_edit: true,
+                        can_delete: true,
+                        error: None,
+                    },
+                    Message {
+                        id: 3,
+                        chat_id,
+                        sender_name: "QA".to_string(),
+                        content: "I can test it this afternoon".to_string(),
+                        timestamp: Utc::now(),
+                        is_own: false,
+                        is_edited: false,
+                        reply_to_content: Some("Great! Let's review it first".to_string()),
+                        media: None,
+                        status: MessageStatus::Delivered,
+                        can_edit: false,
+                        can_delete: false,
+                        error: None,
+                    },
+                ]),
+                _ => Ok(vec![]),
+            }
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn get_messages_before(
+        &self,
+        chat_id: i64,
+        before_message_id: i32,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<Message>>> + Send + '_ {
+        async move {
+            let mut messages = self.get_messages(chat_id, usize::MAX).await?;
+            messages.retain(|message| message.id < before_message_id);
+            let start = messages.len().saturating_sub(limit);
+            Ok(messages.split_off(start))
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn send_message(
+        &self,
+        chat_id: i64,
+        content: String,
+    ) -> impl std::future::Future<Output = Result<Message>> + Send + '_ {
+        async move {
+            Ok(Message {
+                id: 999,
+                chat_id,
+                sender_name: OWN_SENDER_NAME.to_string(),
+                content,
+                timestamp: Utc::now(),
+                is_own: true,
+                is_edited: false,
+                reply_to_content: None,
+                media: None,
+                status: MessageStatus::Sent,
+                can_edit: true,
+                can_delete: true,
+                error: None,
+            })
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn edit_message(
+        &self,
+        _chat_id: i64,
+        _message_id: i32,
+        _content: String,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        async move { Ok(()) }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn reply_to_message(
+        &self,
+        chat_id: i64,
+        _reply_to: i32,
+        content: String,
+    ) -> impl std::future::Future<Output = Result<Message>> + Send + '_ {
+        async move {
+            Ok(Message {
+                id: 1000,
+                chat_id,
+                sender_name: OWN_SENDER_NAME.to_string(),
+                content,
+                timestamp: Utc::now(),
+                is_own: true,
+                is_edited: false,
+                reply_to_content: Some("Replied message".to_string()),
+                media: None,
+                status: MessageStatus::Sent,
+                can_edit: true,
+                can_delete: true,
+                error: None,
+            })
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn delete_message(
+        &self,
+        _chat_id: i64,
+        _message_id: i32,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        async move { Ok(()) }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn subscribe_updates(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<mpsc::UnboundedReceiver<Update>>> + Send + '_
+    {
+        async move {
+            let (tx, rx) = mpsc::unbounded_channel();
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(10));
+                let mut counter = 0;
+                loop {
+                    interval.tick().await;
+                    counter += 1;
+
+                    let update = match counter % 3 {
+                        0 => Update::NewMessage(Message {
+                            id: 2000 + counter,
+                            chat_id: 1,
+                            sender_name: "Alice".to_string(),
+                            content: format!("Mock update message #{}", counter),
+                            timestamp: Utc::now(),
+                            is_own: false,
+                            is_edited: false,
+                            reply_to_content: None,
+                            media: None,
+                            status: MessageStatus::Delivered,
+                            can_edit: false,
+                            can_delete: false,
+                            error: None,
+                        }),
+                        1 => Update::EditMessage {
+                            chat_id: 1,
+                            message_id: 1,
+                            new_content: format!(
+                                "Updated content at {}",
+                                Utc::now().format("%H:%M:%S")
+                            ),
+                        },
+                        _ => Update::TypingStatus {
+                            chat_id: 1,
+                            user_name: "Alice".to_string(),
+                            is_typing: true,
+                        },
+                    };
+
+                    if tx.send(update).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            Ok(rx)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MOCK_IMAGE_PNG_BASE64, mock_photo_media};
+    use base64::Engine;
+
+    #[test]
+    fn mock_photo_media_has_local_preview_file_for_kitty_smoke() {
+        let media = mock_photo_media();
+
+        let path = media
+            .local_image_path()
+            .expect("mock photo should have a local preview image");
+        assert!(path.exists());
+        assert!(std::fs::metadata(path).unwrap().len() > 200);
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(MOCK_IMAGE_PNG_BASE64)
+            .unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+}
