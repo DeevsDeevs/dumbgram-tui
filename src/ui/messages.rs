@@ -4,7 +4,7 @@ use crate::{
     config::Theme,
     state::FocusedPanel,
     telegram::types::{MessageStatus, message_display_content},
-    text::{display_width, truncate_with_ellipsis},
+    text::{display_width, truncate_with_ellipsis, wrap_display_lines_limited},
 };
 use ratatui::{
     Frame,
@@ -31,61 +31,15 @@ pub(crate) const MESSAGE_TITLE_BORDER_RESERVED_COLUMNS: u16 = 2;
 pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
     let text_width = list_text_width(area.width);
 
-    let items: Vec<ListItem> = if app.state.messages.is_empty() {
-        vec![ListItem::new(Line::from(Span::raw(
-            message_empty_placeholder(app.state.selected_chat_id().is_some()),
-        )))]
+    let (items, selected_index) = if app.state.messages.is_empty() {
+        (
+            vec![ListItem::new(Line::from(Span::raw(
+                message_empty_placeholder(app.state.selected_chat_id().is_some()),
+            )))],
+            selected_list_index(app.state.selected_message_index, 0),
+        )
     } else {
-        app.state
-            .messages
-            .iter()
-            .map(|msg| {
-                let time_str = msg.timestamp.format("%H:%M").to_string();
-
-                let status_label = message_status_label(&msg.status, msg.is_own);
-
-                let metadata =
-                    message_metadata(&time_str, msg.is_edited, status_label, msg.error.as_deref());
-
-                let msg_color = if msg.status == MessageStatus::Failed {
-                    ratatui::style::Color::Red
-                } else if msg.is_own {
-                    theme.own_message
-                } else {
-                    theme.other_message
-                };
-
-                let sender = format!("{}: ", msg.sender_name);
-                let content_width = text_width
-                    .saturating_sub(display_width(&sender) + display_width(&metadata))
-                    .max(1);
-                let display_content = message_display_content(msg.media.as_ref(), &msg.content);
-                let content = truncate_with_ellipsis(&display_content, content_width);
-
-                let mut main_spans = vec![Span::styled(
-                    sender,
-                    Style::default().add_modifier(Modifier::BOLD),
-                )];
-                main_spans.extend(message_content_spans(&content, msg_color));
-                main_spans.push(Span::raw(metadata));
-                let main_line = Line::from(main_spans);
-
-                if let Some(reply_content) = &msg.reply_to_content {
-                    let reply_line = Line::from(vec![Span::styled(
-                        format!(
-                            "{REPLY_LINE_PREFIX}{REPLY_MARKER}{REPLY_MARKER_SEPARATOR}{}",
-                            truncate_with_ellipsis(reply_content, reply_content_width(text_width))
-                        ),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )]);
-                    ListItem::new(vec![main_line, reply_line])
-                } else {
-                    ListItem::new(main_line)
-                }
-            })
-            .collect()
+        visible_message_items(app, theme, text_width, area.height)
     };
 
     let chat_name = app
@@ -116,12 +70,7 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
         )
         .highlight_symbol(SELECTED_ROW_SYMBOL);
 
-    let selected_index =
-        selected_list_index(app.state.selected_message_index, app.state.messages.len());
-
-    let mut list_state = ListState::default()
-        .with_offset(app.state.message_scroll_offset)
-        .with_selected(selected_index);
+    let mut list_state = ListState::default().with_selected(selected_index);
     frame.render_stateful_widget(list, area, &mut list_state);
 
     if app.state.delete_confirmation.is_some() {
@@ -157,11 +106,143 @@ pub(crate) fn message_status_label(status: &MessageStatus, is_own: bool) -> &'st
 
     match status {
         MessageStatus::Sending => "sending",
-        MessageStatus::Sent => "sent",
-        MessageStatus::Delivered => "delivered",
-        MessageStatus::Read => "read",
+        MessageStatus::Sent | MessageStatus::Delivered => "✓",
+        MessageStatus::Read => "✓✓",
         MessageStatus::Failed => "failed",
     }
+}
+
+fn visible_message_items(
+    app: &App,
+    theme: &Theme,
+    text_width: usize,
+    area_height: u16,
+) -> (Vec<ListItem<'static>>, Option<usize>) {
+    let capacity = area_height.saturating_sub(crate::state::PANEL_BORDER_RESERVED_ROWS) as usize;
+    let mut remaining_rows = capacity.max(1);
+    let mut items = Vec::new();
+    let mut selected_index = None;
+
+    for (idx, msg) in app
+        .state
+        .messages
+        .iter()
+        .enumerate()
+        .skip(app.state.message_scroll_offset)
+    {
+        if remaining_rows == 0 {
+            break;
+        }
+        if idx == app.state.selected_message_index {
+            selected_index = Some(items.len());
+        }
+
+        let (item, row_count) = message_item(msg, theme, text_width, remaining_rows);
+        items.push(item);
+        remaining_rows = remaining_rows.saturating_sub(row_count);
+    }
+
+    if selected_index.is_none()
+        && app.state.selected_message_index >= app.state.message_scroll_offset
+    {
+        selected_index = selected_list_index(
+            app.state
+                .selected_message_index
+                .saturating_sub(app.state.message_scroll_offset),
+            items.len(),
+        );
+    }
+
+    (items, selected_index)
+}
+
+fn message_item(
+    msg: &crate::telegram::types::Message,
+    theme: &Theme,
+    text_width: usize,
+    max_rows: usize,
+) -> (ListItem<'static>, usize) {
+    let time_str = msg.timestamp.format("%H:%M").to_string();
+    let status_label = message_status_label(&msg.status, msg.is_own);
+    let metadata = message_metadata(&time_str, msg.is_edited, status_label, msg.error.as_deref());
+    let msg_color = if msg.status == MessageStatus::Failed {
+        ratatui::style::Color::Red
+    } else if msg.is_own {
+        theme.own_message
+    } else {
+        theme.other_message
+    };
+    let reply_rows = usize::from(msg.reply_to_content.is_some() && max_rows > 1);
+    let content_rows = max_rows.saturating_sub(reply_rows).max(1);
+    let mut lines = message_lines(
+        &msg.sender_name,
+        msg.media.as_ref(),
+        &msg.content,
+        &metadata,
+        msg_color,
+        text_width,
+        content_rows,
+    );
+
+    if let Some(reply_content) = &msg.reply_to_content
+        && lines.len() < max_rows
+    {
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "{REPLY_LINE_PREFIX}{REPLY_MARKER}{REPLY_MARKER_SEPARATOR}{}",
+                truncate_with_ellipsis(reply_content, reply_content_width(text_width))
+            ),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )]));
+    }
+
+    let row_count = lines.len();
+    (ListItem::new(lines), row_count)
+}
+
+fn message_lines(
+    sender_name: &str,
+    media: Option<&crate::telegram::types::MessageMedia>,
+    content: &str,
+    metadata: &str,
+    msg_color: Color,
+    text_width: usize,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
+    let sender = format!("{sender_name}: ");
+    let first_content_width = text_width
+        .saturating_sub(display_width(&sender) + display_width(metadata))
+        .max(1);
+    let continuation_width = text_width.saturating_sub(display_width(&sender)).max(1);
+    let display_content = message_display_content(media, content);
+    let wrapped_content = wrap_display_lines_limited(
+        &display_content,
+        first_content_width,
+        continuation_width,
+        max_lines,
+    );
+
+    wrapped_content
+        .into_iter()
+        .enumerate()
+        .map(|(index, content_line)| {
+            if index == 0 {
+                let mut spans = vec![Span::styled(
+                    sender.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )];
+                spans.extend(message_content_spans(&content_line, msg_color));
+                spans.push(Span::raw(metadata.to_string()));
+                Line::from(spans)
+            } else {
+                let mut spans = vec![Span::raw(" ".repeat(display_width(&sender)))];
+                spans.extend(message_content_spans(&content_line, msg_color));
+                Line::from(spans)
+            }
+        })
+        .collect()
 }
 
 fn reply_content_width(text_width: usize) -> usize {
@@ -313,8 +394,9 @@ mod tests {
         DELETE_CONFIRMATION_TEXT, DELETE_CONFIRMATION_TITLE, MESSAGE_EMPTY_NO_CHAT_LABEL,
         MESSAGE_EMPTY_NO_MESSAGES_LABEL, MESSAGE_TITLE_BORDER_RESERVED_COLUMNS, REPLY_LINE_PREFIX,
         REPLY_MARKER, REPLY_MARKER_SEPARATOR, display_width, message_content_spans,
-        message_empty_placeholder, message_metadata, message_panel_title, message_position_label,
-        message_status_label, message_title_width, reply_content_width, typing_label,
+        message_empty_placeholder, message_lines, message_metadata, message_panel_title,
+        message_position_label, message_status_label, message_title_width, reply_content_width,
+        typing_label,
     };
     use crate::telegram::types::MessageStatus;
 
@@ -351,17 +433,14 @@ mod tests {
     }
 
     #[test]
-    fn message_status_labels_are_explicit_and_non_emoji() {
+    fn message_status_labels_use_compact_checkmarks() {
         assert_eq!(
             message_status_label(&MessageStatus::Sending, true),
             "sending"
         );
-        assert_eq!(message_status_label(&MessageStatus::Sent, true), "sent");
-        assert_eq!(
-            message_status_label(&MessageStatus::Delivered, true),
-            "delivered"
-        );
-        assert_eq!(message_status_label(&MessageStatus::Read, true), "read");
+        assert_eq!(message_status_label(&MessageStatus::Sent, true), "✓");
+        assert_eq!(message_status_label(&MessageStatus::Delivered, true), "✓");
+        assert_eq!(message_status_label(&MessageStatus::Read, true), "✓✓");
         assert_eq!(message_status_label(&MessageStatus::Failed, true), "failed");
     }
 
@@ -372,9 +451,9 @@ mod tests {
     }
 
     #[test]
-    fn message_status_labels_distinguish_delivery_from_read() {
+    fn message_status_labels_distinguish_sent_from_read() {
         assert_ne!(
-            message_status_label(&MessageStatus::Delivered, true),
+            message_status_label(&MessageStatus::Sent, true),
             message_status_label(&MessageStatus::Read, true)
         );
     }
@@ -392,11 +471,37 @@ mod tests {
 
     #[test]
     fn message_metadata_uses_plain_unicode_separators() {
-        let metadata = message_metadata("12:34", true, "read", Some("network down"));
+        let metadata = message_metadata("12:34", true, "✓✓", Some("network down"));
 
-        assert_eq!(metadata, " 12:34 · edited · read · error: network down");
+        assert_eq!(metadata, " 12:34 · edited · ✓✓ · error: network down");
         assert!(!metadata.contains("[edited]"));
         assert!(!metadata.contains(" | "));
+    }
+
+    #[test]
+    fn message_lines_wrap_long_content_without_ellipsis() {
+        let lines = message_lines(
+            "Alice",
+            None,
+            "abcdefghijklmnopqrstuvwxyz",
+            " 12:34",
+            ratatui::style::Color::Gray,
+            20,
+            usize::MAX,
+        );
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let letters_only = rendered
+            .chars()
+            .filter(|ch| ch.is_ascii_lowercase())
+            .collect::<String>();
+
+        assert!(lines.len() > 1);
+        assert!(letters_only.ends_with("abcdefghijklmnopqrstuvwxyz"));
+        assert!(!rendered.contains('…'));
     }
 
     #[test]

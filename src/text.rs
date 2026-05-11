@@ -10,6 +10,57 @@ pub fn char_display_width(ch: char) -> usize {
 
 const TRUNCATION_MARKER: &str = "…";
 
+#[cfg(test)]
+pub fn wrap_display_lines(text: &str, first_width: usize, subsequent_width: usize) -> Vec<String> {
+    wrap_display_lines_limited(text, first_width, subsequent_width, usize::MAX)
+}
+
+pub fn wrap_display_lines_limited(
+    text: &str,
+    first_width: usize,
+    subsequent_width: usize,
+    max_lines: usize,
+) -> Vec<String> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+
+    let first_width = first_width.max(1);
+    let subsequent_width = subsequent_width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    let mut current_limit = first_width;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(std::mem::take(&mut current));
+            if lines.len() >= max_lines {
+                return lines;
+            }
+            current_width = 0;
+            current_limit = subsequent_width;
+            continue;
+        }
+
+        let char_width = char_display_width(ch);
+        if current_width > 0 && current_width + char_width > current_limit {
+            lines.push(std::mem::take(&mut current));
+            if lines.len() >= max_lines {
+                return lines;
+            }
+            current_width = 0;
+            current_limit = subsequent_width;
+        }
+
+        current.push(ch);
+        current_width += char_width;
+    }
+
+    lines.push(current);
+    lines
+}
+
 pub fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
@@ -43,7 +94,10 @@ pub fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{char_display_width, display_width, truncate_with_ellipsis};
+    use super::{
+        char_display_width, display_width, truncate_with_ellipsis, wrap_display_lines,
+        wrap_display_lines_limited,
+    };
 
     #[test]
     fn leaves_short_text_unchanged() {
@@ -56,6 +110,34 @@ mod tests {
         assert_eq!(display_width("hello"), 5);
         assert_eq!(display_width("好 chat"), 7);
         assert_eq!(char_display_width('好'), 2);
+    }
+
+    #[test]
+    fn wraps_text_by_display_width() {
+        assert_eq!(
+            wrap_display_lines("hello world", 5, 4),
+            vec!["hello", " wor", "ld"]
+        );
+        assert_eq!(wrap_display_lines("a\nb", 10, 10), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn wraps_text_with_line_limit_without_scanning_tail() {
+        let text = format!("{}tail", "a".repeat(1_000_000));
+
+        assert_eq!(
+            wrap_display_lines_limited(&text, 4, 4, 2),
+            vec!["aaaa", "aaaa"]
+        );
+        assert!(wrap_display_lines_limited("hello", 5, 5, 0).is_empty());
+    }
+
+    #[test]
+    fn wraps_wide_text_by_display_width() {
+        let lines = wrap_display_lines("好好ab", 3, 2);
+
+        assert_eq!(lines, vec!["好", "好", "ab"]);
+        assert!(lines.iter().all(|line| display_width(line) <= 3));
     }
 
     #[test]

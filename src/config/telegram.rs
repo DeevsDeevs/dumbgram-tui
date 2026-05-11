@@ -1,3 +1,4 @@
+use crate::paths;
 use color_eyre::Result;
 use serde::{Deserialize, Deserializer};
 use std::{
@@ -10,8 +11,12 @@ pub struct TelegramConfig {
     #[serde(deserialize_with = "deserialize_api_id")]
     pub api_id: i32,
     pub api_hash: String,
-    #[serde(alias = "session_path")]
+    #[serde(alias = "session_path", default = "default_session_file")]
     pub session_file: String,
+}
+
+fn default_session_file() -> String {
+    paths::SESSION_FILE_NAME.to_string()
 }
 
 fn deserialize_api_id<'de, D>(deserializer: D) -> std::result::Result<i32, D::Error>
@@ -48,8 +53,17 @@ impl Config {
 }
 
 impl TelegramConfig {
-    pub fn session_path(&self) -> PathBuf {
-        expand_tilde(&self.session_file)
+    pub fn session_path_for_config(&self, config_path: &Path) -> PathBuf {
+        let session_path = expand_tilde(&self.session_file);
+        if session_path.is_absolute() || self.session_file.starts_with('~') {
+            session_path
+        } else {
+            config_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(|parent| parent.join(&session_path))
+                .unwrap_or(session_path)
+        }
     }
 }
 
@@ -71,14 +85,14 @@ impl Default for TelegramConfig {
         Self {
             api_id: 0,
             api_hash: String::new(),
-            session_file: "session.dat".to_string(),
+            session_file: default_session_file(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, expand_tilde_with_home};
+    use super::{Config, default_session_file, expand_tilde_with_home};
     use std::path::{Path, PathBuf};
 
     fn parse_test_config(config: &str) -> Config {
@@ -99,6 +113,19 @@ mod tests {
         assert_eq!(config.telegram.api_id, 12345);
         assert_eq!(config.telegram.api_hash, "hash");
         assert_eq!(config.telegram.session_file, "session.dat");
+    }
+
+    #[test]
+    fn telegram_config_defaults_session_file_when_omitted() {
+        let config = parse_test_config(
+            r#"
+            [telegram]
+            api_id = 12345
+            api_hash = "hash"
+            "#,
+        );
+
+        assert_eq!(config.telegram.session_file, default_session_file());
     }
 
     #[test]
@@ -132,6 +159,31 @@ mod tests {
             error
                 .to_string()
                 .contains("telegram.api_id must be an integer")
+        );
+    }
+
+    #[test]
+    fn session_path_resolves_relative_to_config_directory() {
+        let config = parse_test_config(
+            r#"
+            [telegram]
+            api_id = 12345
+            api_hash = "hash"
+            session_file = "session.dat"
+            "#,
+        );
+
+        assert_eq!(
+            config
+                .telegram
+                .session_path_for_config(Path::new("/home/alice/.config/dumbgram/config.toml")),
+            PathBuf::from("/home/alice/.config/dumbgram/session.dat")
+        );
+        assert_eq!(
+            config
+                .telegram
+                .session_path_for_config(Path::new("config.toml")),
+            PathBuf::from("session.dat")
         );
     }
 

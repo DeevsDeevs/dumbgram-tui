@@ -15,21 +15,27 @@ use ratatui::{
 pub(crate) const CHAT_PANEL_LABEL: &str = "Chats";
 pub(crate) const CHAT_EMPTY_NO_FOLDER_LABEL: &str = "No folder selected";
 pub(crate) const CHAT_EMPTY_NO_CHATS_LABEL: &str = "No chats loaded";
+pub(crate) const CHAT_SEARCH_NO_MATCHES_LABEL: &str = "No matching loaded chats";
 pub(crate) const CHAT_EMPTY_PREVIEW_LABEL: &str = "No message preview";
 pub(crate) const CHAT_PREVIEW_PREFIX: &str = "  ";
 
 pub fn render_chats(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
     let text_width = list_text_width(area.width);
 
+    let display_indices = app.state.chat_display_indices();
     let items: Vec<ListItem> = if app.state.chats.is_empty() {
         vec![ListItem::new(Line::from(Span::raw(
             chat_empty_placeholder(!app.state.folders.is_empty()),
         )))]
+    } else if app.state.chat_search_active() && display_indices.is_empty() {
+        vec![ListItem::new(Line::from(Span::raw(
+            chat_search_empty_placeholder(),
+        )))]
     } else {
-        app.state
-            .chats
+        display_indices
             .iter()
-            .map(|chat| {
+            .map(|&chat_index| {
+                let chat = &app.state.chats[chat_index];
                 let unread_indicator = chat_unread_indicator(chat.unread_count);
                 let group_indicator = chat_group_indicator(chat.is_group);
 
@@ -56,7 +62,15 @@ pub fn render_chats(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, t
             .collect()
     };
 
-    let title = chat_panel_title(app.state.selected_chat_index, app.state.chats.len());
+    let title = if app.state.chat_search_active() {
+        chat_search_panel_title(
+            app.state.chat_search_query(),
+            app.state.selected_chat_display_index().unwrap_or(0),
+            display_indices.len(),
+        )
+    } else {
+        chat_panel_title(app.state.selected_chat_index, app.state.chats.len())
+    };
 
     let list = List::new(items)
         .block(
@@ -76,12 +90,41 @@ pub fn render_chats(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, t
         )
         .highlight_symbol(SELECTED_ROW_SYMBOL);
 
-    let selected_index = selected_list_index(app.state.selected_chat_index, app.state.chats.len());
+    let selected_index = if app.state.chat_search_active() {
+        selected_list_index(
+            app.state.selected_chat_display_index().unwrap_or(0),
+            display_indices.len(),
+        )
+    } else {
+        selected_list_index(app.state.selected_chat_index, app.state.chats.len())
+    };
+    let offset = if app.state.chat_search_active() {
+        app.state.chat_search_scroll_offset
+    } else {
+        app.state.chat_scroll_offset
+    };
 
     let mut list_state = ListState::default()
-        .with_offset(app.state.chat_scroll_offset)
+        .with_offset(offset)
         .with_selected(selected_index);
     frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+pub(crate) fn chat_search_panel_title(
+    query: &str,
+    selected_index: usize,
+    chat_count: usize,
+) -> String {
+    let query = if query.is_empty() { "type…" } else { query };
+    if chat_count == 0 {
+        format!(" {CHAT_PANEL_LABEL} /{query} 0/0 ")
+    } else {
+        format!(
+            " {CHAT_PANEL_LABEL} /{query} {}/{} ",
+            selected_index.min(chat_count - 1) + 1,
+            chat_count
+        )
+    }
 }
 
 pub(crate) fn chat_panel_title(selected_index: usize, chat_count: usize) -> String {
@@ -116,6 +159,10 @@ pub(crate) fn chat_empty_placeholder(has_selected_folder: bool) -> &'static str 
     }
 }
 
+pub(crate) fn chat_search_empty_placeholder() -> &'static str {
+    CHAT_SEARCH_NO_MATCHES_LABEL
+}
+
 pub(crate) fn chat_preview_text(last_message: Option<&str>) -> &str {
     last_message
         .filter(|message| !message.trim().is_empty())
@@ -130,8 +177,10 @@ pub(crate) fn chat_preview_width(text_width: usize) -> usize {
 mod tests {
     use super::{
         CHAT_EMPTY_NO_CHATS_LABEL, CHAT_EMPTY_NO_FOLDER_LABEL, CHAT_EMPTY_PREVIEW_LABEL,
-        CHAT_PREVIEW_PREFIX, chat_empty_placeholder, chat_group_indicator, chat_panel_title,
-        chat_preview_text, chat_preview_width, chat_unread_indicator, display_width,
+        CHAT_PREVIEW_PREFIX, CHAT_SEARCH_NO_MATCHES_LABEL, chat_empty_placeholder,
+        chat_group_indicator, chat_panel_title, chat_preview_text, chat_preview_width,
+        chat_search_empty_placeholder, chat_search_panel_title, chat_unread_indicator,
+        display_width,
     };
 
     #[test]
@@ -139,6 +188,12 @@ mod tests {
         assert_eq!(chat_panel_title(0, 0), " Chats 0/0 ");
         assert_eq!(chat_panel_title(0, 4), " Chats 1/4 ");
         assert_eq!(chat_panel_title(99, 4), " Chats 4/4 ");
+    }
+
+    #[test]
+    fn chat_search_panel_title_shows_query_and_filtered_position() {
+        assert_eq!(chat_search_panel_title("", 0, 0), " Chats /type… 0/0 ");
+        assert_eq!(chat_search_panel_title("ali", 0, 2), " Chats /ali 1/2 ");
     }
 
     #[test]
@@ -157,6 +212,15 @@ mod tests {
     fn chat_empty_placeholder_distinguishes_missing_folder_from_empty_chat_list() {
         assert_eq!(chat_empty_placeholder(false), CHAT_EMPTY_NO_FOLDER_LABEL);
         assert_eq!(chat_empty_placeholder(true), CHAT_EMPTY_NO_CHATS_LABEL);
+    }
+
+    #[test]
+    fn chat_search_empty_placeholder_explains_loaded_scope() {
+        assert_eq!(
+            chat_search_empty_placeholder(),
+            CHAT_SEARCH_NO_MATCHES_LABEL
+        );
+        assert!(chat_search_empty_placeholder().contains("loaded chats"));
     }
 
     #[test]

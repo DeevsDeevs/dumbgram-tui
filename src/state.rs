@@ -1,12 +1,15 @@
 use crate::diagnostics;
 use crate::telegram::types::{
     Chat, Folder, Message, MessageStatus, OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID, Update,
-    is_all_folder, message_display_preview,
+    is_all_folder, message_display_content, message_display_preview,
 };
-use crate::text::display_width;
+use crate::text::{display_width, wrap_display_lines_limited};
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) const FOLDER_LEFT_SCROLL_INDICATOR: &str = "◀ ";
@@ -42,12 +45,63 @@ fn last_index(item_count: usize) -> usize {
     item_count.saturating_sub(1)
 }
 
-fn message_visible_row_height(message: &Message) -> usize {
-    if message.reply_to_content.is_some() {
-        REPLY_MESSAGE_ROW_HEIGHT
-    } else {
-        MESSAGE_ROW_HEIGHT
+#[cfg(test)]
+pub(crate) fn message_visible_row_height_for_width(message: &Message, text_width: usize) -> usize {
+    message_visible_row_height_for_width_capped(message, text_width, usize::MAX)
+}
+
+pub(crate) fn message_visible_row_height_for_width_capped(
+    message: &Message,
+    text_width: usize,
+    max_height: usize,
+) -> usize {
+    if max_height == 0 {
+        return 0;
     }
+
+    let sender = format!("{}: ", message.sender_name);
+    let metadata_width = message_metadata_display_width(message);
+    let first_content_width = text_width
+        .saturating_sub(display_width(&sender) + metadata_width)
+        .max(1);
+    let continuation_width = text_width.saturating_sub(display_width(&sender)).max(1);
+    let display_content = message_display_content(message.media.as_ref(), &message.content);
+    let mut rows = wrap_display_lines_limited(
+        &display_content,
+        first_content_width,
+        continuation_width,
+        max_height,
+    )
+    .len()
+    .max(MESSAGE_ROW_HEIGHT);
+    if message.reply_to_content.is_some() && rows < max_height {
+        rows += REPLY_MESSAGE_ROW_HEIGHT - MESSAGE_ROW_HEIGHT;
+    }
+    rows
+}
+
+#[cfg(test)]
+fn message_visible_row_height(message: &Message) -> usize {
+    message_visible_row_height_for_width(message, usize::MAX / 2)
+}
+
+fn message_metadata_display_width(message: &Message) -> usize {
+    let mut width = 6;
+    if message.is_edited {
+        width += display_width(" · edited");
+    }
+    if message.is_own {
+        width += display_width(match message.status {
+            MessageStatus::Sending => " · sending",
+            MessageStatus::Sent | MessageStatus::Delivered => " · ✓",
+            MessageStatus::Read => " · ✓✓",
+            MessageStatus::Failed => " · failed",
+        });
+    }
+    if let Some(error) = &message.error {
+        width += display_width(" · error: ") + display_width(error);
+    }
+    width
 }
 
 fn chat_name_starts_with(name: &str, prefix: char) -> bool {
@@ -80,6 +134,35 @@ pub(crate) fn delete_failed_error(error: impl std::fmt::Display) -> String {
 
 fn delete_update_matches_chat(update_chat_id: i64, chat_id: i64) -> bool {
     update_chat_id == UNKNOWN_DELETE_UPDATE_CHAT_ID || update_chat_id == chat_id
+}
+
+fn chat_matches_search(chat_name: &str, query: &str) -> bool {
+    let query = normalize_chat_search_text(query);
+    if query.is_empty() {
+        return true;
+    }
+
+    let name = normalize_chat_search_text(chat_name);
+    name.contains(&query) || is_subsequence(&query, &name)
+}
+
+fn normalize_chat_search_text(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .filter(|ch| ch.is_alphanumeric() || ch.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut chars = haystack.chars();
+    needle.chars().all(|needle_char| {
+        chars
+            .by_ref()
+            .any(|haystack_char| haystack_char == needle_char)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +208,13 @@ pub enum MessageSubmitAction {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadedMediaReference {
+    pub chat_id: i64,
+    pub message_id: i32,
+    pub path: PathBuf,
+}
+
 pub struct AppState {
     pub folders: Vec<Folder>,
     pub chats: Vec<Chat>,
@@ -132,6 +222,8 @@ pub struct AppState {
     pub selected_folder_index: usize,
     pub selected_chat_index: usize,
     pub chat_scroll_offset: usize,
+    pub chat_search_query: Option<String>,
+    pub chat_search_scroll_offset: usize,
     pub selected_message_index: usize,
     pub message_scroll_offset: usize,
     pub focused_panel: FocusedPanel,
@@ -155,6 +247,7 @@ pub struct AppState {
     pub error_timestamp: Option<DateTime<Utc>>,
     pub status_message: Option<String>,
     pub status_timestamp: Option<DateTime<Utc>>,
+    pub last_downloaded_media: Option<DownloadedMediaReference>,
     pub delete_confirmation: Option<DeleteConfirmation>,
     pub typing_users: HashMap<i64, Vec<String>>,
 }
@@ -168,6 +261,8 @@ impl AppState {
             selected_folder_index: 0,
             selected_chat_index: 0,
             chat_scroll_offset: 0,
+            chat_search_query: None,
+            chat_search_scroll_offset: 0,
             selected_message_index: 0,
             message_scroll_offset: 0,
             focused_panel: FocusedPanel::Folders,
@@ -191,6 +286,7 @@ impl AppState {
             error_timestamp: None,
             status_message: None,
             status_timestamp: None,
+            last_downloaded_media: None,
             delete_confirmation: None,
             typing_users: HashMap::new(),
         }
@@ -352,6 +448,126 @@ impl AppState {
             self.selected_chat_index = index;
             self.ensure_selected_chat_visible();
         }
+    }
+
+    pub fn chat_search_active(&self) -> bool {
+        self.chat_search_query.is_some()
+    }
+
+    pub fn chat_search_query(&self) -> &str {
+        self.chat_search_query.as_deref().unwrap_or("")
+    }
+
+    pub fn begin_chat_search(&mut self) {
+        self.chat_search_query = Some(String::new());
+        self.chat_search_scroll_offset = 0;
+    }
+
+    pub fn clear_chat_search(&mut self) {
+        self.chat_search_query = None;
+        self.chat_search_scroll_offset = 0;
+        self.ensure_selected_chat_visible();
+    }
+
+    pub fn push_chat_search_char(&mut self, ch: char) {
+        if !self.chat_search_active() || ch.is_control() {
+            return;
+        }
+        if let Some(query) = self.chat_search_query.as_mut() {
+            query.push(ch);
+        }
+        self.select_first_chat_search_match();
+    }
+
+    pub fn pop_chat_search_char(&mut self) {
+        if let Some(query) = self.chat_search_query.as_mut() {
+            query.pop();
+        }
+        self.select_first_chat_search_match();
+    }
+
+    pub fn chat_display_indices(&self) -> Vec<usize> {
+        if !self.chat_search_active() {
+            return (0..self.chats.len()).collect();
+        }
+
+        self.chats
+            .iter()
+            .enumerate()
+            .filter_map(|(index, chat)| {
+                chat_matches_search(&chat.name, self.chat_search_query()).then_some(index)
+            })
+            .collect()
+    }
+
+    pub fn selected_chat_display_index(&self) -> Option<usize> {
+        self.chat_display_indices()
+            .iter()
+            .position(|&index| index == self.selected_chat_index)
+    }
+
+    fn select_first_chat_search_match(&mut self) {
+        if let Some(index) = self.chat_display_indices().first().copied() {
+            self.selected_chat_index = index;
+        }
+        self.ensure_selected_chat_search_visible();
+    }
+
+    pub fn ensure_selected_chat_search_visible(&mut self) {
+        if !self.chat_search_active() {
+            self.ensure_selected_chat_visible();
+            return;
+        }
+
+        let indices = self.chat_display_indices();
+        if indices.is_empty() {
+            self.chat_search_scroll_offset = 0;
+            return;
+        }
+
+        let capacity = self.chat_visible_capacity();
+        let max_scroll_offset = indices.len().saturating_sub(capacity);
+        self.chat_search_scroll_offset = self.chat_search_scroll_offset.min(max_scroll_offset);
+        let Some(selected_display_index) = indices
+            .iter()
+            .position(|&index| index == self.selected_chat_index)
+        else {
+            return;
+        };
+
+        if selected_display_index < self.chat_search_scroll_offset {
+            self.chat_search_scroll_offset = selected_display_index;
+        } else if selected_display_index >= self.chat_search_scroll_offset + capacity {
+            self.chat_search_scroll_offset = selected_display_index + 1 - capacity;
+        }
+    }
+
+    pub fn select_next_chat_search_match(&mut self) {
+        let indices = self.chat_display_indices();
+        if indices.is_empty() {
+            return;
+        }
+        let position = indices
+            .iter()
+            .position(|&index| index == self.selected_chat_index)
+            .unwrap_or(0);
+        let next_position = (position + 1).min(indices.len() - 1);
+        self.selected_chat_index = indices[next_position];
+        self.ensure_selected_chat_search_visible();
+    }
+
+    pub fn select_previous_chat_search_match(&mut self) {
+        let indices = self.chat_display_indices();
+        if indices.is_empty() {
+            return;
+        }
+        let position = indices
+            .iter()
+            .position(|&index| index == self.selected_chat_index)
+            .unwrap_or(0);
+        let previous_position = position.saturating_sub(1);
+        self.selected_chat_index = indices[previous_position];
+        self.ensure_selected_chat_search_visible();
     }
 
     pub fn next_chat_index_starting_with(&self, prefix: char) -> Option<usize> {
@@ -868,6 +1084,23 @@ impl AppState {
                     self.refresh_selected_chat_last_message_from_loaded_messages();
                 }
             }
+            Update::ReadOutgoingMessages {
+                chat_id,
+                max_message_id,
+            } => {
+                for message in &mut self.messages {
+                    if message.chat_id == chat_id
+                        && message.is_own
+                        && message.id <= max_message_id
+                        && !matches!(
+                            message.status,
+                            MessageStatus::Sending | MessageStatus::Failed | MessageStatus::Read
+                        )
+                    {
+                        message.status = MessageStatus::Read;
+                    }
+                }
+            }
             Update::TypingStatus {
                 chat_id,
                 user_name,
@@ -952,6 +1185,10 @@ impl AppState {
             .max(1) as usize
     }
 
+    fn message_text_width(&self) -> usize {
+        self.messages_area.width.saturating_sub(5) as usize
+    }
+
     pub fn ensure_selected_message_visible(&mut self) {
         if self.messages.is_empty() {
             self.selected_message_index = 0;
@@ -962,14 +1199,70 @@ impl AppState {
         self.selected_message_index = self
             .selected_message_index
             .min(last_index(self.messages.len()));
-        let capacity = self.message_visible_capacity();
-        let max_scroll_offset = self.messages.len().saturating_sub(capacity);
-        self.message_scroll_offset = self.message_scroll_offset.min(max_scroll_offset);
-        if self.selected_message_index < self.message_scroll_offset {
-            self.message_scroll_offset = self.selected_message_index;
-        } else if self.selected_message_index >= self.message_scroll_offset + capacity {
-            self.message_scroll_offset = self.selected_message_index + 1 - capacity;
+        self.message_scroll_offset = self
+            .message_scroll_offset
+            .min(last_index(self.messages.len()));
+        let (selected_is_visible, visible_rows) = self.message_viewport_status();
+        if !selected_is_visible
+            || (visible_rows < self.message_visible_capacity() && self.message_scroll_offset > 0)
+        {
+            self.message_scroll_offset = self.message_scroll_offset_for_selected();
         }
+    }
+
+    fn message_viewport_status(&self) -> (bool, usize) {
+        let capacity = self.message_visible_capacity();
+        let width = self.message_text_width();
+        let mut visible_rows = 0;
+        let mut selected_is_visible = false;
+
+        for (idx, message) in self
+            .messages
+            .iter()
+            .enumerate()
+            .skip(self.message_scroll_offset)
+        {
+            let remaining_rows = capacity.saturating_sub(visible_rows);
+            if remaining_rows == 0 {
+                break;
+            }
+            if idx == self.selected_message_index {
+                selected_is_visible = true;
+            }
+            visible_rows +=
+                message_visible_row_height_for_width_capped(message, width, remaining_rows);
+            if visible_rows >= capacity {
+                break;
+            }
+        }
+
+        (selected_is_visible, visible_rows)
+    }
+
+    fn message_scroll_offset_for_selected(&self) -> usize {
+        let capacity = self.message_visible_capacity();
+        let width = self.message_text_width();
+        let mut rows = 0;
+        let mut offset = self.selected_message_index;
+
+        for idx in (0..=self.selected_message_index).rev() {
+            let remaining_rows = capacity.saturating_sub(rows);
+            if remaining_rows == 0 {
+                break;
+            }
+            let message_height = message_visible_row_height_for_width_capped(
+                &self.messages[idx],
+                width,
+                remaining_rows.saturating_add(1),
+            );
+            if message_height > remaining_rows {
+                break;
+            }
+            rows += message_height;
+            offset = idx;
+        }
+
+        offset
     }
 
     pub fn reset_message_selection(&mut self) {
@@ -979,6 +1272,21 @@ impl AppState {
 
     pub fn selected_message(&self) -> Option<&Message> {
         self.messages.get(self.selected_message_index)
+    }
+
+    pub fn record_downloaded_media(&mut self, chat_id: i64, message_id: i32, path: PathBuf) {
+        self.last_downloaded_media = Some(DownloadedMediaReference {
+            chat_id,
+            message_id,
+            path,
+        });
+    }
+
+    pub fn selected_message_download_path(&self) -> Option<&Path> {
+        let message = self.selected_message()?;
+        let downloaded = self.last_downloaded_media.as_ref()?;
+        (downloaded.chat_id == message.chat_id && downloaded.message_id == message.id)
+            .then_some(downloaded.path.as_path())
     }
 
     pub fn selected_message_is_last(&self) -> bool {
@@ -997,7 +1305,12 @@ impl AppState {
             .enumerate()
             .skip(self.message_scroll_offset)
         {
-            let message_height = message_visible_row_height(message);
+            let remaining_rows = self.message_visible_capacity().saturating_sub(current_row);
+            let message_height = message_visible_row_height_for_width_capped(
+                message,
+                self.message_text_width(),
+                remaining_rows,
+            );
             if row < current_row + message_height {
                 self.selected_message_index = idx;
                 self.ensure_selected_message_visible();
@@ -1127,6 +1440,7 @@ impl AppState {
             self.selected_message_index = self
                 .selected_message_index
                 .saturating_sub(self.message_visible_capacity());
+            self.message_scroll_offset = self.selected_message_index;
             self.ensure_selected_message_visible();
         }
     }
@@ -1410,7 +1724,8 @@ mod tests {
         NOTIFICATION_TIMEOUT_SECONDS, PANEL_BORDER_RESERVED_COLUMNS, PANEL_BORDER_RESERVED_ROWS,
         REMOTE_EDIT_WHILE_EDITING_STATUS, REPLY_MESSAGE_ROW_HEIGHT, REPLY_SENT_STATUS,
         SPLIT_RATIO_STEP, delete_failed_error, delete_update_matches_chat, edit_failed_error,
-        last_index, message_visible_row_height, reply_failed_error, send_failed_error,
+        last_index, message_visible_row_height, message_visible_row_height_for_width,
+        reply_failed_error, send_failed_error,
     };
     use crate::telegram::types::{
         Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME,
@@ -1542,13 +1857,16 @@ mod tests {
     }
 
     #[test]
-    fn message_visible_row_height_accounts_for_reply_preview_rows() {
+    fn message_visible_row_height_accounts_for_reply_preview_rows_and_wrapping() {
         let plain = message(10);
         let mut reply = message(20);
         reply.reply_to_content = Some("quoted".to_string());
+        let mut long = message(30);
+        long.content = "abcdefghijklmnopqrstuvwxyz".to_string();
 
         assert_eq!(message_visible_row_height(&plain), MESSAGE_ROW_HEIGHT);
         assert_eq!(message_visible_row_height(&reply), REPLY_MESSAGE_ROW_HEIGHT);
+        assert!(message_visible_row_height_for_width(&long, 20) > MESSAGE_ROW_HEIGHT);
     }
 
     #[test]
@@ -1722,6 +2040,29 @@ mod tests {
         assert_eq!(state.folders[1].unread_count, 5);
         assert!(state.messages.is_empty());
         assert_eq!(state.chats[1].last_message.as_deref(), Some("background"));
+    }
+
+    #[test]
+    fn read_outgoing_update_marks_loaded_own_messages_read() {
+        let mut state = AppState::new();
+        state.messages = vec![
+            update_message(10, 1, "old own", true),
+            update_message(20, 1, "new own", true),
+            update_message(15, 1, "incoming", false),
+            update_message(10, 2, "other chat", true),
+        ];
+        state.messages[1].status = MessageStatus::Sending;
+        state.messages[3].status = MessageStatus::Sent;
+
+        state.apply_update(Update::ReadOutgoingMessages {
+            chat_id: 1,
+            max_message_id: 15,
+        });
+
+        assert_eq!(state.messages[0].status, MessageStatus::Read);
+        assert_eq!(state.messages[1].status, MessageStatus::Sending);
+        assert_eq!(state.messages[2].status, MessageStatus::Delivered);
+        assert_eq!(state.messages[3].status, MessageStatus::Sent);
     }
 
     #[test]
@@ -2775,6 +3116,54 @@ mod tests {
     }
 
     #[test]
+    fn chat_search_matches_loaded_chats_by_substring_or_subsequence() {
+        let mut state = AppState::new();
+        state.chats = vec![
+            chat(1, "Alice Personal"),
+            chat(2, "Work Team"),
+            chat(3, "Project Alpha"),
+        ];
+        state.begin_chat_search();
+
+        state.push_chat_search_char('p');
+        state.push_chat_search_char('r');
+        assert_eq!(state.chat_display_indices(), vec![0, 2]);
+
+        state.push_chat_search_char('o');
+        state.push_chat_search_char('j');
+        assert_eq!(state.chat_display_indices(), vec![2]);
+        assert_eq!(state.selected_chat_index, 2);
+
+        state.pop_chat_search_char();
+        state.pop_chat_search_char();
+        assert_eq!(state.chat_display_indices(), vec![0, 2]);
+
+        state.chat_search_query = Some("wt".to_string());
+        assert_eq!(state.chat_display_indices(), vec![1]);
+    }
+
+    #[test]
+    fn chat_search_keeps_selected_filtered_result_visible_without_moving_normal_scroll() {
+        let mut state = state_with_many_chats();
+        state.begin_chat_search();
+        state.push_chat_search_char('c');
+
+        for _ in 0..5 {
+            state.select_next_chat_search_match();
+        }
+
+        assert_eq!(state.selected_chat_index, 5);
+        assert_eq!(state.selected_chat_display_index(), Some(5));
+        assert_eq!(state.chat_search_scroll_offset, 4);
+        assert_eq!(state.chat_scroll_offset, 0);
+
+        state.clear_chat_search();
+        assert!(!state.chat_search_active());
+        assert_eq!(state.chat_search_scroll_offset, 0);
+        assert_eq!(state.chat_scroll_offset, 4);
+    }
+
+    #[test]
     fn chat_selection_keeps_scroll_offset_visible() {
         let mut state = state_with_many_chats();
 
@@ -2862,6 +3251,21 @@ mod tests {
 
         state.selected_message_index = 99;
         assert!(state.selected_message().is_none());
+    }
+
+    #[test]
+    fn selected_message_download_path_matches_selected_message_only() {
+        let mut state = AppState::new();
+        state.messages = vec![message(10), message(20)];
+        state.record_downloaded_media(10, 20, "/tmp/downloaded.bin".into());
+
+        assert_eq!(state.selected_message_download_path(), None);
+
+        state.selected_message_index = 1;
+        assert_eq!(
+            state.selected_message_download_path(),
+            Some(std::path::Path::new("/tmp/downloaded.bin"))
+        );
     }
 
     #[test]

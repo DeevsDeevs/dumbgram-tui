@@ -14,7 +14,51 @@ pub fn handle_chat_key(state: &mut AppState, key: KeyEvent) -> ChatKeyOutcome {
         return ChatKeyOutcome::Ignored;
     }
 
+    if state.chat_search_active() {
+        return match key.code {
+            KeyCode::Esc => {
+                state.clear_chat_search();
+                ChatKeyOutcome::Handled
+            }
+            KeyCode::Enter => {
+                let selected_match =
+                    (!state.chat_display_indices().is_empty()).then_some(state.selected_chat_index);
+                state.clear_chat_search();
+                selected_match.map_or(ChatKeyOutcome::Handled, ChatKeyOutcome::OpenChatAt)
+            }
+            KeyCode::Backspace => {
+                state.pop_chat_search_char();
+                ChatKeyOutcome::Handled
+            }
+            KeyCode::Down => {
+                state.select_next_chat_search_match();
+                if state.chat_display_indices().is_empty() {
+                    ChatKeyOutcome::Handled
+                } else {
+                    ChatKeyOutcome::OpenChatAt(state.selected_chat_index)
+                }
+            }
+            KeyCode::Up => {
+                state.select_previous_chat_search_match();
+                if state.chat_display_indices().is_empty() {
+                    ChatKeyOutcome::Handled
+                } else {
+                    ChatKeyOutcome::OpenChatAt(state.selected_chat_index)
+                }
+            }
+            KeyCode::Char(ch) if key.modifiers == KeyModifiers::NONE => {
+                state.push_chat_search_char(ch);
+                ChatKeyOutcome::Handled
+            }
+            _ => ChatKeyOutcome::Handled,
+        };
+    }
+
     match key.code {
+        KeyCode::Char('/') if key.modifiers == KeyModifiers::NONE => {
+            state.begin_chat_search();
+            ChatKeyOutcome::Handled
+        }
         KeyCode::Down
             if state
                 .selected_chat_index
@@ -176,6 +220,96 @@ mod tests {
             handle_chat_key(&mut state, key(KeyCode::Char('x'))),
             ChatKeyOutcome::Ignored
         );
+    }
+
+    #[test]
+    fn chat_keys_search_loaded_chats_by_name_before_opening() {
+        let mut state = AppState::new();
+        state.focused_panel = FocusedPanel::Chats;
+        state.chats = vec![
+            named_chat(1, "Alice Personal"),
+            named_chat(2, "Work Team"),
+            named_chat(3, "Project Alpha"),
+        ];
+
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Char('/'))),
+            ChatKeyOutcome::Handled
+        );
+        assert!(state.chat_search_active());
+
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Char('p'))),
+            ChatKeyOutcome::Handled
+        );
+        assert_eq!(state.chat_search_query(), "p");
+        assert_eq!(state.selected_chat_index, 0);
+
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Char('r'))),
+            ChatKeyOutcome::Handled
+        );
+        assert_eq!(state.chat_search_query(), "pr");
+        assert_eq!(state.selected_chat_index, 0);
+
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Char('o'))),
+            ChatKeyOutcome::Handled
+        );
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Char('j'))),
+            ChatKeyOutcome::Handled
+        );
+        assert_eq!(state.chat_search_query(), "proj");
+        assert_eq!(state.selected_chat_index, 2);
+
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Enter)),
+            ChatKeyOutcome::OpenChatAt(2)
+        );
+        assert!(!state.chat_search_active());
+    }
+
+    #[test]
+    fn chat_search_arrow_selection_opens_selected_result() {
+        let mut state = AppState::new();
+        state.focused_panel = FocusedPanel::Chats;
+        state.chats = vec![
+            named_chat(1, "Alpha"),
+            named_chat(2, "Beta"),
+            named_chat(3, "Gamma"),
+        ];
+        state.begin_chat_search();
+
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Down)),
+            ChatKeyOutcome::OpenChatAt(1)
+        );
+        assert_eq!(state.selected_chat_index, 1);
+        assert!(state.chat_search_active());
+    }
+
+    #[test]
+    fn chat_search_enter_with_no_matches_does_not_open_stale_selection() {
+        let mut state = AppState::new();
+        state.focused_panel = FocusedPanel::Chats;
+        state.chats = vec![named_chat(1, "Alpha"), named_chat(2, "Beta")];
+        state.selected_chat_index = 1;
+        state.begin_chat_search();
+        for ch in "zzz".chars() {
+            assert_eq!(
+                handle_chat_key(&mut state, key(KeyCode::Char(ch))),
+                ChatKeyOutcome::Handled
+            );
+        }
+        assert!(state.chat_display_indices().is_empty());
+
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Enter)),
+            ChatKeyOutcome::Handled
+        );
+        assert!(!state.chat_search_active());
+        assert_eq!(state.selected_chat_index, 1);
     }
 
     #[test]

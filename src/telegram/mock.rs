@@ -1,4 +1,4 @@
-use super::client::TelegramClient;
+use super::client::{DownloadedMedia, TelegramClient};
 use super::types::{
     Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, Update, all_folder,
 };
@@ -69,6 +69,25 @@ impl TelegramClient for MockTelegramClient {
                     unread_count: 2,
                 },
             ])
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn download_message_media(
+        &self,
+        _chat_id: i64,
+        message_id: i32,
+        destination_dir: PathBuf,
+    ) -> impl std::future::Future<Output = Result<DownloadedMedia>> + Send + '_ {
+        async move {
+            std::fs::create_dir_all(&destination_dir)?;
+            let path = destination_dir.join(format!("dumbgram-mock-message-{message_id}.png"));
+            let bytes = base64::engine::general_purpose::STANDARD.decode(MOCK_IMAGE_PNG_BASE64)?;
+            std::fs::write(&path, &bytes)?;
+            Ok(DownloadedMedia {
+                path,
+                bytes: bytes.len() as u64,
+            })
         }
     }
 

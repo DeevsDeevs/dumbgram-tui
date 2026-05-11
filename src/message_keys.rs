@@ -5,6 +5,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 pub enum MessageKeyOutcome {
     Handled,
     OpenSelectedLink,
+    CopySelectedText,
+    DownloadSelectedMedia,
+    OpenDownloadedMedia,
     Ignored,
 }
 
@@ -32,6 +35,9 @@ pub fn handle_message_key(state: &mut AppState, key: KeyEvent) -> MessageKeyOutc
         KeyCode::Char('r') => state.request_reply_to_selected_message(),
         KeyCode::Char('d') => state.request_delete_selected_message(),
         KeyCode::Char('o') => return MessageKeyOutcome::OpenSelectedLink,
+        KeyCode::Char('c') => return MessageKeyOutcome::CopySelectedText,
+        KeyCode::Char('s') => return MessageKeyOutcome::DownloadSelectedMedia,
+        KeyCode::Char('v') => return MessageKeyOutcome::OpenDownloadedMedia,
         _ => return MessageKeyOutcome::Ignored,
     }
 
@@ -133,6 +139,21 @@ mod tests {
         assert_eq!(
             handle_message_key(&mut state, key(KeyCode::Char('o'))),
             MessageKeyOutcome::OpenSelectedLink
+        );
+
+        assert_eq!(
+            handle_message_key(&mut state, key(KeyCode::Char('c'))),
+            MessageKeyOutcome::CopySelectedText
+        );
+
+        assert_eq!(
+            handle_message_key(&mut state, key(KeyCode::Char('s'))),
+            MessageKeyOutcome::DownloadSelectedMedia
+        );
+
+        assert_eq!(
+            handle_message_key(&mut state, key(KeyCode::Char('v'))),
+            MessageKeyOutcome::OpenDownloadedMedia
         );
 
         assert_eq!(

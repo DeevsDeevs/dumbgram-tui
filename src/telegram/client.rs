@@ -1,6 +1,13 @@
 use super::types::{Chat, Folder, Message, Update};
-use color_eyre::Result;
+use color_eyre::{Result, eyre::eyre};
+use std::path::PathBuf;
 use tokio::sync::mpsc;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadedMedia {
+    pub path: PathBuf,
+    pub bytes: u64,
+}
 
 pub trait TelegramClient {
     async fn connect(&mut self) -> Result<()>;
@@ -30,6 +37,14 @@ pub trait TelegramClient {
         _chat_id: i64,
     ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
         async move { Ok(()) }
+    }
+    fn download_message_media(
+        &self,
+        _chat_id: i64,
+        _message_id: i32,
+        _destination_dir: PathBuf,
+    ) -> impl std::future::Future<Output = Result<DownloadedMedia>> + Send + '_ {
+        async move { Err(eyre!("No downloadable media")) }
     }
     #[allow(clippy::manual_async_fn)]
     fn send_message(

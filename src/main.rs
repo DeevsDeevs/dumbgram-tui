@@ -5,15 +5,18 @@ mod chat_keys;
 mod config;
 mod confirm_keys;
 mod diagnostics;
+mod file_opener;
 mod folder_keys;
 mod global_keys;
 mod input_keys;
 mod links;
 mod message_keys;
 mod mouse_events;
+mod paths;
 mod preferences;
 mod state;
 mod telegram;
+mod terminal_clipboard;
 mod terminal_images;
 mod text;
 mod ui;
@@ -43,14 +46,22 @@ const LOADING_OLDER_MESSAGES_STATUS: &str = "Loading older messages…";
 const LOADING_CHAT_MESSAGES_STATUS: &str = "Loading chat messages…";
 const LOADING_FOLDER_CHATS_STATUS: &str = "Loading folder chats…";
 const LINK_OPENED_STATUS: &str = "Link opened";
+const MESSAGE_TEXT_COPIED_STATUS: &str = "Message text copied";
+const DOWNLOADING_MEDIA_STATUS: &str = "Downloading media…";
+const MEDIA_DOWNLOADED_STATUS: &str = "Media downloaded to Downloads";
+const DOWNLOADED_MEDIA_OPENED_STATUS: &str = "Downloaded media opened";
+const NO_DOWNLOADED_MEDIA_STATUS: &str = "No downloaded media for selected message";
+const NO_TEXT_IN_SELECTED_MESSAGE_STATUS: &str = "No text in selected message";
 const NO_LINK_IN_SELECTED_MESSAGE_STATUS: &str = "No link in selected message";
+const NO_MEDIA_IN_SELECTED_MESSAGE_STATUS: &str = "No downloadable media in selected message";
 const OPEN_LINK_FAILED_PREFIX: &str = "Open link failed";
+const OPEN_DOWNLOADED_MEDIA_FAILED_PREFIX: &str = "Open downloaded media failed";
 const DELETING_MESSAGE_STATUS: &str = "Deleting message…";
 const SENDING_MESSAGE_STATUS: &str = "Sending message…";
 const SAVING_EDIT_STATUS: &str = "Saving edit…";
 const SENDING_REPLY_STATUS: &str = "Sending reply…";
-const DEFAULT_CONFIG_PATH: &str = "config.toml";
-const APP_COMMAND: &str = "dumbgram_tui";
+const APP_COMMAND: &str = env!("CARGO_PKG_NAME");
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SMOKE_CHECK_CONFIG_CONFLICT: &str =
     "--smoke cannot be combined with --check-config because smoke is mock-only";
 const SMOKE_CHECK_AUTH_CONFLICT: &str =
@@ -108,7 +119,7 @@ impl Default for Cli {
     fn default() -> Self {
         Self {
             mode: RunMode::RealTelegram,
-            config_path: DEFAULT_CONFIG_PATH.to_string(),
+            config_path: default_config_path_string(),
             smoke: false,
             check_config: false,
             check_auth: false,
@@ -236,12 +247,17 @@ where
     Ok(cli)
 }
 
+fn default_config_path_string() -> String {
+    paths::default_config_path().to_string_lossy().into_owned()
+}
+
 fn print_help() {
+    let default_config_path = default_config_path_string();
     println!(
-        "Dumbgram TUI\n\n\
+        "Dumbgram TUI {APP_VERSION}\n\n\
 Usage:\n  {APP_COMMAND} [OPTIONS]\n\n\
-Options:\n  --mock             Run with built-in mock Telegram data for smoke testing\n  --smoke            Load mock data, render off-screen, exercise interactions, and exit\n  --check-config     Validate Telegram config and session path without connecting\n  --check-auth       Connect and verify saved Telegram session without login/TUI\n  -c, --config PATH  Load Telegram config from PATH (default: {DEFAULT_CONFIG_PATH})\n  --log PATH         Append privacy-safe runtime diagnostics to PATH\n  -h, --help         Print this help\n\n\
-Examples:\n  {APP_COMMAND} --mock\n  {APP_COMMAND} --mock --smoke\n  {APP_COMMAND} --check-config --config {DEFAULT_CONFIG_PATH}\n  {APP_COMMAND} --check-auth --config {DEFAULT_CONFIG_PATH}\n  {APP_COMMAND} --config {DEFAULT_CONFIG_PATH}"
+Options:\n  --mock             Run with built-in mock Telegram data for smoke testing\n  --smoke            Load mock data, render off-screen, exercise interactions, and exit\n  --check-config     Validate Telegram config and session path without connecting\n  --check-auth       Connect and verify saved Telegram session without login/TUI\n  -c, --config PATH  Load Telegram config from PATH (default: {default_config_path})\n  --log PATH         Append privacy-safe runtime diagnostics to PATH\n  -h, --help         Print this help\n\n\
+Examples:\n  {APP_COMMAND} --mock\n  {APP_COMMAND} --mock --smoke\n  {APP_COMMAND} --check-config --config \"{default_config_path}\"\n  {APP_COMMAND} --check-auth --config \"{default_config_path}\"\n  {APP_COMMAND} --config \"{default_config_path}\""
     );
 }
 
@@ -281,7 +297,9 @@ fn validate_config(config: &config::Config, config_path: &str) -> Result<()> {
         ));
     }
 
-    let session_path = config.telegram.session_path();
+    let session_path = config
+        .telegram
+        .session_path_for_config(Path::new(config_path));
     if let Some(parent) = session_path.parent()
         && !parent.as_os_str().is_empty()
         && parent.exists()
@@ -315,7 +333,9 @@ fn ensure_session_parent_dir(session_path: &Path) -> Result<()> {
 
 fn load_checked_config_with_session_parent(config_path: &str) -> Result<(config::Config, String)> {
     let config = load_checked_config(config_path)?;
-    let session_path = config.telegram.session_path();
+    let session_path = config
+        .telegram
+        .session_path_for_config(Path::new(config_path));
     ensure_session_parent_dir(&session_path)?;
     let session_path = session_path.to_string_lossy().into_owned();
 
@@ -342,7 +362,9 @@ fn check_config_message(config_path: &str, config: &config::Config, session_path
 
 fn check_config(config_path: &str) -> Result<()> {
     let config = load_checked_config(config_path)?;
-    let session_path = config.telegram.session_path();
+    let session_path = config
+        .telegram
+        .session_path_for_config(Path::new(config_path));
 
     println!(
         "{}",
@@ -1385,6 +1407,8 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
     let edit_message_loader = EditMessageLoader::new(client.clone(), edit_message_tx);
     let (reply_message_tx, mut reply_message_rx) = tokio::sync::mpsc::unbounded_channel();
     let reply_message_loader = ReplyMessageLoader::new(client.clone(), reply_message_tx);
+    let (download_media_tx, mut download_media_rx) = tokio::sync::mpsc::unbounded_channel();
+    let download_media_loader = DownloadMediaLoader::new(client.clone(), download_media_tx);
     loop {
         let draw_started = Instant::now();
         terminal.draw(|f| ui::render_layout(f, app, theme))?;
@@ -1445,6 +1469,9 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
         while let Ok(reply_result) = reply_message_rx.try_recv() {
             apply_reply_message_result(app, reply_result);
         }
+        while let Ok(download_result) = download_media_rx.try_recv() {
+            apply_download_media_result(app, download_result);
+        }
 
         app.state.check_notification_timeout();
 
@@ -1465,6 +1492,7 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
                             delete_message: Some(&delete_message_loader),
                             edit_message: Some(&edit_message_loader),
                             reply_message: Some(&reply_message_loader),
+                            download_media: Some(&download_media_loader),
                         },
                     )
                     .await?;
@@ -1547,6 +1575,12 @@ struct ReplyMessageResult {
     result: std::result::Result<Message, String>,
 }
 
+struct DownloadMediaResult {
+    chat_id: i64,
+    message_id: i32,
+    result: std::result::Result<telegram::DownloadedMedia, String>,
+}
+
 struct HandlerLoaders<'a, C> {
     chat_message: Option<&'a mut ChatMessageLoader<C>>,
     older_message: Option<&'a mut OlderMessageLoader<C>>,
@@ -1555,6 +1589,7 @@ struct HandlerLoaders<'a, C> {
     delete_message: Option<&'a DeleteMessageLoader<C>>,
     edit_message: Option<&'a EditMessageLoader<C>>,
     reply_message: Option<&'a ReplyMessageLoader<C>>,
+    download_media: Option<&'a DownloadMediaLoader<C>>,
 }
 
 impl<C> HandlerLoaders<'_, C> {
@@ -1567,6 +1602,7 @@ impl<C> HandlerLoaders<'_, C> {
             delete_message: None,
             edit_message: None,
             reply_message: None,
+            download_media: None,
         }
     }
 }
@@ -1800,6 +1836,11 @@ struct ReplyMessageLoader<C> {
     tx: tokio::sync::mpsc::UnboundedSender<ReplyMessageResult>,
 }
 
+struct DownloadMediaLoader<C> {
+    client: C,
+    tx: tokio::sync::mpsc::UnboundedSender<DownloadMediaResult>,
+}
+
 impl<C> SendMessageLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
@@ -1901,6 +1942,47 @@ where
         tokio::spawn(async move {
             let result = actions::reply_message_result(&client, chat_id, message_id, content).await;
             let _ = tx.send(ReplyMessageResult {
+                chat_id,
+                message_id,
+                result,
+            });
+        });
+    }
+}
+
+impl<C> DownloadMediaLoader<C>
+where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    fn new(client: C, tx: tokio::sync::mpsc::UnboundedSender<DownloadMediaResult>) -> Self {
+        Self { client, tx }
+    }
+
+    fn spawn_download_media(
+        &self,
+        chat_id: i64,
+        message_id: i32,
+        media_kind: telegram::types::MessageMediaKind,
+    ) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        diagnostics::event(
+            "media_download_spawn",
+            format!(
+                "chat_id={chat_id} message_id={message_id} kind={} destination=downloads",
+                media_kind.diagnostic_label()
+            ),
+        );
+        tokio::spawn(async move {
+            let result = actions::download_message_media_result(
+                &client,
+                chat_id,
+                message_id,
+                media_kind,
+                actions::default_download_dir(),
+            )
+            .await;
+            let _ = tx.send(DownloadMediaResult {
                 chat_id,
                 message_id,
                 result,
@@ -2215,6 +2297,16 @@ enum UiProgress<'a> {
 }
 
 impl UiProgress<'_> {
+    fn copy_text(&mut self, text: &str) -> Result<()> {
+        match self {
+            Self::Live { terminal, .. } => {
+                terminal_clipboard::copy_text(terminal.backend_mut(), text)?;
+            }
+            Self::Silent => {}
+        }
+        Ok(())
+    }
+
     fn show(&mut self, app: &mut App, status: impl Into<String>) -> Result<()> {
         let status = status.into();
         let show_status_banner = !is_loading_progress_status(&status);
@@ -2248,6 +2340,127 @@ fn log_draw_duration(label: &str, started: Instant) {
             "slow_terminal_draw",
             format!("label={label} elapsed_ms={elapsed_ms}"),
         );
+    }
+}
+
+fn copy_selected_message_text(app: &mut App, progress: &mut UiProgress<'_>) -> Result<()> {
+    let Some(message) = app.state.selected_message() else {
+        app.state.set_status(NO_TEXT_IN_SELECTED_MESSAGE_STATUS);
+        return Ok(());
+    };
+    if message.content.trim().is_empty() {
+        diagnostics::event(
+            "message_copy_skipped",
+            format!(
+                "reason=no_text chat_id={} message_id={}",
+                message.chat_id, message.id
+            ),
+        );
+        app.state.set_status(NO_TEXT_IN_SELECTED_MESSAGE_STATUS);
+        return Ok(());
+    }
+
+    diagnostics::event(
+        "message_copy",
+        format!(
+            "chat_id={} message_id={} chars={}",
+            message.chat_id,
+            message.id,
+            message.content.chars().count()
+        ),
+    );
+    let text = message.content.clone();
+    progress.copy_text(&text)?;
+    app.state.set_status(MESSAGE_TEXT_COPIED_STATUS);
+    Ok(())
+}
+
+fn selected_media_download_request(
+    app: &mut App,
+) -> Option<(i64, i32, telegram::types::MessageMediaKind)> {
+    let Some(message) = app.state.selected_message() else {
+        app.state.set_status(NO_MEDIA_IN_SELECTED_MESSAGE_STATUS);
+        return None;
+    };
+    let Some(media) = message
+        .media
+        .as_ref()
+        .filter(|media| media.kind.is_downloadable())
+    else {
+        diagnostics::event(
+            "media_download_skipped",
+            format!(
+                "reason=no_downloadable_media chat_id={} message_id={}",
+                message.chat_id, message.id
+            ),
+        );
+        app.state.set_status(NO_MEDIA_IN_SELECTED_MESSAGE_STATUS);
+        return None;
+    };
+    Some((message.chat_id, message.id, media.kind.clone()))
+}
+
+async fn download_selected_message_media<C: TelegramClient>(
+    app: &mut App,
+    client: &C,
+) -> Result<()> {
+    let Some((chat_id, message_id, media_kind)) = selected_media_download_request(app) else {
+        return Ok(());
+    };
+    let result = actions::download_message_media_result(
+        client,
+        chat_id,
+        message_id,
+        media_kind,
+        actions::default_download_dir(),
+    )
+    .await;
+    apply_download_media_result(
+        app,
+        DownloadMediaResult {
+            chat_id,
+            message_id,
+            result,
+        },
+    );
+    Ok(())
+}
+
+fn apply_download_media_result(app: &mut App, download: DownloadMediaResult) {
+    match download.result {
+        Ok(downloaded) => {
+            diagnostics::event(
+                "media_download_apply",
+                format!(
+                    "chat_id={} message_id={} bytes={} destination=downloads",
+                    download.chat_id, download.message_id, downloaded.bytes
+                ),
+            );
+            app.state.record_downloaded_media(
+                download.chat_id,
+                download.message_id,
+                downloaded.path,
+            );
+            app.state.set_status(MEDIA_DOWNLOADED_STATUS);
+        }
+        Err(error) => app.state.set_error(error),
+    }
+}
+
+fn open_selected_downloaded_media(app: &mut App) {
+    let Some(path) = app.state.selected_message_download_path() else {
+        app.state.set_status(NO_DOWNLOADED_MEDIA_STATUS);
+        return;
+    };
+
+    diagnostics::event("downloaded_media_open", "target=file_opener");
+    match file_opener::open_path(path) {
+        Ok(()) => app.state.set_status(DOWNLOADED_MEDIA_OPENED_STATUS),
+        Err(error) => {
+            diagnostics::event("downloaded_media_open_error", "error=true");
+            app.state
+                .set_error(format!("{OPEN_DOWNLOADED_MEDIA_FAILED_PREFIX}: {error}"));
+        }
     }
 }
 
@@ -2383,6 +2596,25 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
         message_keys::MessageKeyOutcome::Handled => return Ok(()),
         message_keys::MessageKeyOutcome::OpenSelectedLink => {
             open_selected_message_link(app);
+            return Ok(());
+        }
+        message_keys::MessageKeyOutcome::CopySelectedText => {
+            copy_selected_message_text(app, progress)?;
+            return Ok(());
+        }
+        message_keys::MessageKeyOutcome::DownloadSelectedMedia => {
+            if let Some((chat_id, message_id, media_kind)) = selected_media_download_request(app) {
+                progress.show(app, DOWNLOADING_MEDIA_STATUS)?;
+                if let Some(loader) = loaders.download_media {
+                    loader.spawn_download_media(chat_id, message_id, media_kind);
+                } else {
+                    download_selected_message_media(app, client).await?;
+                }
+            }
+            return Ok(());
+        }
+        message_keys::MessageKeyOutcome::OpenDownloadedMedia => {
+            open_selected_downloaded_media(app);
             return Ok(());
         }
         message_keys::MessageKeyOutcome::Ignored => {}
@@ -2535,14 +2767,19 @@ async fn open_chat_at_with_optional_async_loader<
     chat_message_loader: &mut Option<&mut ChatMessageLoader<C>>,
     index: usize,
 ) -> Result<()> {
-    progress.show(app, LOADING_CHAT_MESSAGES_STATUS)?;
+    if index >= app.state.chats.len() || app.state.selected_chat_index == index {
+        return Ok(());
+    }
+
     if let Some(loader) = chat_message_loader.as_deref_mut() {
         if let Some(chat_id) = actions::begin_open_chat_at(&mut app.state, index) {
+            progress.show(app, LOADING_CHAT_MESSAGES_STATUS)?;
             loader.spawn_latest_chat_messages(chat_id);
         }
         return Ok(());
     }
 
+    progress.show(app, LOADING_CHAT_MESSAGES_STATUS)?;
     let result = actions::open_chat_at(&mut app.state, client, index).await;
     if result.is_ok() {
         app.state.clear_status();
@@ -2705,9 +2942,9 @@ mod tests {
         APP_COMMAND, CHECK_AUTH_OK_PREFIX, CHECK_CONFIG_AUTH_CONFLICT,
         CHECK_CONFIG_SESSION_EXISTS_STATUS, CHECK_CONFIG_SESSION_WILL_CREATE_STATUS,
         CLI_USAGE_EXIT_CODE, CONFIG_LOAD_HELP, CONFIG_PATH_ARGUMENT_REQUIRED,
-        ChatMessageLoadResult, ChatMessageLoader, DEFAULT_CONFIG_PATH, DeleteMessageLoader,
-        DeleteMessageResult, EditMessageLoader, EditMessageResult, FolderChatLoadResult,
-        FolderChatLoader, InitialStateLoadResult, InitialStateLoader, LOADING_CHAT_MESSAGES_STATUS,
+        ChatMessageLoadResult, ChatMessageLoader, DeleteMessageLoader, DeleteMessageResult,
+        EditMessageLoader, EditMessageResult, FolderChatLoadResult, FolderChatLoader,
+        InitialStateLoadResult, InitialStateLoader, LOADING_CHAT_MESSAGES_STATUS,
         LOADING_TELEGRAM_STATUS, LOG_PATH_ARGUMENT_REQUIRED, LOGIN_2FA_ENABLED_STATUS,
         LOGIN_2FA_HINT_PREFIX, LOGIN_2FA_PROMPT, LOGIN_2FA_SIGNED_IN_PREFIX, LOGIN_CODE_PROMPT,
         LOGIN_CODE_SENT_PREFIX, LOGIN_FAILED_PREFIX, LOGIN_HEADER, LOGIN_PHONE_PROMPT,
@@ -2722,13 +2959,14 @@ mod tests {
         apply_edit_message_result, apply_folder_chat_load_result, apply_initial_state_load_result,
         apply_older_message_load_result, apply_reply_message_result, apply_send_message_result,
         apply_subscribe_updates_result, check_auth_ok_message, check_auth_unauthorized_message,
-        check_config_message, check_config_session_status, ensure_session_parent_dir,
-        handle_mouse_event, load_checked_config, load_checked_config_with_session_parent,
-        login_2fa_hint_message, login_2fa_signed_in_message, login_code_sent_message,
-        login_failed_message, login_signed_in_message, message_submit_action_status,
-        older_message_key_navigation, parse_args_from, preserve_prompt_input_line_spaces,
-        require_prompt_line, require_prompt_response, save_app_preferences_if_changed,
-        smoke_ok_message, trim_prompt_input_line, validate_config,
+        check_config_message, check_config_session_status, default_config_path_string,
+        ensure_session_parent_dir, handle_mouse_event, load_checked_config,
+        load_checked_config_with_session_parent, login_2fa_hint_message,
+        login_2fa_signed_in_message, login_code_sent_message, login_failed_message,
+        login_signed_in_message, message_submit_action_status, older_message_key_navigation,
+        open_chat_at_with_optional_async_loader, parse_args_from,
+        preserve_prompt_input_line_spaces, require_prompt_line, require_prompt_response,
+        save_app_preferences_if_changed, smoke_ok_message, trim_prompt_input_line, validate_config,
     };
     use crate::app::App;
     use crate::config::telegram::{Config, TelegramConfig};
@@ -3284,6 +3522,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn async_noop_chat_open_does_not_spawn_message_load() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut loader = ChatMessageLoader::new(MockTelegramClient::new(), tx);
+        let mut loader_ref = Some(&mut loader);
+        let mut client = MockTelegramClient::new();
+        let mut progress = UiProgress::Silent;
+        let mut app = App::new();
+        app.state.chats = vec![chat(1), chat(2)];
+        app.state.selected_chat_index = 0;
+        app.state.messages = vec![message(1)];
+
+        open_chat_at_with_optional_async_loader(
+            &mut app,
+            &mut client,
+            &mut progress,
+            &mut loader_ref,
+            0,
+        )
+        .await
+        .expect("no-op chat open should succeed");
+
+        assert_eq!(app.state.selected_chat_index, 0);
+        assert_eq!(app.state.messages.len(), 1);
+        assert!(app.state.status_message.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), rx.recv())
+                .await
+                .is_err(),
+            "no-op chat open should not spawn a message loader"
+        );
+    }
+
+    #[tokio::test]
     async fn async_chat_message_loader_aborts_superseded_load() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut loader = ChatMessageLoader::new(SlowFirstLatestMessagesClient, tx);
@@ -3775,7 +4046,7 @@ mod tests {
     fn empty_args_use_shared_default_config_path() {
         let cli = parse_test_args(std::iter::empty::<&str>());
 
-        assert_eq!(cli.config_path, DEFAULT_CONFIG_PATH);
+        assert_eq!(cli.config_path, default_config_path_string());
         assert_eq!(cli.mode, RunMode::RealTelegram);
         assert!(!cli.smoke);
     }

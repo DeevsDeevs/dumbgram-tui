@@ -274,6 +274,16 @@ fn help_bar_controls(app: &App) -> String {
             HIDE_HELP_CONTROL_LABEL,
         ])
     } else if app.state.focused_panel == FocusedPanel::Chats {
+        if app.state.chat_search_active() {
+            return join_help_controls(&[
+                "Search chats: type",
+                "Enter open",
+                "Esc clear",
+                "Backspace edit",
+                "Up/Down open",
+                HIDE_HELP_CONTROL_LABEL,
+            ]);
+        }
         let chats_label = if app.state.chats.len() > 1 {
             CHATS_HELP_LABEL
         } else {
@@ -284,6 +294,7 @@ fn help_bar_controls(app: &App) -> String {
             controls.push("letters jump");
         }
         controls.extend([
+            "/ search",
             "Right messages",
             "Left folders",
             "Tab focus",
@@ -376,8 +387,24 @@ fn selected_message_help_controls(state: &AppState, message: &Message) -> String
 
     controls.push("r reply");
 
+    if !message.content.trim().is_empty() {
+        controls.push("c copy text");
+    }
+
     if crate::links::first_url(&message.content).is_some() {
         controls.push("o open link");
+    }
+
+    if message
+        .media
+        .as_ref()
+        .is_some_and(|media| media.kind.is_downloadable())
+    {
+        controls.push("s save media");
+    }
+
+    if state.selected_message_download_path().is_some() {
+        controls.push("v open saved");
     }
 
     if message.is_own && message.can_delete {
@@ -776,7 +803,7 @@ mod tests {
         chats.state.focused_panel = FocusedPanel::Chats;
         assert_eq!(
             help_bar_controls(&chats),
-            "Chats: no other chats · Right messages · Left folders · Tab focus · q quit · < > resize · ? hide help"
+            "Chats: no other chats · / search · Right messages · Left folders · Tab focus · q quit · < > resize · ? hide help"
         );
 
         chats.state.chats = vec![crate::telegram::types::Chat {
@@ -789,7 +816,7 @@ mod tests {
         }];
         assert_eq!(
             help_bar_controls(&chats),
-            "Chats: no other chats · Right messages · Left folders · Tab focus · q quit · < > resize · ? hide help"
+            "Chats: no other chats · / search · Right messages · Left folders · Tab focus · q quit · < > resize · ? hide help"
         );
 
         chats.state.chats.push(crate::telegram::types::Chat {
@@ -802,7 +829,13 @@ mod tests {
         });
         assert_eq!(
             help_bar_controls(&chats),
-            "Chats: Up/Down choose · letters jump · Right messages · Left folders · Tab focus · q quit · < > resize · ? hide help"
+            "Chats: Up/Down choose · letters jump · / search · Right messages · Left folders · Tab focus · q quit · < > resize · ? hide help"
+        );
+
+        chats.state.begin_chat_search();
+        assert_eq!(
+            help_bar_controls(&chats),
+            "Search chats: type · Enter open · Esc clear · Backspace edit · Up/Down open · ? hide help"
         );
     }
 
@@ -849,7 +882,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&reply_only),
-            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · c copy text · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         reply_only
@@ -859,7 +892,7 @@ mod tests {
         reply_only.state.selected_message_index = 1;
         assert_eq!(
             help_bar_controls(&reply_only),
-            "Messages: Up/Pg/Home/End move · Down input · r reply · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: Up/Pg/Home/End move · Down input · r reply · c copy text · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         reply_only
@@ -869,7 +902,7 @@ mod tests {
         reply_only.state.selected_message_index = 1;
         assert_eq!(
             help_bar_controls(&reply_only),
-            "Messages: Up/Down/Pg/Home/End move · r reply · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: Up/Down/Pg/Home/End move · r reply · c copy text · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         let mut full_actions = App::new();
@@ -880,7 +913,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&full_actions),
-            "Messages: Up/PgUp older · Down input · Pg/Home/End move · e edit · r reply · d delete · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: Up/PgUp older · Down input · Pg/Home/End move · e edit · r reply · c copy text · d delete · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         let mut link_actions = App::new();
@@ -890,7 +923,25 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&link_actions),
-            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · o open link · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · c copy text · o open link · Left chats · Tab focus · q quit · < > resize · ? hide help"
+        );
+
+        let mut media_actions = App::new();
+        media_actions.state.focused_panel = FocusedPanel::Messages;
+        media_actions.state.messages = vec![message_with_status(MessageStatus::Sent)];
+        media_actions.state.messages[0].media = Some(MessageMedia::photo());
+
+        assert_eq!(
+            help_bar_controls(&media_actions),
+            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · c copy text · s save media · Left chats · Tab focus · q quit · < > resize · ? hide help"
+        );
+
+        media_actions
+            .state
+            .record_downloaded_media(10, -1, "/tmp/downloaded-photo.jpg".into());
+        assert_eq!(
+            help_bar_controls(&media_actions),
+            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · c copy text · s save media · v open saved · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
     }
 
@@ -904,7 +955,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&app),
-            "Messages: no older history · Down input · Pg/Home/End move · r reply · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: no older history · Down input · Pg/Home/End move · r reply · c copy text · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
     }
 }

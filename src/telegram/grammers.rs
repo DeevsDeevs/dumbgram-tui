@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::mpsc;
 
-use super::client::TelegramClient;
+use super::client::{DownloadedMedia, TelegramClient};
 use super::types::{
     Chat, Folder, Message, MessageMedia, MessageMediaKind, MessageStatus, OWN_SENDER_NAME,
     UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update, all_folder,
@@ -26,12 +26,14 @@ const UPDATE_ERROR_PREFIX: &str = "Update error";
 
 type ChatCache = HashMap<i64, grammers_client::types::Chat>;
 type DialogFilterCache = HashMap<i32, tl::enums::DialogFilter>;
+type OutboxReadMaxIdCache = HashMap<i64, i32>;
 
 #[derive(Clone)]
 pub struct GrammersClient {
     client: Client,
     chat_cache: Arc<Mutex<ChatCache>>,
     dialog_filter_cache: Arc<Mutex<DialogFilterCache>>,
+    outbox_read_max_id_cache: Arc<Mutex<OutboxReadMaxIdCache>>,
     session_path: String,
     media_cache_dir: PathBuf,
 }
@@ -52,6 +54,7 @@ impl GrammersClient {
             client,
             chat_cache: Arc::new(Mutex::new(HashMap::new())),
             dialog_filter_cache: Arc::new(Mutex::new(HashMap::new())),
+            outbox_read_max_id_cache: Arc::new(Mutex::new(HashMap::new())),
             session_path: session_path.to_string(),
             media_cache_dir: media_cache_dir(session_path),
         })
@@ -106,13 +109,34 @@ impl GrammersClient {
     fn cached_dialog_filter(&self, folder_id: i32) -> Result<Option<tl::enums::DialogFilter>> {
         Ok(self.dialog_filter_cache()?.get(&folder_id).cloned())
     }
+
+    fn outbox_read_max_id_cache(&self) -> Result<MutexGuard<'_, OutboxReadMaxIdCache>> {
+        self.outbox_read_max_id_cache
+            .lock()
+            .map_err(|error| color_eyre::eyre::eyre!(chat_cache_lock_failed_message(error)))
+    }
+
+    fn cache_outbox_read_max_id(&self, chat_id: i64, max_message_id: i32) -> Result<()> {
+        cache_outbox_read_max_id(&self.outbox_read_max_id_cache, chat_id, max_message_id)
+    }
+
+    fn cached_outbox_read_max_id(&self, chat_id: i64) -> Result<Option<i32>> {
+        Ok(self.outbox_read_max_id_cache()?.get(&chat_id).copied())
+    }
+
+    fn cache_dialog_read_state(&self, dialog: &grammers_client::types::Dialog) -> Result<()> {
+        if let Some(max_message_id) = dialog_outbox_read_max_id(dialog) {
+            self.cache_outbox_read_max_id(dialog.chat().id(), max_message_id)?;
+        }
+        Ok(())
+    }
 }
 
 fn dumbgram_init_params() -> InitParams {
     InitParams {
         device_model: "Dumbgram TUI".to_string(),
         system_version: env!("CARGO_PKG_VERSION").to_string(),
-        app_version: "1.0.0".to_string(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
         // Startup and folder/chat loads already fetch the recent visible history. Replaying
         // offline update backlog makes hours-old messages appear as new live messages.
         catch_up: false,
@@ -149,32 +173,100 @@ fn delete_message_updates(channel_id: Option<i64>, message_ids: &[i32]) -> Vec<U
         .collect()
 }
 
-fn message_sender_name(is_outgoing: bool, sender_name: Option<String>) -> String {
-    if is_outgoing {
-        OWN_SENDER_NAME.to_string()
-    } else {
-        sender_name.unwrap_or_else(|| UNKNOWN_SENDER_NAME.to_string())
+fn chat_id_from_peer(peer: &tl::enums::Peer) -> i64 {
+    match peer {
+        tl::enums::Peer::User(peer) => peer.user_id,
+        tl::enums::Peer::Chat(peer) => peer.chat_id,
+        tl::enums::Peer::Channel(peer) => peer.channel_id,
     }
 }
 
-fn convert_message(msg: grammers_client::types::Message) -> Message {
+fn read_outbox_update_from_raw(update: &tl::enums::Update) -> Option<Update> {
+    match update {
+        tl::enums::Update::ReadHistoryOutbox(update) => Some(Update::ReadOutgoingMessages {
+            chat_id: chat_id_from_peer(&update.peer),
+            max_message_id: update.max_id,
+        }),
+        tl::enums::Update::ReadChannelOutbox(update) => Some(Update::ReadOutgoingMessages {
+            chat_id: update.channel_id,
+            max_message_id: update.max_id,
+        }),
+        _ => None,
+    }
+}
+
+fn non_empty_text(value: Option<String>) -> Option<String> {
+    value.filter(|text| !text.trim().is_empty())
+}
+
+fn cache_outbox_read_max_id(
+    cache: &Arc<Mutex<OutboxReadMaxIdCache>>,
+    chat_id: i64,
+    max_message_id: i32,
+) -> Result<()> {
+    let mut cache = cache
+        .lock()
+        .map_err(|error| color_eyre::eyre::eyre!(chat_cache_lock_failed_message(error)))?;
+    let entry = cache.entry(chat_id).or_insert(max_message_id);
+    *entry = (*entry).max(max_message_id);
+    Ok(())
+}
+
+fn message_status_for_read_state(
+    is_outgoing: bool,
+    message_id: i32,
+    outbox_read_max_id: Option<i32>,
+) -> MessageStatus {
+    if is_outgoing {
+        if outbox_read_max_id.is_some_and(|max_id| message_id <= max_id) {
+            MessageStatus::Read
+        } else {
+            MessageStatus::Sent
+        }
+    } else {
+        MessageStatus::Delivered
+    }
+}
+
+fn message_sender_name(
+    is_outgoing: bool,
+    sender_name: Option<String>,
+    post_author: Option<String>,
+    chat_name: Option<String>,
+) -> String {
+    if is_outgoing {
+        OWN_SENDER_NAME.to_string()
+    } else {
+        non_empty_text(sender_name)
+            .or_else(|| non_empty_text(post_author))
+            .or_else(|| non_empty_text(chat_name))
+            .unwrap_or_else(|| UNKNOWN_SENDER_NAME.to_string())
+    }
+}
+
+fn convert_message(
+    msg: grammers_client::types::Message,
+    outbox_read_max_id: Option<i32>,
+) -> Message {
     let is_outgoing = msg.outgoing();
+    let chat = msg.chat();
     let media = message_media(msg.media().as_ref());
     Message {
         id: msg.id(),
-        chat_id: msg.chat().id(),
-        sender_name: message_sender_name(is_outgoing, msg.sender().map(|s| s.name().to_string())),
+        chat_id: chat.id(),
+        sender_name: message_sender_name(
+            is_outgoing,
+            msg.sender().map(|s| s.name().to_string()),
+            msg.raw.post_author.clone(),
+            Some(chat.name().to_string()),
+        ),
         content: msg.text().to_string(),
         timestamp: msg.date(),
         is_own: is_outgoing,
         is_edited: msg.edit_date().is_some(),
         reply_to_content: None,
         media,
-        status: if is_outgoing {
-            MessageStatus::Sent
-        } else {
-            MessageStatus::Delivered
-        },
+        status: message_status_for_read_state(is_outgoing, msg.id(), outbox_read_max_id),
         can_edit: is_outgoing && is_within_edit_window(msg.date()),
         can_delete: is_outgoing,
         error: None,
@@ -246,7 +338,10 @@ async fn message_media_with_local_preview(
             Ok(None) => {}
             Err(error) => diagnostics::event(
                 "media_preview_download_error",
-                format!("chat_id={chat_id} message_id={message_id} error={error}"),
+                format!(
+                    "chat_id={chat_id} message_id={message_id} error_kind={:?}",
+                    error.kind()
+                ),
             ),
         }
     }
@@ -277,6 +372,88 @@ async fn download_media_thumbnail(
     Ok(Some(path))
 }
 
+fn media_download_file_name(
+    chat_id: i64,
+    message_id: i32,
+    media: &grammers_client::types::Media,
+) -> String {
+    use grammers_client::types::Media;
+
+    match media {
+        Media::Photo(_) => format!("dumbgram-chat-{chat_id}-message-{message_id}.jpg"),
+        Media::Document(document) => {
+            sanitize_download_file_name(document.name()).unwrap_or_else(|| {
+                let extension = document
+                    .mime_type()
+                    .and_then(download_extension_for_mime)
+                    .unwrap_or("bin");
+                format!("dumbgram-chat-{chat_id}-message-{message_id}.{extension}")
+            })
+        }
+        _ => format!("dumbgram-chat-{chat_id}-message-{message_id}.bin"),
+    }
+}
+
+fn download_extension_for_mime(mime_type: &str) -> Option<&'static str> {
+    match mime_type {
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "video/mp4" => Some("mp4"),
+        "video/quicktime" => Some("mov"),
+        "application/pdf" => Some("pdf"),
+        "text/plain" => Some("txt"),
+        _ => None,
+    }
+}
+
+fn sanitize_download_file_name(name: &str) -> Option<String> {
+    let sanitized = name
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '\0' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .chars()
+        .take(120)
+        .collect::<String>();
+
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn available_download_path(destination_dir: &Path, file_name: &str) -> PathBuf {
+    let candidate = destination_dir.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("dumbgram-media");
+    let extension = path.extension().and_then(|extension| extension.to_str());
+
+    for copy_index in 1.. {
+        let candidate_name = if let Some(extension) = extension {
+            format!("{stem}-{copy_index}.{extension}")
+        } else {
+            format!("{stem}-{copy_index}")
+        };
+        let candidate = destination_dir.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded copy-index loop must return an available path")
+}
+
 fn media_thumbnail(media: &grammers_client::types::Media) -> Option<PhotoSize> {
     use grammers_client::types::Media;
 
@@ -293,13 +470,15 @@ async fn convert_message_with_media_preview(
     client: &Client,
     media_cache_dir: &Path,
     msg: grammers_client::types::Message,
+    outbox_read_max_id: Option<i32>,
 ) -> Message {
     let is_outgoing = msg.outgoing();
+    let chat = msg.chat();
     let media = msg.media();
     let message_media = message_media_with_local_preview(
         client,
         media_cache_dir,
-        msg.chat().id(),
+        chat.id(),
         msg.id(),
         media.as_ref(),
     )
@@ -307,19 +486,20 @@ async fn convert_message_with_media_preview(
 
     Message {
         id: msg.id(),
-        chat_id: msg.chat().id(),
-        sender_name: message_sender_name(is_outgoing, msg.sender().map(|s| s.name().to_string())),
+        chat_id: chat.id(),
+        sender_name: message_sender_name(
+            is_outgoing,
+            msg.sender().map(|s| s.name().to_string()),
+            msg.raw.post_author.clone(),
+            Some(chat.name().to_string()),
+        ),
         content: msg.text().to_string(),
         timestamp: msg.date(),
         is_own: is_outgoing,
         is_edited: msg.edit_date().is_some(),
         reply_to_content: None,
         media: message_media,
-        status: if is_outgoing {
-            MessageStatus::Sent
-        } else {
-            MessageStatus::Delivered
-        },
+        status: message_status_for_read_state(is_outgoing, msg.id(), outbox_read_max_id),
         can_edit: is_outgoing && is_within_edit_window(msg.date()),
         can_delete: is_outgoing,
         error: None,
@@ -336,6 +516,13 @@ fn message_preview_from_grammers_message(message: &grammers_client::types::Messa
 fn is_within_edit_window(date: DateTime<Utc>) -> bool {
     let now = chrono::Utc::now();
     (now - date).num_hours() < 48
+}
+
+fn dialog_outbox_read_max_id(dialog: &grammers_client::types::Dialog) -> Option<i32> {
+    match &dialog.raw {
+        tl::enums::Dialog::Dialog(raw) => Some(raw.read_outbox_max_id),
+        tl::enums::Dialog::Folder(_) => None,
+    }
 }
 
 fn dialog_unread_count(dialog: &grammers_client::types::Dialog) -> usize {
@@ -584,13 +771,17 @@ async fn collect_message_page(
     media_cache_dir: &Path,
     mut iter: grammers_client::client::messages::MessageIter,
     chat_id: i64,
+    outbox_read_max_id: Option<i32>,
     limit: usize,
     direction: &str,
 ) -> Result<Vec<Message>> {
     let mut messages = Vec::new();
 
     while let Some(msg) = iter.next().await? {
-        messages.push(convert_message_with_media_preview(client, media_cache_dir, msg).await);
+        messages.push(
+            convert_message_with_media_preview(client, media_cache_dir, msg, outbox_read_max_id)
+                .await,
+        );
         if messages.len() % 10 == 0 || messages.len() >= limit {
             diagnostics::event(
                 "message_iter_progress",
@@ -615,6 +806,36 @@ impl TelegramClient for GrammersClient {
     }
 
     #[allow(clippy::manual_async_fn)]
+    fn download_message_media(
+        &self,
+        chat_id: i64,
+        message_id: i32,
+        destination_dir: PathBuf,
+    ) -> impl std::future::Future<Output = Result<DownloadedMedia>> + Send + '_ {
+        async move {
+            let chat = self.cached_chat(chat_id)?;
+            std::fs::create_dir_all(&destination_dir)?;
+            let mut messages = self.client.get_messages_by_id(&chat, &[message_id]).await?;
+            let message = messages
+                .pop()
+                .flatten()
+                .ok_or_else(|| color_eyre::eyre::eyre!("Message not found"))?;
+            let media = message
+                .media()
+                .ok_or_else(|| color_eyre::eyre::eyre!("No downloadable media"))?;
+            let path = available_download_path(
+                &destination_dir,
+                &media_download_file_name(chat_id, message_id, &media),
+            );
+            self.client
+                .download_media(&Downloadable::Media(media), &path)
+                .await?;
+            let bytes = std::fs::metadata(&path).map(|metadata| metadata.len())?;
+            Ok(DownloadedMedia { path, bytes })
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
     fn send_message(
         &self,
         chat_id: i64,
@@ -626,7 +847,7 @@ impl TelegramClient for GrammersClient {
                 .client
                 .send_message(chat, InputMessage::text(content))
                 .await?;
-            Ok(convert_message(msg))
+            Ok(convert_message(msg, None))
         }
     }
 
@@ -657,7 +878,7 @@ impl TelegramClient for GrammersClient {
             let chat = self.cached_chat(chat_id)?;
             let input = InputMessage::text(content).reply_to(Some(reply_to));
             let msg = self.client.send_message(chat, input).await?;
-            Ok(convert_message(msg))
+            Ok(convert_message(msg, None))
         }
     }
 
@@ -682,12 +903,14 @@ impl TelegramClient for GrammersClient {
     ) -> impl std::future::Future<Output = Result<Vec<Message>>> + Send + '_ {
         async move {
             let chat = self.cached_chat(chat_id)?;
+            let outbox_read_max_id = self.cached_outbox_read_max_id(chat_id)?;
             let iter = self.client.iter_messages(chat);
             collect_message_page(
                 &self.client,
                 &self.media_cache_dir,
                 iter,
                 chat_id,
+                outbox_read_max_id,
                 limit,
                 "latest",
             )
@@ -704,12 +927,14 @@ impl TelegramClient for GrammersClient {
     ) -> impl std::future::Future<Output = Result<Vec<Message>>> + Send + '_ {
         async move {
             let chat = self.cached_chat(chat_id)?;
+            let outbox_read_max_id = self.cached_outbox_read_max_id(chat_id)?;
             let iter = self.client.iter_messages(chat).offset_id(before_message_id);
             collect_message_page(
                 &self.client,
                 &self.media_cache_dir,
                 iter,
                 chat_id,
+                outbox_read_max_id,
                 limit,
                 "older",
             )
@@ -758,6 +983,7 @@ impl TelegramClient for GrammersClient {
 
             let chat = dialog.chat();
             self.cache_chat(chat.clone())?;
+            self.cache_dialog_read_state(&dialog)?;
 
             chats.push(Chat {
                 id: chat.id(),
@@ -784,6 +1010,7 @@ impl TelegramClient for GrammersClient {
             let mut folder_names = HashMap::new();
 
             while let Some(dialog) = iter.next().await? {
+                self.cache_dialog_read_state(&dialog)?;
                 let unread_count = dialog_unread_count(&dialog);
                 all_unread_count += unread_count;
                 if let Some((folder_id, folder_name)) = dialog_folder_metadata(&dialog) {
@@ -823,6 +1050,7 @@ impl TelegramClient for GrammersClient {
         async move {
             let (tx, rx) = mpsc::unbounded_channel();
             let client = self.client.clone();
+            let outbox_read_max_id_cache = Arc::clone(&self.outbox_read_max_id_cache);
 
             tokio::spawn(async move {
                 'update_loop: loop {
@@ -842,7 +1070,7 @@ impl TelegramClient for GrammersClient {
                                         ),
                                     );
                                     if !msg.outgoing() {
-                                        vec![Update::NewMessage(convert_message(msg))]
+                                        vec![Update::NewMessage(convert_message(msg, None))]
                                     } else {
                                         Vec::new()
                                     }
@@ -859,6 +1087,36 @@ impl TelegramClient for GrammersClient {
                                         deletion.channel_id(),
                                         deletion.messages(),
                                     )
+                                }
+                                grammers_client::Update::Raw(raw) => {
+                                    if let Some(Update::ReadOutgoingMessages {
+                                        chat_id,
+                                        max_message_id,
+                                    }) = read_outbox_update_from_raw(&raw)
+                                    {
+                                        if let Err(error) = cache_outbox_read_max_id(
+                                            &outbox_read_max_id_cache,
+                                            chat_id,
+                                            max_message_id,
+                                        ) {
+                                            diagnostics::event(
+                                                "read_outbox_cache_error",
+                                                format!("chat_id={chat_id} error={error}"),
+                                            );
+                                        }
+                                        diagnostics::event(
+                                            "telegram_update_read_outbox",
+                                            format!(
+                                                "chat_id={chat_id} max_message_id={max_message_id}"
+                                            ),
+                                        );
+                                        vec![Update::ReadOutgoingMessages {
+                                            chat_id,
+                                            max_message_id,
+                                        }]
+                                    } else {
+                                        Vec::new()
+                                    }
                                 }
                                 _ => Vec::new(),
                             };
@@ -891,10 +1149,11 @@ mod tests {
         UPDATE_ERROR_PREFIX, chat_cache_lock_failed_message, chat_matches_filter_categories,
         chat_not_found_in_cache_message, delete_message_updates, delete_update_chat_id,
         dialog_chats_from_page_parts, dumbgram_init_params, folders_from_dialog_filters,
-        input_peers_contain_chat, message_sender_name, update_error_message,
+        input_peers_contain_chat, message_sender_name, message_status_for_read_state,
+        read_outbox_update_from_raw, update_error_message,
     };
     use crate::telegram::types::{
-        OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update,
+        MessageStatus, OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update,
     };
     use grammers_client::grammers_tl_types as tl;
     use std::collections::HashMap;
@@ -905,16 +1164,82 @@ mod tests {
 
         assert!(!params.catch_up);
         assert_eq!(params.update_queue_limit, Some(100));
+        assert_eq!(params.app_version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
     fn outgoing_message_sender_label_uses_own_name_even_without_sender() {
-        assert_eq!(message_sender_name(true, None), OWN_SENDER_NAME);
+        assert_eq!(message_sender_name(true, None, None, None), OWN_SENDER_NAME);
         assert_eq!(
-            message_sender_name(false, Some("Alice".to_string())),
+            message_sender_name(false, Some("Alice".to_string()), None, None),
             "Alice"
         );
-        assert_eq!(message_sender_name(false, None), UNKNOWN_SENDER_NAME);
+        assert_eq!(
+            message_sender_name(
+                false,
+                None,
+                Some("Channel Signature".to_string()),
+                Some("News Channel".to_string())
+            ),
+            "Channel Signature"
+        );
+        assert_eq!(
+            message_sender_name(false, None, None, Some("News Channel".to_string())),
+            "News Channel"
+        );
+        assert_eq!(
+            message_sender_name(false, None, None, None),
+            UNKNOWN_SENDER_NAME
+        );
+    }
+
+    #[test]
+    fn outgoing_status_uses_dialog_outbox_read_max_id() {
+        assert_eq!(
+            message_status_for_read_state(true, 10, Some(10)),
+            MessageStatus::Read
+        );
+        assert_eq!(
+            message_status_for_read_state(true, 11, Some(10)),
+            MessageStatus::Sent
+        );
+        assert_eq!(
+            message_status_for_read_state(false, 10, Some(10)),
+            MessageStatus::Delivered
+        );
+    }
+
+    #[test]
+    fn raw_outbox_read_updates_become_status_updates() {
+        let direct = read_outbox_update_from_raw(&tl::enums::Update::ReadHistoryOutbox(
+            tl::types::UpdateReadHistoryOutbox {
+                peer: tl::enums::Peer::User(tl::types::PeerUser { user_id: 42 }),
+                max_id: 123,
+                pts: 1,
+                pts_count: 1,
+            },
+        ));
+        assert!(matches!(
+            direct,
+            Some(Update::ReadOutgoingMessages {
+                chat_id: 42,
+                max_message_id: 123
+            })
+        ));
+
+        let channel = read_outbox_update_from_raw(&tl::enums::Update::ReadChannelOutbox(
+            tl::types::UpdateReadChannelOutbox {
+                channel_id: 99,
+                max_id: 77,
+            },
+        ));
+        assert!(matches!(
+            channel,
+            Some(Update::ReadOutgoingMessages {
+                chat_id: 99,
+                max_message_id: 77
+            })
+        ));
     }
 
     fn dialog_filter(id: i32, title: &str) -> tl::enums::DialogFilter {

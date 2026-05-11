@@ -47,6 +47,10 @@ pub enum Update {
         chat_id: i64,
         message_id: i32,
     },
+    ReadOutgoingMessages {
+        chat_id: i64,
+        max_message_id: i32,
+    },
     TypingStatus {
         chat_id: i64,
         user_name: String,
@@ -71,6 +75,27 @@ pub struct MessageMedia {
     pub kind: MessageMediaKind,
     pub label: String,
     pub local_path: Option<PathBuf>,
+}
+
+impl MessageMediaKind {
+    pub fn is_downloadable(&self) -> bool {
+        matches!(
+            self,
+            Self::Photo | Self::Image | Self::Sticker | Self::Video | Self::Document
+        )
+    }
+
+    pub fn diagnostic_label(&self) -> &'static str {
+        match self {
+            Self::Photo => "photo",
+            Self::Image => "image",
+            Self::Sticker => "sticker",
+            Self::Video => "video",
+            Self::Document => "document",
+            Self::WebPage => "web_page",
+            Self::Other => "other",
+        }
+    }
 }
 
 impl MessageMedia {

@@ -16,7 +16,7 @@ A small terminal Telegram client written in Rust with Ratatui/Crossterm and Gram
 
 - Large accounts are loaded in bounded pages, but full chat pagination UI is still limited.
 - Telegram folder names are best-effort from dialog filters/folder metadata; folder-rule editing is not implemented.
-- Photo/image messages are shown with text placeholders such as `[photo]`. In Ghostty/Kitty-compatible terminals, selected downloaded thumbnails are also displayed with the Kitty graphics protocol. Full media browser controls, manual downloads, search, and multiple accounts are not implemented.
+- Photo/image messages are shown with text placeholders such as `[photo]`. In Ghostty/Kitty-compatible terminals, selected downloaded thumbnails are also displayed with the Kitty graphics protocol. Full media browser controls, multi-account support, and server-side search are not implemented.
 - Some Telegram delete updates do not include enough context to identify the chat precisely.
 
 ## Setup
@@ -27,11 +27,14 @@ Use Devbox:
 devbox install
 ```
 
-Create local config:
+Create local config in Dumbgram's config directory:
 
 ```bash
-cp config.example.toml config.toml
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/dumbgram"
+cp config.example.toml "${XDG_CONFIG_HOME:-$HOME/.config}/dumbgram/config.toml"
 ```
+
+Dumbgram uses `~/.config/dumbgram/config.toml` by default on macOS/Linux. Set `DUMBGRAM_CONFIG_HOME` to override the directory explicitly.
 
 Edit `config.toml`:
 
@@ -42,7 +45,7 @@ api_hash = "your_api_hash"
 session_file = "session.dat"
 ```
 
-Get `api_id` and `api_hash` from <https://my.telegram.org>. `session_file` may also use a `~/...` path.
+Get `api_id` and `api_hash` from <https://my.telegram.org>. A relative `session_file` is resolved next to `config.toml`, so the example stores the session in the same Dumbgram config directory.
 
 ## Run
 
@@ -67,10 +70,10 @@ Direct CLI examples:
 dumbgram_tui --help
 dumbgram_tui --mock
 dumbgram_tui --mock --smoke
-dumbgram_tui --check-config --config config.toml
-dumbgram_tui --check-auth --config config.toml
-dumbgram_tui --config config.toml
-dumbgram_tui --config config.toml --log dumbgram.log
+dumbgram_tui --check-config
+dumbgram_tui --check-auth
+dumbgram_tui
+dumbgram_tui --config ./config.toml --log dumbgram.log
 ```
 
 `--smoke` is mock-only and never uses real Telegram.
@@ -104,13 +107,24 @@ Navigation:
 - `<` / `>` — resize chat/message split outside input.
 - `q` — quit outside input.
 
+Chat actions:
+
+- `/` — search loaded chats by name while the chat list is focused.
+- Type in chat search — filter loaded chats; substring and simple fuzzy/subsequence matches are supported.
+- `Up` / `Down` in chat search — move to and open another matching result.
+- `Enter` — open the selected search result and leave chat search.
+- `Esc` — clear chat search.
+
 Message actions:
 
 - `Enter` in input — send, save edit, or send reply when text is present.
 - `e` — edit selected own editable message.
 - `r` — reply to selected message.
 - `d` — delete selected own deletable message, or dismiss a failed local send.
+- `c` — copy selected message text using OSC52 clipboard support.
 - `o` — open the first web link in the selected message.
+- `s` — save selected downloadable media to Downloads.
+- `v` — open the saved file for the selected message after saving it.
 - Click a visible `http://` or `https://` link in a message to open it.
 - `y` — confirm delete.
 - `n`, `Esc`, `Ctrl-C` — cancel delete.
@@ -123,6 +137,21 @@ Mouse:
 - Scroll messages to move selection. Use `Up` or `PageUp` at the first loaded message to request older history.
 - Mouse input is ignored while a delete confirmation prompt is open.
 
+## Nix / Devbox install
+
+This repository exposes a Nix flake package and app for `aarch64-darwin`, `x86_64-darwin`, `aarch64-linux`, and `x86_64-linux`:
+
+```bash
+nix run .#dumbgram_tui -- --help
+nix build .#dumbgram_tui
+```
+
+For a global Devbox install from a local checkout or Git flake URL:
+
+```bash
+devbox global add path:$PWD#dumbgram_tui
+```
+
 ## Development
 
 ```bash
@@ -134,7 +163,7 @@ devbox run test
 devbox run smoke
 ```
 
-Local runtime files such as `config.toml`, `session.dat`, `*.dat`, `*.state.toml`, `.devbox/`, and `target/` are ignored by Git. Do not commit Telegram credentials or session files.
+Local runtime files such as repository-local `config.toml`, `session.dat`, `*.dat`, `*.state.toml`, `.devbox/`, and `target/` are ignored by Git. Do not commit Telegram credentials or session files.
 
 ## License
 

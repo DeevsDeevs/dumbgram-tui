@@ -1,4 +1,7 @@
-use crate::{app::App, diagnostics};
+use crate::{
+    app::{App, TerminalImageRenderCache},
+    diagnostics,
+};
 use base64::Engine;
 use image::ImageFormat;
 use std::{env, fs, io::Cursor, io::Write, path::Path};
@@ -7,6 +10,7 @@ const KITTY_ESCAPE_START: &str = "\x1b_G";
 const KITTY_ESCAPE_END: &str = "\x1b\\";
 const MAX_IMAGE_COLUMNS: u16 = 40;
 const MAX_IMAGE_ROWS: u16 = 12;
+const TERMINAL_CELL_HEIGHT_TO_WIDTH_RATIO: f32 = 2.0;
 const MIN_IMAGE_COLUMNS: u16 = 8;
 const MIN_IMAGE_ROWS: u16 = 4;
 
@@ -75,41 +79,102 @@ pub(crate) fn kitty_png_file_image_at_sequence(
     path: &Path,
     column: u16,
     row: u16,
-    columns: u16,
-    rows: u16,
-) -> std::io::Result<(String, usize, ImagePayloadSourceFormat)> {
-    let (bytes, source_format) = kitty_png_payload_bytes(path)?;
-    let byte_len = bytes.len();
+    max_columns: u16,
+    max_rows: u16,
+) -> std::io::Result<(String, usize, ImagePayloadSourceFormat, u16, u16)> {
+    let payload = kitty_png_payload_bytes(path)?;
+    let geometry = fit_image_cells(payload.width, payload.height, max_columns, max_rows);
+    let byte_len = payload.bytes.len();
     Ok((
         format!(
             "\x1b[{};{}H{}",
             row.saturating_add(1),
             column.saturating_add(1),
-            kitty_png_image_sequence(&bytes, columns, rows)
+            kitty_png_image_sequence(&payload.bytes, geometry.columns, geometry.rows)
         ),
         byte_len,
-        source_format,
+        payload.source_format,
+        geometry.columns,
+        geometry.rows,
     ))
 }
 
-fn kitty_png_payload_bytes(path: &Path) -> std::io::Result<(Vec<u8>, ImagePayloadSourceFormat)> {
+struct ImagePayload {
+    bytes: Vec<u8>,
+    source_format: ImagePayloadSourceFormat,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImageCellGeometry {
+    columns: u16,
+    rows: u16,
+}
+
+fn kitty_png_payload_bytes(path: &Path) -> std::io::Result<ImagePayload> {
     let bytes = fs::read(path)?;
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Ok((bytes, ImagePayloadSourceFormat::Png));
+        let image = image::load_from_memory_with_format(&bytes, ImageFormat::Png)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        return Ok(ImagePayload {
+            bytes,
+            source_format: ImagePayloadSourceFormat::Png,
+            width: image.width(),
+            height: image.height(),
+        });
     }
     if bytes.starts_with(b"\xff\xd8\xff") {
         let image = image::load_from_memory_with_format(&bytes, ImageFormat::Jpeg)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let width = image.width();
+        let height = image.height();
         let mut png = Cursor::new(Vec::new());
         image
             .write_to(&mut png, ImageFormat::Png)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        return Ok((png.into_inner(), ImagePayloadSourceFormat::Jpeg));
+        return Ok(ImagePayload {
+            bytes: png.into_inner(),
+            source_format: ImagePayloadSourceFormat::Jpeg,
+            width,
+            height,
+        });
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         "unsupported image preview format",
     ))
+}
+
+fn fit_image_cells(
+    image_width: u32,
+    image_height: u32,
+    max_columns: u16,
+    max_rows: u16,
+) -> ImageCellGeometry {
+    if image_width == 0 || image_height == 0 || max_columns == 0 || max_rows == 0 {
+        return ImageCellGeometry {
+            columns: max_columns,
+            rows: max_rows,
+        };
+    }
+
+    let image_aspect = image_width as f32 / image_height as f32;
+    let viewport_aspect =
+        max_columns as f32 / (max_rows as f32 * TERMINAL_CELL_HEIGHT_TO_WIDTH_RATIO);
+    if viewport_aspect > image_aspect {
+        let rows = max_rows;
+        let columns = ((rows as f32 * TERMINAL_CELL_HEIGHT_TO_WIDTH_RATIO * image_aspect).round()
+            as u16)
+            .clamp(1, max_columns);
+        ImageCellGeometry { columns, rows }
+    } else {
+        let columns = max_columns;
+        let rows = ((columns as f32 / image_aspect / TERMINAL_CELL_HEIGHT_TO_WIDTH_RATIO).round()
+            as u16)
+            .clamp(1, max_rows);
+        ImageCellGeometry { columns, rows }
+    }
 }
 
 pub(crate) fn render_selected_image<W: Write>(
@@ -136,8 +201,6 @@ pub(crate) fn render_selected_image<W: Write>(
         return Ok(());
     }
 
-    writer.write_all(clear_kitty_images_sequence().as_bytes())?;
-
     let selected_message = app.state.selected_message();
     let selected = selected_message.is_some();
     let message_id = selected_message.map(|message| message.id);
@@ -147,6 +210,7 @@ pub(crate) fn render_selected_image<W: Write>(
         .and_then(|media| media.local_image_path())
         .map(Path::to_path_buf);
     let Some(path) = path else {
+        clear_visible_terminal_image(writer, app)?;
         log_terminal_image_once(
             app,
             format!("skip:no-image:{selected}:{has_media}"),
@@ -155,58 +219,71 @@ pub(crate) fn render_selected_image<W: Write>(
                 "reason=no_selected_image selected={selected} media={has_media} local_path=false"
             ),
         );
-        writer.flush()?;
         return Ok(());
     };
 
     let area = app.state.terminal_image_area;
-    let columns = area.width.saturating_sub(2).min(MAX_IMAGE_COLUMNS);
-    let rows = area.height.saturating_sub(2).min(MAX_IMAGE_ROWS);
-    if columns < MIN_IMAGE_COLUMNS || rows < MIN_IMAGE_ROWS {
+    let max_columns = area.width.saturating_sub(2).min(MAX_IMAGE_COLUMNS);
+    let max_rows = area.height.saturating_sub(2).min(MAX_IMAGE_ROWS);
+    if max_columns < MIN_IMAGE_COLUMNS || max_rows < MIN_IMAGE_ROWS {
+        clear_visible_terminal_image(writer, app)?;
         log_terminal_image_once(
             app,
             format!(
                 "skip:area:{}:{}:{}:{}",
-                area.width, area.height, columns, rows
+                area.width, area.height, max_columns, max_rows
             ),
             "terminal_image_skip",
             format!(
-                "reason=area_too_small area_width={} area_height={} columns={columns} rows={rows}",
+                "reason=area_too_small area_width={} area_height={} columns={max_columns} rows={max_rows}",
                 area.width, area.height
             ),
         );
-        writer.flush()?;
         return Ok(());
     }
 
     let column = area.x.saturating_add(1);
     let row = area.y.saturating_add(1);
-    let (sequence, byte_len, source_format) =
-        match kitty_png_file_image_at_sequence(&path, column, row, columns, rows) {
-            Ok(sequence) => sequence,
-            Err(error) => {
-                log_terminal_image_once(
-                    app,
-                    format!("error:read:{:?}", error.kind()),
-                    "terminal_image_error",
-                    format!("stage=read_image error_kind={:?}", error.kind()),
-                );
-                writer.flush()?;
-                return Ok(());
-            }
-        };
-    writer.write_all(sequence.as_bytes())?;
+    let render_key = terminal_image_visible_key(&path, column, row, max_columns, max_rows);
+    if app.terminal_image_visible_key.as_deref() == Some(render_key.as_str()) {
+        return Ok(());
+    }
+
+    let (byte_len, source_format, columns, rows) = match ensure_terminal_image_sequence_cache(
+        app,
+        &path,
+        column,
+        row,
+        max_columns,
+        max_rows,
+    ) {
+        Ok(sequence) => sequence,
+        Err(error) => {
+            clear_visible_terminal_image(writer, app)?;
+            log_terminal_image_once(
+                app,
+                format!("error:read:{:?}", error.kind()),
+                "terminal_image_error",
+                format!("stage=read_image error_kind={:?}", error.kind()),
+            );
+            return Ok(());
+        }
+    };
+    writer.write_all(clear_kitty_images_sequence().as_bytes())?;
+    let sequence = app
+        .terminal_image_render_cache
+        .as_ref()
+        .expect("terminal image render cache should be populated")
+        .sequence
+        .as_bytes();
+    writer.write_all(sequence)?;
     writer.flush()?;
+    app.terminal_image_visible_key = Some(render_key);
     log_terminal_image_once(
         app,
         format!(
             "render:{:?}:{}:{}:{}:{}:{}",
-            message_id,
-            byte_len,
-            source_format.diagnostic_label(),
-            columns,
-            rows,
-            area.width
+            message_id, byte_len, source_format, columns, rows, area.width
         ),
         "terminal_image_render",
         format!(
@@ -214,12 +291,70 @@ pub(crate) fn render_selected_image<W: Write>(
             message_id
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
-            source_format.diagnostic_label(),
+            source_format,
             area.width,
             area.height
         ),
     );
     Ok(())
+}
+
+fn clear_visible_terminal_image<W: Write>(writer: &mut W, app: &mut App) -> std::io::Result<()> {
+    if app.terminal_image_visible_key.take().is_some() {
+        writer.write_all(clear_kitty_images_sequence().as_bytes())?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+fn terminal_image_visible_key(
+    path: &Path,
+    column: u16,
+    row: u16,
+    columns: u16,
+    rows: u16,
+) -> String {
+    format!("{}:{column}:{row}:{columns}:{rows}", path.to_string_lossy())
+}
+
+fn ensure_terminal_image_sequence_cache(
+    app: &mut App,
+    path: &Path,
+    column: u16,
+    row: u16,
+    max_columns: u16,
+    max_rows: u16,
+) -> std::io::Result<(usize, &'static str, u16, u16)> {
+    if let Some(cache) = app.terminal_image_render_cache.as_ref()
+        && cache.path == path
+        && cache.column == column
+        && cache.row == row
+        && cache.requested_columns == max_columns
+        && cache.requested_rows == max_rows
+    {
+        return Ok((
+            cache.byte_len,
+            cache.source_format,
+            cache.columns,
+            cache.rows,
+        ));
+    }
+
+    let (sequence, byte_len, source_format, columns, rows) =
+        kitty_png_file_image_at_sequence(path, column, row, max_columns, max_rows)?;
+    app.terminal_image_render_cache = Some(TerminalImageRenderCache {
+        path: path.to_path_buf(),
+        column,
+        row,
+        requested_columns: max_columns,
+        requested_rows: max_rows,
+        columns,
+        rows,
+        sequence,
+        byte_len,
+        source_format: source_format.diagnostic_label(),
+    });
+    Ok((byte_len, source_format.diagnostic_label(), columns, rows))
 }
 
 fn terminal_kind(value: Option<&str>) -> &'static str {
@@ -247,10 +382,10 @@ fn log_terminal_image_once(app: &mut App, key: String, name: &str, details: Stri
 mod tests {
     use super::{
         ImagePayloadSourceFormat, clear_kitty_images_sequence, clear_terminal_images_for_support,
-        kitty_png_file_image_at_sequence, kitty_png_image_sequence,
-        terminal_env_supports_kitty_graphics,
+        ensure_terminal_image_sequence_cache, fit_image_cells, kitty_png_file_image_at_sequence,
+        kitty_png_image_sequence, terminal_env_supports_kitty_graphics,
     };
-    use base64::Engine;
+    use crate::app::App;
     use image::{DynamicImage, ImageFormat, RgbImage};
     use std::{fs, io::Cursor, path::Path};
 
@@ -291,16 +426,20 @@ mod tests {
             "dumbgram-terminal-image-test-{}.png",
             std::process::id()
         ));
-        let png_bytes = base64::engine::general_purpose::STANDARD
-            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axK6JkAAAAASUVORK5CYII=")
+        let image = RgbImage::from_fn(1, 1, |_x, _y| image::Rgb([120, 80, 40]));
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut png, ImageFormat::Png)
             .unwrap();
+        let png_bytes = png.into_inner();
         fs::write(&path, &png_bytes).unwrap();
 
-        let (sequence, byte_len, source_format) =
+        let (sequence, byte_len, source_format, columns, rows) =
             kitty_png_file_image_at_sequence(Path::new(&path), 2, 3, 10, 4).unwrap();
 
         assert_eq!(byte_len, png_bytes.len());
         assert_eq!(source_format, ImagePayloadSourceFormat::Png);
+        assert_eq!((columns, rows), (8, 4));
         assert!(sequence.starts_with("\x1b[4;3H\x1b_G"));
         assert!(!sequence.contains(path.to_string_lossy().as_ref()));
         fs::remove_file(path).ok();
@@ -319,13 +458,59 @@ mod tests {
             .unwrap();
         fs::write(&path, jpeg.into_inner()).unwrap();
 
-        let (sequence, byte_len, source_format) =
+        let (sequence, byte_len, source_format, columns, rows) =
             kitty_png_file_image_at_sequence(Path::new(&path), 2, 3, 10, 4).unwrap();
 
         assert_eq!(source_format, ImagePayloadSourceFormat::Jpeg);
         assert!(byte_len > 0);
+        assert_eq!((columns, rows), (8, 4));
         assert!(sequence.starts_with("\x1b[4;3H\x1b_G"));
-        assert!(sequence.contains("a=T,f=100,q=2,z=1,c=10,r=4;"));
+        assert!(sequence.contains("a=T,f=100,q=2,z=1,c=8,r=4;"));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn image_cell_fit_preserves_aspect_inside_viewport() {
+        assert_eq!(
+            fit_image_cells(1600, 900, 40, 12),
+            super::ImageCellGeometry {
+                columns: 40,
+                rows: 11,
+            }
+        );
+        assert_eq!(
+            fit_image_cells(900, 1600, 40, 12),
+            super::ImageCellGeometry {
+                columns: 14,
+                rows: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_image_sequence_cache_reuses_encoded_payload_for_same_area() {
+        let path = std::env::temp_dir().join(format!(
+            "dumbgram-terminal-image-cache-test-{}.png",
+            std::process::id()
+        ));
+        let image = RgbImage::from_fn(1, 1, |_x, _y| image::Rgb([120, 80, 40]));
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        let png_bytes = png.into_inner();
+        fs::write(&path, &png_bytes).unwrap();
+        let mut app = App::new();
+
+        let first = ensure_terminal_image_sequence_cache(&mut app, &path, 1, 2, 10, 4).unwrap();
+        fs::write(&path, b"not-an-image").unwrap();
+        let second = ensure_terminal_image_sequence_cache(&mut app, &path, 1, 2, 10, 4).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            app.terminal_image_render_cache.as_ref().unwrap().byte_len,
+            png_bytes.len()
+        );
         fs::remove_file(path).ok();
     }
 

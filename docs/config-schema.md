@@ -5,10 +5,15 @@ It intentionally does **not** list planned layout, keybinding, sync, or theme-fi
 
 ## Main configuration file
 
-By default the app reads `config.toml` in the current working directory. Use `--config PATH` to load a different file:
+By default the app reads `config.toml` from Dumbgram's app config directory:
+
+- macOS/Linux: `${XDG_CONFIG_HOME:-~/.config}/dumbgram/config.toml`
+- Windows: `%APPDATA%\\dumbgram\\config.toml`
+
+Set `DUMBGRAM_CONFIG_HOME` to override the directory explicitly. Use `--config PATH` to load a different file:
 
 ```bash
-dumbgram_tui --config ~/.config/dumbgram/config.toml
+dumbgram_tui --config ./config.toml
 ```
 
 ## Supported TOML schema
@@ -22,10 +27,11 @@ api_id = 12345
 # Required. Get this from https://my.telegram.org.
 api_hash = "YOUR_API_HASH"
 
-# Required. Telegram session file to create/reuse.
-# Relative paths are resolved from the process working directory.
+# Optional. Telegram session file to create/reuse.
+# Defaults to "session.dat".
+# Relative paths are resolved next to the loaded config.toml.
 # ~/... is expanded from HOME.
-session_file = "~/.config/dumbgram/session.dat"
+session_file = "session.dat"
 
 # Backward-compatible alias accepted by the parser:
 # session_path = "~/.config/dumbgram/session.dat"
@@ -39,22 +45,24 @@ Only `telegram.api_id`, `telegram.api_hash`, and `telegram.session_file` / `tele
 
 1. `telegram.api_id` must parse to a positive integer.
 2. `telegram.api_hash` must be non-empty after trimming whitespace.
-3. `telegram.session_file` / `telegram.session_path` must be non-empty after trimming whitespace.
+3. `telegram.session_file` / `telegram.session_path`, when present, must be non-empty after trimming whitespace.
 4. If the resolved session-file parent path already exists, it must be a directory.
 5. Missing session-file parent directories are allowed; real launch and `--check-auth` create them before opening the Grammers session.
 
 ## Session path behavior
 
-- `session_file = "session.dat"` stores the session in the current working directory.
+- Omitting `session_file` uses `session.dat` next to the loaded config file.
+- `session_file = "session.dat"` also stores the session next to the loaded config file.
 - `session_file = "~/.config/dumbgram/session.dat"` expands `~` using `HOME`.
+- Absolute paths are used as-is.
 - `session_path` is accepted as an alias for compatibility with earlier docs.
 - Session files contain Telegram login state and must not be committed.
 
 ## Diagnostics
 
 ```bash
-dumbgram_tui --check-config --config config.toml
-dumbgram_tui --check-auth --config config.toml
+dumbgram_tui --check-config
+dumbgram_tui --check-auth
 ```
 
 - `--check-config` parses and validates the file only.
@@ -62,7 +70,7 @@ dumbgram_tui --check-auth --config config.toml
 
 ## Local UI state
 
-Dumbgram keeps runtime UI preferences out of `config.toml`. When launched with `--config config.toml`, it stores preferences in `config.state.toml` next to that config file. Currently persisted values are:
+Dumbgram keeps runtime UI preferences out of `config.toml`. It stores preferences in `<config-stem>.state.toml` next to the loaded config file. Currently persisted values are:
 
 ```toml
 [ui]

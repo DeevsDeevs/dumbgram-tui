@@ -1,7 +1,7 @@
 use crate::{
-    state::{AppState, FocusedPanel},
+    state::{AppState, FocusedPanel, message_visible_row_height_for_width_capped},
     telegram::types::message_display_content,
-    text::{display_width, truncate_with_ellipsis},
+    text::{char_display_width, display_width},
     ui::{self, SELECTED_ROW_SYMBOL},
 };
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -78,8 +78,17 @@ pub fn handle_mouse_click(state: &mut AppState, mouse_event: MouseEvent) -> Mous
         let border_offset = 1;
         let relative_y = y.saturating_sub(state.chats_area.y + border_offset);
         let height_per_chat = 2;
-        let chat_index = state.chat_scroll_offset + (relative_y / height_per_chat) as usize;
-        if chat_index >= state.chats.len() || chat_index == state.selected_chat_index {
+        let display_offset = if state.chat_search_active() {
+            state.chat_search_scroll_offset
+        } else {
+            state.chat_scroll_offset
+        };
+        let display_index = display_offset + (relative_y / height_per_chat) as usize;
+        let display_indices = state.chat_display_indices();
+        let Some(chat_index) = display_indices.get(display_index).copied() else {
+            return MouseClickOutcome::Handled;
+        };
+        if chat_index == state.selected_chat_index {
             MouseClickOutcome::Handled
         } else {
             MouseClickOutcome::OpenChatAt(chat_index)
@@ -110,16 +119,14 @@ fn message_link_at_click(state: &AppState, x: u16, y: u16) -> Option<String> {
     let mut current_row = 0;
 
     for message in state.messages.iter().skip(state.message_scroll_offset) {
-        let message_height = if message.reply_to_content.is_some() {
-            2
-        } else {
-            1
-        };
+        let remaining_rows = state.message_visible_capacity().saturating_sub(current_row);
+        let message_height = message_visible_row_height_for_width_capped(
+            message,
+            ui::list_text_width(state.messages_area.width),
+            remaining_rows,
+        );
         if relative_y < current_row + message_height {
-            if relative_y != current_row {
-                return None;
-            }
-
+            let line_index = relative_y - current_row;
             let time_str = message.timestamp.format("%H:%M").to_string();
             let metadata = ui::messages::message_metadata(
                 &time_str,
@@ -133,12 +140,18 @@ fn message_link_at_click(state: &AppState, x: u16, y: u16) -> Option<String> {
                 .saturating_sub(display_width(&sender) + display_width(&metadata))
                 .max(1);
             let display_content = message_display_content(message.media.as_ref(), &message.content);
-            let content = truncate_with_ellipsis(&display_content, content_width);
+            let line_ranges = wrap_display_line_ranges(
+                &display_content,
+                content_width,
+                text_width.saturating_sub(display_width(&sender)).max(1),
+                line_index + 1,
+            );
+            let (line_start, line) = line_ranges.get(line_index)?;
+            let line_end = line_start + line.len();
             let content_start = display_width(SELECTED_ROW_SYMBOL) + display_width(&sender);
+            let column = relative_x.checked_sub(content_start)?;
 
-            return relative_x
-                .checked_sub(content_start)
-                .and_then(|column| crate::links::link_at_display_column(&content, column));
+            return link_in_wrapped_line_at_column(&display_content, *line_start, line_end, column);
         }
         current_row += message_height;
         if current_row >= state.message_visible_capacity() {
@@ -147,6 +160,77 @@ fn message_link_at_click(state: &AppState, x: u16, y: u16) -> Option<String> {
     }
 
     None
+}
+
+fn wrap_display_line_ranges(
+    text: &str,
+    first_width: usize,
+    subsequent_width: usize,
+    max_lines: usize,
+) -> Vec<(usize, String)> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+
+    let first_width = first_width.max(1);
+    let subsequent_width = subsequent_width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_start = 0;
+    let mut current_width = 0;
+    let mut current_limit = first_width;
+
+    for (byte_index, ch) in text.char_indices() {
+        if ch == '\n' {
+            lines.push((current_start, std::mem::take(&mut current)));
+            if lines.len() >= max_lines {
+                return lines;
+            }
+            current_start = byte_index + ch.len_utf8();
+            current_width = 0;
+            current_limit = subsequent_width;
+            continue;
+        }
+
+        let char_width = char_display_width(ch);
+        if current_width > 0 && current_width + char_width > current_limit {
+            lines.push((current_start, std::mem::take(&mut current)));
+            if lines.len() >= max_lines {
+                return lines;
+            }
+            current_start = byte_index;
+            current_width = 0;
+            current_limit = subsequent_width;
+        }
+
+        current.push(ch);
+        current_width += char_width;
+    }
+
+    lines.push((current_start, current));
+    lines
+}
+
+fn link_in_wrapped_line_at_column(
+    text: &str,
+    line_start: usize,
+    line_end: usize,
+    column: usize,
+) -> Option<String> {
+    let line = &text[line_start..line_end];
+    crate::links::links_in_text(text)
+        .into_iter()
+        .find_map(|link| {
+            let overlap_start = link.start.max(line_start);
+            let overlap_end = link.end.min(line_end);
+            if overlap_start >= overlap_end {
+                return None;
+            }
+
+            let start_column = display_width(&line[..overlap_start - line_start]);
+            let end_column = display_width(&line[..overlap_end - line_start]);
+            (column >= start_column && column < end_column).then_some(link.url)
+        })
 }
 
 #[cfg(test)]
@@ -390,6 +474,35 @@ mod tests {
     }
 
     #[test]
+    fn chat_search_click_uses_filtered_scroll_offset() {
+        let mut state = AppState::new();
+        state.chats_area = Rect::new(0, 5, 30, 8);
+        state.chats = vec![
+            chat(1, "Chat 1"),
+            chat(2, "Chat 2"),
+            chat(3, "Chat 3"),
+            chat(4, "Chat 4"),
+            chat(5, "Chat 5"),
+        ];
+        state.begin_chat_search();
+        state.push_chat_search_char('c');
+        state.chat_search_scroll_offset = 2;
+
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    2,
+                    8
+                )
+            ),
+            MouseClickOutcome::OpenChatAt(3)
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Chats);
+    }
+
+    #[test]
     fn selected_or_out_of_range_chat_click_is_handled_without_opening_chat() {
         let mut state = AppState::new();
         state.chats_area = Rect::new(0, 5, 30, 8);
@@ -477,6 +590,28 @@ mod tests {
                 )
             ),
             MouseClickOutcome::OpenLink("https://example.org".to_string())
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Messages);
+        assert_eq!(state.selected_message_index, 0);
+    }
+
+    #[test]
+    fn message_click_on_wrapped_url_continuation_requests_link_open() {
+        let mut state = AppState::new();
+        state.messages_area = Rect::new(30, 5, 35, 8);
+        state.messages = vec![message_with_content(1, "prefix https://example.org/path")];
+
+        let wrapped_url_column = 30 + 1 + 2 + 4 + 2;
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    wrapped_url_column,
+                    7
+                )
+            ),
+            MouseClickOutcome::OpenLink("https://example.org/path".to_string())
         );
         assert_eq!(state.focused_panel, FocusedPanel::Messages);
         assert_eq!(state.selected_message_index, 0);

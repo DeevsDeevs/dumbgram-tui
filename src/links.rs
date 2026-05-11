@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::text::display_width;
 use color_eyre::{Result, eyre::eyre};
 use std::process::Command;
@@ -50,6 +51,7 @@ pub(crate) fn first_url(text: &str) -> Option<String> {
     links_in_text(text).into_iter().next().map(|link| link.url)
 }
 
+#[cfg(test)]
 pub(crate) fn link_at_display_column(text: &str, column: usize) -> Option<String> {
     links_in_text(text).into_iter().find_map(|link| {
         let start_column = display_width(&text[..link.start]);

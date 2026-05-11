@@ -7,7 +7,7 @@ Dumbgram TUI is a Rust terminal client for Telegram. It uses:
 - `grammers-client` and `grammers-session` for Telegram authentication, sessions, chat history, message sends, edits, replies, deletes, and updates.
 - `ratatui` and `crossterm` for the terminal interface, input events, mouse support, and alternate-screen rendering.
 - `tokio` for async runtime and update handling.
-- TOML configuration loaded from `config.toml` at the repository root.
+- TOML configuration loaded from the app config directory by default, or from `--config PATH`.
 
 The binary crate is `dumbgram_tui` and the entry point is `src/main.rs`.
 
@@ -46,8 +46,11 @@ devbox shell
 1. Copy the sample config:
 
    ```bash
-   cp config.example.toml config.toml
+   mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/dumbgram"
+   cp config.example.toml "${XDG_CONFIG_HOME:-$HOME/.config}/dumbgram/config.toml"
    ```
+
+   On macOS/Linux this defaults to `~/.config/dumbgram/config.toml`, or pass `--config PATH`.
 
 2. Fill in Telegram credentials from <https://my.telegram.org>:
 
@@ -98,7 +101,7 @@ On the first real Telegram run, the app prompts for phone number, login code, an
 - `src/telegram/` — Telegram abstraction, real Grammers client, mock client, shared data types.
 - `src/ui/` — Ratatui widgets for folders, chats, messages, input, and layout.
 - `src/config/` — config loading and theme defaults.
-- `config.example.toml` — safe example config.
+- `config.example.toml` — safe example config for the app config directory.
 - `docs/config-schema.md` — larger planned configuration schema notes.
 - `devbox.json` and `devbox.lock` — reproducible development environment.
 

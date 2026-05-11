@@ -1,10 +1,11 @@
 use crate::diagnostics;
 use crate::state::{AppState, DeleteConfirmation, MessageSubmitAction, NO_CHAT_SELECTED_ERROR};
 use crate::telegram::{
-    TelegramClient,
-    types::{ALL_FOLDER_ID, Chat, Folder, Message},
+    DownloadedMedia, TelegramClient,
+    types::{ALL_FOLDER_ID, Chat, Folder, Message, MessageMediaKind},
 };
 use color_eyre::Result;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -28,9 +29,66 @@ pub(crate) const LOAD_MESSAGES_TIMED_OUT_STATUS: &str = "Load messages timed out
 pub(crate) const LOAD_OLDER_MESSAGES_TIMED_OUT_STATUS: &str = "Load older messages timed out";
 pub(crate) const LOAD_CHATS_TIMED_OUT_STATUS: &str = "Load chats timed out";
 pub(crate) const LOAD_OLDER_MESSAGES_FAILED_PREFIX: &str = "Load older messages failed";
+pub(crate) const DOWNLOAD_MEDIA_FAILED_PREFIX: &str = "Download media failed";
 
 fn load_older_messages_failed_error(error: impl std::fmt::Display) -> String {
     format!("{LOAD_OLDER_MESSAGES_FAILED_PREFIX}: {error}")
+}
+
+fn download_media_failed_error(error: impl std::fmt::Display) -> String {
+    format!("{DOWNLOAD_MEDIA_FAILED_PREFIX}: {error}")
+}
+
+pub fn default_download_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Downloads"))
+        .unwrap_or_else(|| PathBuf::from("Downloads"))
+}
+
+pub async fn download_message_media_result<C: TelegramClient>(
+    client: &C,
+    chat_id: i64,
+    message_id: i32,
+    media_kind: MessageMediaKind,
+    destination_dir: PathBuf,
+) -> std::result::Result<DownloadedMedia, String> {
+    diagnostics::event(
+        "media_download_start",
+        format!(
+            "chat_id={chat_id} message_id={message_id} kind={} destination=downloads",
+            media_kind.diagnostic_label()
+        ),
+    );
+    let started = Instant::now();
+    match client
+        .download_message_media(chat_id, message_id, destination_dir)
+        .await
+    {
+        Ok(downloaded) => {
+            diagnostics::event(
+                "media_download_finish",
+                format!(
+                    "chat_id={chat_id} message_id={message_id} kind={} bytes={} elapsed_ms={} destination=downloads",
+                    media_kind.diagnostic_label(),
+                    downloaded.bytes,
+                    started.elapsed().as_millis()
+                ),
+            );
+            Ok(downloaded)
+        }
+        Err(error) => {
+            diagnostics::event(
+                "media_download_error",
+                format!(
+                    "chat_id={chat_id} message_id={message_id} kind={} elapsed_ms={} error=true",
+                    media_kind.diagnostic_label(),
+                    started.elapsed().as_millis()
+                ),
+            );
+            Err(download_media_failed_error(error))
+        }
+    }
 }
 
 pub struct PendingSend {
@@ -752,7 +810,7 @@ pub async fn finish_send_message<C: TelegramClient>(
 mod tests {
     use super::{
         LOAD_CHATS_TIMED_OUT_STATUS, NO_OLDER_MESSAGES_STATUS, apply_initial_state_load_result,
-        begin_open_folder_at, begin_send_message, confirm_delete,
+        begin_open_folder_at, begin_send_message, confirm_delete, download_message_media_result,
         fetch_folder_chats_and_selected_messages, fetch_initial_state, fetch_latest_chat_messages,
         finish_send_message, load_initial_state, load_older_messages_failed_error,
         load_older_selected_chat_messages, load_selected_chat_messages, open_chat_at,
@@ -763,7 +821,7 @@ mod tests {
         AppState, DeleteConfirmation, MESSAGE_DELETED_STATUS, NO_CHAT_SELECTED_ERROR,
     };
     use crate::telegram::types::{
-        Chat, Folder, Message, MessageStatus, OWN_SENDER_NAME, Update, all_folder,
+        Chat, Folder, Message, MessageMediaKind, MessageStatus, OWN_SENDER_NAME, Update, all_folder,
     };
     use crate::telegram::{MockTelegramClient, TelegramClient};
     use chrono::Utc;
@@ -779,6 +837,17 @@ mod tests {
 
     fn action_should_succeed<T>(result: Result<T>) -> T {
         result.expect("test action should succeed")
+    }
+
+    fn test_download_dir(name: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "dumbgram-tui-test-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock should be after epoch")
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
     }
 
     fn chat(id: i64, name: &str) -> Chat {
@@ -1578,6 +1647,22 @@ mod tests {
     #[test]
     fn message_history_page_size_is_conservative_for_real_account_loads() {
         assert_eq!(super::MESSAGE_HISTORY_PAGE_SIZE, 20);
+    }
+
+    #[tokio::test]
+    async fn download_message_media_result_saves_mock_media_to_requested_directory() {
+        let client = MockTelegramClient::new();
+        let dir = test_download_dir("media-download");
+
+        let downloaded =
+            download_message_media_result(&client, 1, 3, MessageMediaKind::Photo, dir.clone())
+                .await
+                .expect("mock media should download");
+
+        assert!(downloaded.path.starts_with(&dir));
+        assert!(downloaded.bytes > 0);
+        assert!(downloaded.path.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
