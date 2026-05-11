@@ -2,77 +2,85 @@
   description = "Dumbgram TUI - terminal Telegram client";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs }:
-    let
-      systems = [
-        "aarch64-darwin"
-        "x86_64-darwin"
-        "aarch64-linux"
-        "x86_64-linux"
-      ];
-      forAllSystems = nixpkgs.lib.genAttrs systems;
-    in
-    {
-      packages = forAllSystems (system:
-        let
-          pkgs = import nixpkgs { inherit system; };
-          cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-          packageName = cargoToml.package.name;
-          packageVersion = cargoToml.package.version;
-          dumbgram = pkgs.rustPlatform.buildRustPackage {
-            pname = packageName;
-            version = packageVersion;
-            src = self;
-            cargoLock.lockFile = ./Cargo.lock;
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, ... }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        overlays = [ (import rust-overlay) ];
+        pkgs = import nixpkgs {
+          inherit system overlays;
+        };
 
-            nativeBuildInputs = [ pkgs.pkg-config ];
+        cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+        packageName = cargoToml.package.name;
+        packageVersion = cargoToml.package.version;
 
-            meta = with pkgs.lib; {
-              description = "Terminal Telegram client built with Ratatui and Grammers";
-              homepage = "https://github.com/deevus/dumbgram-tui";
-              mainProgram = packageName;
-              platforms = platforms.linux ++ platforms.darwin;
-            };
+        rustToolchain = pkgs.rust-bin.stable.latest.default;
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+        };
+
+        dumbgram = rustPlatform.buildRustPackage {
+          pname = packageName;
+          version = packageVersion;
+          src = ./.;
+
+          cargoLock = {
+            lockFile = ./Cargo.lock;
           };
-        in
-        {
+
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+          ];
+
+          buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.libiconv
+          ];
+
+          doCheck = false;
+
+          meta = with pkgs.lib; {
+            description = "Terminal Telegram client built with Ratatui and Grammers";
+            homepage = "https://github.com/DeevsDeevs/dumbgram-tui";
+            mainProgram = packageName;
+            platforms = platforms.linux ++ platforms.darwin;
+          };
+        };
+      in
+      {
+        packages = {
           default = dumbgram;
           dumbgram_tui = dumbgram;
-        });
+        };
 
-      apps = forAllSystems (system:
-        let
-          package = self.packages.${system}.default;
-        in
-        {
-          default = {
-            type = "app";
-            program = "${package}/bin/dumbgram_tui";
-          };
-          dumbgram_tui = self.apps.${system}.default;
-        });
+        apps.default = flake-utils.lib.mkApp {
+          drv = dumbgram;
+        };
 
-      devShells = forAllSystems (system:
-        let
-          pkgs = import nixpkgs { inherit system; };
-        in
-        {
-          default = pkgs.mkShell {
-            packages = with pkgs; [
-              cargo
-              clippy
-              pkg-config
-              rust-analyzer
-              rustc
-              rustfmt
-            ];
+        apps.dumbgram_tui = flake-utils.lib.mkApp {
+          drv = dumbgram;
+        };
 
-            RUST_BACKTRACE = "1";
-            CARGO_TERM_COLOR = "always";
-          };
-        });
-    };
+        devShells.default = pkgs.mkShell {
+          packages = with pkgs; [
+            rustToolchain
+            pkg-config
+            rust-analyzer
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.libiconv
+          ];
+
+          RUST_BACKTRACE = "1";
+          CARGO_TERM_COLOR = "always";
+        };
+      }
+    );
 }
