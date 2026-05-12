@@ -18,6 +18,7 @@ pub enum MouseClickOutcome {
     Handled,
     OpenFolderAt(usize),
     OpenChatAt(usize),
+    OpenThreadTopicAt(usize),
     OpenLink(String),
     Ignored,
 }
@@ -92,6 +93,19 @@ pub fn handle_mouse_click(state: &mut AppState, mouse_event: MouseEvent) -> Mous
             MouseClickOutcome::Handled
         } else {
             MouseClickOutcome::OpenChatAt(chat_index)
+        }
+    } else if state.thread_topics_area.contains(position) {
+        state.focused_panel = FocusedPanel::Messages;
+        let relative_x = x.saturating_sub(state.thread_topics_area.x + 1) as usize;
+        if let Some(topic_index) = state.thread_topic_index_at_visible_column(relative_x) {
+            if topic_index == state.selected_thread_topic_index {
+                MouseClickOutcome::Handled
+            } else {
+                state.select_thread_topic_at(topic_index);
+                MouseClickOutcome::OpenThreadTopicAt(topic_index)
+            }
+        } else {
+            MouseClickOutcome::Handled
         }
     } else if state.messages_area.contains(position) {
         state.focused_panel = FocusedPanel::Messages;
@@ -237,7 +251,7 @@ fn link_in_wrapped_line_at_column(
 mod tests {
     use super::{MouseClickOutcome, MouseScrollOutcome, handle_mouse_click, handle_mouse_scroll};
     use crate::state::{AppState, FocusedPanel};
-    use crate::telegram::types::{Chat, Folder, Message, MessageStatus, all_folder};
+    use crate::telegram::types::{Chat, Folder, Message, MessageStatus, ThreadTopic, all_folder};
     use chrono::Utc;
     use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
@@ -270,6 +284,7 @@ mod tests {
         Message {
             id,
             chat_id: 7,
+            thread_topic_id: None,
             sender_name: "me".to_string(),
             content: content.to_string(),
             timestamp: Utc::now(),
@@ -289,6 +304,17 @@ mod tests {
             id,
             name: name.to_string(),
             unread_count: 0,
+        }
+    }
+
+    fn thread_topic(id: i32, title: &str) -> ThreadTopic {
+        ThreadTopic {
+            id,
+            title: title.to_string(),
+            top_message_id: id + 1000,
+            unread_count: 0,
+            is_closed: false,
+            is_pinned: false,
         }
     }
 
@@ -444,6 +470,54 @@ mod tests {
             ),
             MouseClickOutcome::OpenFolderAt(1)
         );
+    }
+
+    #[test]
+    fn thread_topic_click_selects_topic_and_requests_open() {
+        let mut state = AppState::new();
+        state.thread_topics_area = Rect::new(30, 5, 60, 3);
+        state.thread_topics = vec![
+            thread_topic(101, "General"),
+            thread_topic(102, "Deployments"),
+        ];
+
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    45,
+                    6
+                )
+            ),
+            MouseClickOutcome::OpenThreadTopicAt(1)
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Messages);
+        assert_eq!(state.selected_thread_topic_index, 1);
+    }
+
+    #[test]
+    fn selected_thread_topic_click_is_handled_without_reopening() {
+        let mut state = AppState::new();
+        state.thread_topics_area = Rect::new(30, 5, 60, 3);
+        state.thread_topics = vec![
+            thread_topic(101, "General"),
+            thread_topic(102, "Deployments"),
+        ];
+
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    32,
+                    6
+                )
+            ),
+            MouseClickOutcome::Handled
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Messages);
+        assert_eq!(state.selected_thread_topic_index, 0);
     }
 
     #[test]

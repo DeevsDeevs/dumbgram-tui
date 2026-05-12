@@ -38,7 +38,7 @@ use ratatui::{
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{fs, io};
-use telegram::types::{Message, Update};
+use telegram::types::{Message, ThreadTopic, Update};
 use telegram::{GrammersClient, MockTelegramClient, TelegramClient};
 
 const LOADING_TELEGRAM_STATUS: &str = "Loading Telegram data…";
@@ -737,8 +737,7 @@ fn assert_smoke_message_render(app: &App, rendered: &str) -> Result<()> {
 fn assert_smoke_typing_render(app: &App, rendered: &str) -> Result<()> {
     if let Some(users) = app
         .state
-        .selected_chat_id()
-        .and_then(|chat_id| app.state.typing_users.get(&chat_id))
+        .selected_typing_users()
         .filter(|users| !users.is_empty())
     {
         let typing_label = ui::messages::typing_label(users);
@@ -1100,6 +1099,72 @@ async fn run_interaction_smoke<C: TelegramClient + Clone + Send + Sync + 'static
         ));
     }
 
+    if app.state.selected_chat_id() != Some(3) || app.state.thread_topics.is_empty() {
+        return Err(color_eyre::eyre::eyre!(
+            "threaded mock chat did not expose topic tabs before topic-open smoke"
+        ));
+    }
+    handle_key_event(app, smoke_key(KeyCode::Enter), client).await?;
+    if app.state.messages.is_empty()
+        || !app
+            .state
+            .messages
+            .iter()
+            .all(|message| message.chat_id == 3 && message.thread_topic_id == Some(101))
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "Enter in messages did not load the selected mock topic history"
+        ));
+    }
+
+    app.state.focused_panel = state::FocusedPanel::Input;
+    app.state.input_buffer = "topic smoke send".to_string();
+    app.state.move_input_cursor_to_end();
+    handle_key_event(app, smoke_key(KeyCode::Enter), client).await?;
+    let selected_sent_topic_message = app
+        .state
+        .messages
+        .get(app.state.selected_message_index)
+        .ok_or_else(|| color_eyre::eyre::eyre!("topic send did not select a message"))?;
+    if selected_sent_topic_message.content != "topic smoke send"
+        || selected_sent_topic_message.chat_id != 3
+        || selected_sent_topic_message.thread_topic_id != Some(101)
+        || selected_sent_topic_message.status != telegram::types::MessageStatus::Sent
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "topic send interaction did not append/select a sent topic-scoped mock message"
+        ));
+    }
+
+    app.state.focused_panel = state::FocusedPanel::Messages;
+    handle_key_event(app, smoke_key(KeyCode::Char('r')), client).await?;
+    if app.state.focused_panel != state::FocusedPanel::Input
+        || app.state.replying_to_message_id.is_none()
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "topic reply shortcut did not enter input reply mode"
+        ));
+    }
+    app.state.input_buffer = "topic smoke reply".to_string();
+    app.state.move_input_cursor_to_end();
+    handle_key_event(app, smoke_key(KeyCode::Enter), client).await?;
+    let selected_topic_reply = app
+        .state
+        .messages
+        .get(app.state.selected_message_index)
+        .ok_or_else(|| color_eyre::eyre::eyre!("topic reply did not select a message"))?;
+    if selected_topic_reply.content != "topic smoke reply"
+        || selected_topic_reply.chat_id != 3
+        || selected_topic_reply.thread_topic_id != Some(101)
+        || selected_topic_reply.reply_to_content.as_deref() != Some("topic 101 reply 1101")
+        || selected_topic_reply.status != telegram::types::MessageStatus::Sent
+        || app.state.replying_to_message_id.is_some()
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "topic reply interaction did not append/select a sent topic-scoped reply"
+        ));
+    }
+
     Ok(())
 }
 
@@ -1110,6 +1175,32 @@ async fn run_mouse_smoke<C: TelegramClient + Clone + Send + Sync + 'static>(
     if app.state.chats_area.width < 4 || app.state.chats_area.height < 4 {
         return Err(color_eyre::eyre::eyre!(
             "smoke layout did not expose a clickable chat list"
+        ));
+    }
+
+    if app.state.selected_chat_id() != Some(3) || app.state.thread_topics.len() < 2 {
+        return Err(color_eyre::eyre::eyre!(
+            "mouse smoke did not start with mock topic tabs available"
+        ));
+    }
+    let topic_click_column = (0..app.state.thread_topics_area.width.saturating_sub(2) as usize)
+        .find(|column| app.state.thread_topic_index_at_visible_column(*column) == Some(1))
+        .ok_or_else(|| color_eyre::eyre::eyre!("second topic tab was not clickable"))?;
+    let topic_click = smoke_click(
+        app.state.thread_topics_area.x + 1 + topic_click_column as u16,
+        app.state.thread_topics_area.y + 1,
+    );
+    handle_mouse_event(app, topic_click, client).await?;
+    if app.state.selected_thread_topic_index != 1
+        || app.state.messages.is_empty()
+        || !app
+            .state
+            .messages
+            .iter()
+            .all(|message| message.chat_id == 3 && message.thread_topic_id == Some(102))
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "mouse topic tab click did not load the clicked mock topic history"
         ));
     }
 
@@ -1422,7 +1513,7 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
             apply_initial_state_load_result(app, load_result, &mark_read_loader);
             initial_state_pending = false;
             for update in deferred_updates.drain(..) {
-                app.state.apply_update(update);
+                apply_update_with_read_ack(app, update, &mark_read_loader);
             }
         }
         if let Some(rx) = update_rx.as_mut() {
@@ -1430,7 +1521,7 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
                 if initial_state_pending {
                     deferred_updates.push(update);
                 } else {
-                    app.state.apply_update(update);
+                    apply_update_with_read_ack(app, update, &mark_read_loader);
                 }
             }
         }
@@ -1530,15 +1621,22 @@ struct InitialStateLoadResult {
     result: std::result::Result<actions::InitialStateLoad, String>,
 }
 
+struct ChatMessageLoad {
+    messages: Vec<Message>,
+    thread_topics: Option<Vec<ThreadTopic>>,
+}
+
 struct ChatMessageLoadResult {
     request_id: u64,
     chat_id: i64,
-    result: std::result::Result<Vec<Message>, String>,
+    topic_id: Option<i32>,
+    result: std::result::Result<ChatMessageLoad, String>,
 }
 
 struct OlderMessageLoadResult {
     request_id: u64,
     chat_id: i64,
+    topic_id: Option<i32>,
     before_message_id: i32,
     navigation: OlderMessageNavigation,
     result: std::result::Result<Vec<Message>, String>,
@@ -1704,6 +1802,17 @@ where
             actions::mark_chat_read_best_effort(&client, chat_id).await;
         });
     }
+
+    fn spawn_mark_thread_read(&self, chat_id: i64, topic_id: i32, max_message_id: i32) {
+        let client = self.client.clone();
+        diagnostics::event(
+            "mark_thread_read_spawn",
+            format!("chat_id={chat_id} topic_id={topic_id} max_message_id={max_message_id}"),
+        );
+        tokio::spawn(async move {
+            actions::mark_thread_read_best_effort(&client, chat_id, topic_id, max_message_id).await;
+        });
+    }
 }
 
 impl<C> ChatMessageLoader<C>
@@ -1739,10 +1848,53 @@ where
             format!("request_id={request_id} chat_id={chat_id}"),
         );
         self.current_handle = Some(tokio::spawn(async move {
-            let result = actions::fetch_latest_chat_messages(&client, chat_id).await;
+            let result = match actions::fetch_latest_chat_messages(&client, chat_id).await {
+                Ok(messages) => {
+                    let thread_topics = actions::fetch_chat_thread_topics(&client, chat_id)
+                        .await
+                        .unwrap_or_default();
+                    Ok(ChatMessageLoad {
+                        messages,
+                        thread_topics: Some(thread_topics),
+                    })
+                }
+                Err(error) => Err(error),
+            };
             let _ = tx.send(ChatMessageLoadResult {
                 request_id,
                 chat_id,
+                topic_id: None,
+                result,
+            });
+        }));
+    }
+
+    fn spawn_thread_topic_messages(&mut self, chat_id: i64, topic_id: i32) {
+        abort_running_task(
+            &mut self.current_handle,
+            "messages_load_abort",
+            self.latest_request_id,
+        );
+
+        self.latest_request_id = self.latest_request_id.saturating_add(1);
+        let request_id = self.latest_request_id;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        diagnostics::event(
+            "thread_messages_load_spawn",
+            format!("request_id={request_id} chat_id={chat_id} topic_id={topic_id}"),
+        );
+        self.current_handle = Some(tokio::spawn(async move {
+            let result = actions::fetch_thread_topic_messages(&client, chat_id, topic_id)
+                .await
+                .map(|messages| ChatMessageLoad {
+                    messages,
+                    thread_topics: None,
+                });
+            let _ = tx.send(ChatMessageLoadResult {
+                request_id,
+                chat_id,
+                topic_id: Some(topic_id),
                 result,
             });
         }));
@@ -1776,6 +1928,7 @@ where
     fn spawn_older_messages(
         &mut self,
         chat_id: i64,
+        topic_id: Option<i32>,
         before_message_id: i32,
         navigation: OlderMessageNavigation,
     ) {
@@ -1792,15 +1945,25 @@ where
         diagnostics::event(
             "older_messages_load_spawn",
             format!(
-                "request_id={request_id} chat_id={chat_id} before_message_id={before_message_id}"
+                "request_id={request_id} chat_id={chat_id} topic_id={topic_id:?} before_message_id={before_message_id}"
             ),
         );
         self.current_handle = Some(tokio::spawn(async move {
-            let result =
-                actions::fetch_older_chat_messages(&client, chat_id, before_message_id).await;
+            let result = if let Some(topic_id) = topic_id {
+                actions::fetch_older_thread_topic_messages(
+                    &client,
+                    chat_id,
+                    topic_id,
+                    before_message_id,
+                )
+                .await
+            } else {
+                actions::fetch_older_chat_messages(&client, chat_id, before_message_id).await
+            };
             let _ = tx.send(OlderMessageLoadResult {
                 request_id,
                 chat_id,
+                topic_id,
                 before_message_id,
                 navigation,
                 result,
@@ -1857,8 +2020,13 @@ where
             format!("temp_id={} chat_id={}", pending.temp_id, pending.chat_id),
         );
         tokio::spawn(async move {
-            let result =
-                actions::send_message_result(&client, pending.chat_id, pending.content).await;
+            let result = actions::send_message_result(
+                &client,
+                pending.chat_id,
+                pending.thread_top_message_id,
+                pending.content,
+            )
+            .await;
             let _ = tx.send(SendMessageResult {
                 temp_id: pending.temp_id,
                 chat_id: pending.chat_id,
@@ -1932,15 +2100,28 @@ where
         Self { client, tx }
     }
 
-    fn spawn_reply_message(&self, chat_id: i64, message_id: i32, content: String) {
+    fn spawn_reply_message(
+        &self,
+        chat_id: i64,
+        thread_top_message_id: Option<i32>,
+        message_id: i32,
+        content: String,
+    ) {
         let client = self.client.clone();
         let tx = self.tx.clone();
         diagnostics::event(
             "reply_message_spawn",
-            format!("chat_id={chat_id} message_id={message_id}"),
+            format!("chat_id={chat_id} topic_id={thread_top_message_id:?} message_id={message_id}"),
         );
         tokio::spawn(async move {
-            let result = actions::reply_message_result(&client, chat_id, message_id, content).await;
+            let result = actions::reply_message_result(
+                &client,
+                chat_id,
+                thread_top_message_id,
+                message_id,
+                content,
+            )
+            .await;
             let _ = tx.send(ReplyMessageResult {
                 chat_id,
                 message_id,
@@ -2144,6 +2325,34 @@ fn apply_reply_message_result(app: &mut App, load: ReplyMessageResult) {
     actions::apply_reply_message_result(&mut app.state, load.result);
 }
 
+fn incoming_update_thread_read_ack(app: &App, update: &Update) -> Option<(i64, i32, i32)> {
+    let Update::NewMessage(message) = update else {
+        return None;
+    };
+    if message.is_own {
+        return None;
+    }
+
+    let chat_id = app.state.selected_chat_id()?;
+    let topic_id = app.state.selected_thread_topic()?.id;
+    (message.chat_id == chat_id && message.thread_topic_id == Some(topic_id))
+        .then_some((chat_id, topic_id, message.id))
+}
+
+fn apply_update_with_read_ack<C>(
+    app: &mut App,
+    update: Update,
+    mark_read_loader: &MarkChatReadLoader<C>,
+) where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    let thread_read_ack = incoming_update_thread_read_ack(app, &update);
+    app.state.apply_update(update);
+    if let Some((chat_id, topic_id, max_message_id)) = thread_read_ack {
+        mark_read_loader.spawn_mark_thread_read(chat_id, topic_id, max_message_id);
+    }
+}
+
 fn apply_chat_message_load_result<C>(
     app: &mut App,
     latest_request_id: u64,
@@ -2176,12 +2385,40 @@ fn apply_chat_message_load_result<C>(
         return;
     }
 
+    let selected_topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
+    if selected_topic_id != load.topic_id {
+        diagnostics::event(
+            "messages_load_ignored",
+            format!(
+                "reason=stale_topic request_id={} chat_id={} topic_id={:?} selected_topic_id={:?}",
+                load.request_id, load.chat_id, load.topic_id, selected_topic_id
+            ),
+        );
+        return;
+    }
+
+    let chat_id = load.chat_id;
+    let topic_id = load.topic_id;
     match load.result {
-        Ok(messages) => {
-            let should_mark_read = selected_chat_needs_read_ack(app, load.chat_id, &messages);
-            app.state.apply_loaded_selected_chat_messages(messages);
-            if should_mark_read {
-                mark_read_loader.spawn_mark_chat_read(load.chat_id);
+        Ok(load) => {
+            let thread_read_ack = topic_id.and_then(|topic_id| {
+                load.messages
+                    .iter()
+                    .map(|message| message.id)
+                    .max()
+                    .map(|max_message_id| (topic_id, max_message_id))
+            });
+            let should_mark_chat_read =
+                topic_id.is_none() && selected_chat_needs_read_ack(app, chat_id, &load.messages);
+            app.state.apply_loaded_selected_chat_messages(load.messages);
+            if let Some(thread_topics) = load.thread_topics {
+                app.state
+                    .apply_loaded_selected_chat_thread_topics(thread_topics);
+            }
+            if let Some((topic_id, max_message_id)) = thread_read_ack {
+                mark_read_loader.spawn_mark_thread_read(chat_id, topic_id, max_message_id);
+            } else if should_mark_chat_read {
+                mark_read_loader.spawn_mark_chat_read(chat_id);
             }
             app.state.clear_status();
         }
@@ -2259,6 +2496,18 @@ fn apply_older_message_load_result(
                 load.request_id,
                 load.chat_id,
                 app.state.selected_chat_id()
+            ),
+        );
+        return;
+    }
+
+    let selected_topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
+    if selected_topic_id != load.topic_id {
+        diagnostics::event(
+            "older_messages_load_ignored",
+            format!(
+                "reason=stale_topic request_id={} chat_id={} topic_id={:?} selected_topic_id={:?}",
+                load.request_id, load.chat_id, load.topic_id, selected_topic_id
             ),
         );
         return;
@@ -2577,10 +2826,10 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
     if let Some(navigation) = older_message_key_navigation(app, key) {
         progress.show(app, LOADING_OLDER_MESSAGES_STATUS)?;
         if let Some(loader) = loaders.older_message {
-            if let Some((chat_id, before_message_id)) =
+            if let Some((chat_id, topic_id, before_message_id)) =
                 actions::selected_older_messages_request(&mut app.state)
             {
-                loader.spawn_older_messages(chat_id, before_message_id, navigation);
+                loader.spawn_older_messages(chat_id, topic_id, before_message_id, navigation);
             }
         } else {
             let loaded = actions::load_older_selected_chat_messages(&mut app.state, client).await?;
@@ -2594,6 +2843,16 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
 
     match message_keys::handle_message_key(&mut app.state, key) {
         message_keys::MessageKeyOutcome::Handled => return Ok(()),
+        message_keys::MessageKeyOutcome::OpenSelectedThreadTopic => {
+            open_selected_thread_topic_with_optional_async_loader(
+                app,
+                client,
+                progress,
+                &mut loaders.chat_message,
+            )
+            .await?;
+            return Ok(());
+        }
         message_keys::MessageKeyOutcome::OpenSelectedLink => {
             open_selected_message_link(app);
             return Ok(());
@@ -2758,6 +3017,35 @@ async fn open_folder_at_with_optional_async_loader<
     result
 }
 
+async fn open_selected_thread_topic_with_optional_async_loader<
+    C: TelegramClient + Clone + Send + Sync + 'static,
+>(
+    app: &mut App,
+    client: &mut C,
+    progress: &mut UiProgress<'_>,
+    chat_message_loader: &mut Option<&mut ChatMessageLoader<C>>,
+) -> Result<()> {
+    let Some((chat_id, topic_id)) = app
+        .state
+        .selected_chat_id()
+        .zip(app.state.selected_thread_topic().map(|topic| topic.id))
+    else {
+        return Ok(());
+    };
+
+    progress.show(app, LOADING_CHAT_MESSAGES_STATUS)?;
+    if let Some(loader) = chat_message_loader.as_deref_mut() {
+        loader.spawn_thread_topic_messages(chat_id, topic_id);
+        return Ok(());
+    }
+
+    let result = actions::load_selected_thread_topic_messages(&mut app.state, client).await;
+    if result.is_ok() {
+        app.state.clear_status();
+    }
+    result
+}
+
 async fn open_chat_at_with_optional_async_loader<
     C: TelegramClient + Clone + Send + Sync + 'static,
 >(
@@ -2796,14 +3084,38 @@ async fn handle_input_focused<C: TelegramClient + Clone + Send + Sync + 'static>
     edit_message_loader: Option<&EditMessageLoader<C>>,
     reply_message_loader: Option<&ReplyMessageLoader<C>>,
 ) -> Result<()> {
-    if input_keys::handle_input_key(&mut app.state, key) == input_keys::InputKeyOutcome::Submit {
+    let input_before = app.state.input_buffer.clone();
+    let outcome = input_keys::handle_input_key(&mut app.state, key);
+    if outcome != input_keys::InputKeyOutcome::Submit
+        && input_before != app.state.input_buffer
+        && app.state.input_has_submit_text()
+    {
+        if let Some(chat_id) = app.state.selected_chat_id() {
+            let topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
+            let client = client.clone();
+            tokio::spawn(async move {
+                actions::send_typing_action_best_effort(&client, chat_id, topic_id).await;
+            });
+        }
+    }
+
+    if outcome == input_keys::InputKeyOutcome::Submit {
         let Some(action) = app.state.prepare_message_submit() else {
             return Ok(());
         };
 
         match action {
-            state::MessageSubmitAction::Send { chat_id, content } => {
-                let pending = actions::begin_send_message(&mut app.state, chat_id, content);
+            state::MessageSubmitAction::Send {
+                chat_id,
+                thread_top_message_id,
+                content,
+            } => {
+                let pending = actions::begin_send_message(
+                    &mut app.state,
+                    chat_id,
+                    thread_top_message_id,
+                    content,
+                );
                 progress.show(app, SENDING_MESSAGE_STATUS)?;
                 if let Some(loader) = send_message_loader {
                     loader.spawn_send_message(pending);
@@ -2834,18 +3146,20 @@ async fn handle_input_focused<C: TelegramClient + Clone + Send + Sync + 'static>
             }
             state::MessageSubmitAction::Reply {
                 chat_id,
+                thread_top_message_id,
                 message_id,
                 content,
             } => {
                 progress.show(app, SENDING_REPLY_STATUS)?;
                 if let Some(loader) = reply_message_loader {
-                    loader.spawn_reply_message(chat_id, message_id, content);
+                    loader.spawn_reply_message(chat_id, thread_top_message_id, message_id, content);
                 } else {
                     actions::execute_message_submit_action(
                         &mut app.state,
                         client,
                         state::MessageSubmitAction::Reply {
                             chat_id,
+                            thread_top_message_id,
                             message_id,
                             content,
                         },
@@ -2931,6 +3245,22 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
             )
             .await?;
         }
+        mouse_events::MouseClickOutcome::OpenThreadTopicAt(index) => {
+            diagnostics::event(
+                "mouse_action",
+                format!(
+                    "action=open_thread_topic_at index={index} column={} row={}",
+                    mouse_event.column, mouse_event.row
+                ),
+            );
+            open_selected_thread_topic_with_optional_async_loader(
+                app,
+                client,
+                progress,
+                &mut chat_message_loader,
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -2941,7 +3271,7 @@ mod tests {
     use super::{
         APP_COMMAND, CHECK_AUTH_OK_PREFIX, CHECK_CONFIG_AUTH_CONFLICT,
         CHECK_CONFIG_SESSION_EXISTS_STATUS, CHECK_CONFIG_SESSION_WILL_CREATE_STATUS,
-        CLI_USAGE_EXIT_CODE, CONFIG_LOAD_HELP, CONFIG_PATH_ARGUMENT_REQUIRED,
+        CLI_USAGE_EXIT_CODE, CONFIG_LOAD_HELP, CONFIG_PATH_ARGUMENT_REQUIRED, ChatMessageLoad,
         ChatMessageLoadResult, ChatMessageLoader, DeleteMessageLoader, DeleteMessageResult,
         EditMessageLoader, EditMessageResult, FolderChatLoadResult, FolderChatLoader,
         InitialStateLoadResult, InitialStateLoader, LOADING_CHAT_MESSAGES_STATUS,
@@ -2958,10 +3288,10 @@ mod tests {
         abort_running_task, apply_chat_message_load_result, apply_delete_message_result,
         apply_edit_message_result, apply_folder_chat_load_result, apply_initial_state_load_result,
         apply_older_message_load_result, apply_reply_message_result, apply_send_message_result,
-        apply_subscribe_updates_result, check_auth_ok_message, check_auth_unauthorized_message,
-        check_config_message, check_config_session_status, default_config_path_string,
-        ensure_session_parent_dir, handle_mouse_event, load_checked_config,
-        load_checked_config_with_session_parent, login_2fa_hint_message,
+        apply_subscribe_updates_result, apply_update_with_read_ack, check_auth_ok_message,
+        check_auth_unauthorized_message, check_config_message, check_config_session_status,
+        default_config_path_string, ensure_session_parent_dir, handle_mouse_event,
+        load_checked_config, load_checked_config_with_session_parent, login_2fa_hint_message,
         login_2fa_signed_in_message, login_code_sent_message, login_failed_message,
         login_signed_in_message, message_submit_action_status, older_message_key_navigation,
         open_chat_at_with_optional_async_loader, parse_args_from,
@@ -2973,7 +3303,7 @@ mod tests {
     use crate::state::{DeleteConfirmation, FocusedPanel};
     use crate::telegram::{
         MockTelegramClient, TelegramClient,
-        types::{Chat, Folder, Message, MessageStatus, Update, all_folder},
+        types::{Chat, Folder, Message, MessageStatus, ThreadTopic, Update, all_folder},
     };
     use chrono::Utc;
     use color_eyre::Result;
@@ -3040,6 +3370,7 @@ mod tests {
         Message {
             id,
             chat_id: 10,
+            thread_topic_id: None,
             sender_name: "Alice".to_string(),
             content: format!("message {id}"),
             timestamp: Utc::now(),
@@ -3063,6 +3394,7 @@ mod tests {
     #[derive(Clone)]
     struct RecordingMarkReadClient {
         marked_chat_ids: Arc<Mutex<Vec<i64>>>,
+        marked_threads: Arc<Mutex<Vec<(i64, i32, i32)>>>,
     }
 
     impl TelegramClient for SlowFirstLatestMessagesClient {
@@ -3223,6 +3555,19 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_thread_read(
+            &self,
+            chat_id: i64,
+            topic_id: i32,
+            max_message_id: i32,
+        ) -> Result<()> {
+            self.marked_threads
+                .lock()
+                .expect("marked threads lock should not be poisoned")
+                .push((chat_id, topic_id, max_message_id));
+            Ok(())
+        }
+
         async fn send_message(&self, _chat_id: i64, _content: String) -> Result<Message> {
             panic!("recording mark-read client should not send messages")
         }
@@ -3340,8 +3685,10 @@ mod tests {
     #[tokio::test]
     async fn accepted_chat_message_load_marks_read_only_when_unread() {
         let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
         let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
             marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads: marked_threads.clone(),
         });
         let mut app = App::new();
         app.state.chats = vec![chat(1)];
@@ -3354,7 +3701,11 @@ mod tests {
             ChatMessageLoadResult {
                 request_id: 1,
                 chat_id: 1,
-                result: Ok(vec![read_message]),
+                topic_id: None,
+                result: Ok(ChatMessageLoad {
+                    messages: vec![read_message],
+                    thread_topics: Some(Vec::new()),
+                }),
             },
             &mark_read_loader,
         );
@@ -3375,7 +3726,11 @@ mod tests {
             ChatMessageLoadResult {
                 request_id: 2,
                 chat_id: 1,
-                result: Ok(vec![unread_message]),
+                topic_id: None,
+                result: Ok(ChatMessageLoad {
+                    messages: vec![unread_message],
+                    thread_topics: Some(Vec::new()),
+                }),
             },
             &mark_read_loader,
         );
@@ -3386,6 +3741,164 @@ mod tests {
                 .expect("marked chat ids lock should not be poisoned")
                 .as_slice(),
             &[1]
+        );
+        assert!(
+            marked_threads
+                .lock()
+                .expect("marked threads lock should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_thread_topic_message_load_marks_only_thread_read() {
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
+            marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads: marked_threads.clone(),
+        });
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        app.state.chats[0].unread_count = 5;
+        app.state
+            .apply_loaded_selected_chat_thread_topics(vec![ThreadTopic {
+                id: 102,
+                title: "Deployments".to_string(),
+                top_message_id: 102,
+                unread_count: 2,
+                is_closed: false,
+                is_pinned: false,
+            }]);
+
+        let mut first_message = message(11);
+        first_message.chat_id = 1;
+        first_message.thread_topic_id = Some(102);
+        let mut latest_message = message(12);
+        latest_message.chat_id = 1;
+        latest_message.thread_topic_id = Some(102);
+        apply_chat_message_load_result(
+            &mut app,
+            3,
+            ChatMessageLoadResult {
+                request_id: 3,
+                chat_id: 1,
+                topic_id: Some(102),
+                result: Ok(ChatMessageLoad {
+                    messages: vec![first_message, latest_message],
+                    thread_topics: None,
+                }),
+            },
+            &mark_read_loader,
+        );
+        tokio::task::yield_now().await;
+
+        assert!(
+            marked_chat_ids
+                .lock()
+                .expect("marked chat ids lock should not be poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            marked_threads
+                .lock()
+                .expect("marked threads lock should not be poisoned")
+                .as_slice(),
+            &[(1, 102, 12)]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_incoming_selected_thread_message_marks_thread_read() {
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
+            marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads: marked_threads.clone(),
+        });
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        app.state
+            .apply_loaded_selected_chat_thread_topics(vec![ThreadTopic {
+                id: 102,
+                title: "Deployments".to_string(),
+                top_message_id: 102,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            }]);
+
+        let mut incoming = message(55);
+        incoming.chat_id = 1;
+        incoming.thread_topic_id = Some(102);
+        apply_update_with_read_ack(
+            &mut app,
+            Update::NewMessage(incoming.clone()),
+            &mark_read_loader,
+        );
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            app.state.messages.last().map(|message| message.id),
+            Some(55)
+        );
+        assert!(
+            marked_chat_ids
+                .lock()
+                .expect("marked chat ids lock should not be poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            marked_threads
+                .lock()
+                .expect("marked threads lock should not be poisoned")
+                .as_slice(),
+            &[(1, 102, 55)]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_incoming_other_thread_message_does_not_mark_selected_thread_read() {
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
+            marked_chat_ids,
+            marked_threads: marked_threads.clone(),
+        });
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        app.state.apply_loaded_selected_chat_thread_topics(vec![
+            ThreadTopic {
+                id: 101,
+                title: "General".to_string(),
+                top_message_id: 101,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            },
+            ThreadTopic {
+                id: 102,
+                title: "Deployments".to_string(),
+                top_message_id: 102,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            },
+        ]);
+        app.state.select_thread_topic_at(1);
+
+        let mut incoming = message(56);
+        incoming.chat_id = 1;
+        incoming.thread_topic_id = Some(101);
+        apply_update_with_read_ack(&mut app, Update::NewMessage(incoming), &mark_read_loader);
+        tokio::task::yield_now().await;
+
+        assert!(app.state.messages.is_empty());
+        assert!(
+            marked_threads
+                .lock()
+                .expect("marked threads lock should not be poisoned")
+                .is_empty()
         );
     }
 
@@ -3404,7 +3917,18 @@ mod tests {
             ChatMessageLoadResult {
                 request_id: 1,
                 chat_id: 2,
-                result: Ok(vec![stale_message]),
+                topic_id: None,
+                result: Ok(ChatMessageLoad {
+                    messages: vec![stale_message],
+                    thread_topics: Some(vec![ThreadTopic {
+                        id: 102,
+                        title: "Stale".to_string(),
+                        top_message_id: 102,
+                        unread_count: 0,
+                        is_closed: false,
+                        is_pinned: false,
+                    }]),
+                }),
             },
             &mark_read_loader,
         );
@@ -3418,12 +3942,84 @@ mod tests {
             ChatMessageLoadResult {
                 request_id: 2,
                 chat_id: 2,
-                result: Ok(vec![current_message]),
+                topic_id: None,
+                result: Ok(ChatMessageLoad {
+                    messages: vec![current_message],
+                    thread_topics: Some(vec![ThreadTopic {
+                        id: 101,
+                        title: "Current".to_string(),
+                        top_message_id: 101,
+                        unread_count: 1,
+                        is_closed: false,
+                        is_pinned: true,
+                    }]),
+                }),
             },
             &mark_read_loader,
         );
         assert_eq!(app.state.messages.len(), 1);
         assert_eq!(app.state.messages[0].id, 2);
+        assert_eq!(app.state.thread_topics.len(), 1);
+        assert_eq!(app.state.thread_topics[0].title, "Current");
+    }
+
+    #[tokio::test]
+    async fn stale_async_thread_topic_message_loads_are_ignored() {
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        app.state.apply_loaded_selected_chat_thread_topics(vec![
+            ThreadTopic {
+                id: 101,
+                title: "General".to_string(),
+                top_message_id: 101,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            },
+            ThreadTopic {
+                id: 102,
+                title: "Deployments".to_string(),
+                top_message_id: 102,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            },
+        ]);
+        app.state.select_thread_topic_at(1);
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
+            marked_chat_ids,
+            marked_threads: marked_threads.clone(),
+        });
+
+        let mut stale_topic_message = message(10);
+        stale_topic_message.chat_id = 1;
+        stale_topic_message.thread_topic_id = Some(101);
+        apply_chat_message_load_result(
+            &mut app,
+            7,
+            ChatMessageLoadResult {
+                request_id: 7,
+                chat_id: 1,
+                topic_id: Some(101),
+                result: Ok(ChatMessageLoad {
+                    messages: vec![stale_topic_message],
+                    thread_topics: None,
+                }),
+            },
+            &mark_read_loader,
+        );
+
+        tokio::task::yield_now().await;
+        assert!(app.state.messages.is_empty());
+        assert_eq!(app.state.selected_thread_topic().unwrap().id, 102);
+        assert!(
+            marked_threads
+                .lock()
+                .expect("marked threads lock should not be poisoned")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3472,6 +4068,7 @@ mod tests {
                     folders: vec![all_folder(0)],
                     chats: vec![chat(1)],
                     messages: Ok(vec![loaded_message]),
+                    thread_topics: Vec::new(),
                 }),
             },
             &mark_read_loader,
@@ -3510,15 +4107,40 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut loader = ChatMessageLoader::new(MockTelegramClient::new(), tx);
 
-        loader.spawn_latest_chat_messages(1);
+        loader.spawn_latest_chat_messages(3);
 
         let result = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
             .expect("background message load should respond")
             .expect("background message load channel should stay open");
         assert_eq!(result.request_id, 1);
-        assert_eq!(result.chat_id, 1);
-        assert_eq!(result.result.expect("mock load should succeed").len(), 3);
+        assert_eq!(result.chat_id, 3);
+        let load = result.result.expect("mock load should succeed");
+        assert_eq!(load.messages.len(), 3);
+        let thread_topics = load
+            .thread_topics
+            .expect("latest load should include topics");
+        assert_eq!(thread_topics.len(), 2);
+        assert_eq!(thread_topics[0].title, "General");
+    }
+
+    #[tokio::test]
+    async fn async_chat_message_loader_sends_thread_topic_messages_without_replacing_topics() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut loader = ChatMessageLoader::new(MockTelegramClient::new(), tx);
+
+        loader.spawn_thread_topic_messages(3, 102);
+
+        let result = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("background thread message load should respond")
+            .expect("background thread message channel should stay open");
+        assert_eq!(result.request_id, 1);
+        assert_eq!(result.chat_id, 3);
+        let load = result.result.expect("mock thread load should succeed");
+        assert_eq!(load.messages.len(), 1);
+        assert_eq!(load.messages[0].id, 102);
+        assert!(load.thread_topics.is_none());
     }
 
     #[tokio::test]
@@ -3568,7 +4190,14 @@ mod tests {
             .expect("background message load channel should stay open");
         assert_eq!(result.request_id, 2);
         assert_eq!(result.chat_id, 2);
-        assert_eq!(result.result.expect("newest load should succeed").len(), 1);
+        assert_eq!(
+            result
+                .result
+                .expect("newest load should succeed")
+                .messages
+                .len(),
+            1
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(80), rx.recv())
                 .await
@@ -3594,6 +4223,7 @@ mod tests {
             OlderMessageLoadResult {
                 request_id: 1,
                 chat_id: 2,
+                topic_id: None,
                 before_message_id: 10,
                 navigation: OlderMessageNavigation::OneLine,
                 result: Ok(vec![stale_older]),
@@ -3610,6 +4240,7 @@ mod tests {
             OlderMessageLoadResult {
                 request_id: 2,
                 chat_id: 2,
+                topic_id: None,
                 before_message_id: 10,
                 navigation: OlderMessageNavigation::OneLine,
                 result: Ok(vec![current_older]),
@@ -3625,7 +4256,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut loader = OlderMessageLoader::new(MockTelegramClient::new(), tx);
 
-        loader.spawn_older_messages(1, 3, OlderMessageNavigation::OneLine);
+        loader.spawn_older_messages(1, None, 3, OlderMessageNavigation::OneLine);
 
         let result = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
@@ -3642,12 +4273,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn async_older_message_loader_fetches_topic_history_when_topic_selected() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut loader = OlderMessageLoader::new(MockTelegramClient::new(), tx);
+
+        loader.spawn_older_messages(3, Some(101), 103, OlderMessageNavigation::OneLine);
+
+        let result = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("background older topic load should respond")
+            .expect("background older topic load channel should stay open");
+        assert_eq!(result.chat_id, 3);
+        assert_eq!(result.topic_id, Some(101));
+        assert_eq!(result.before_message_id, 103);
+        let messages = result.result.expect("mock older topic load should succeed");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, 101);
+    }
+
+    #[tokio::test]
     async fn async_older_message_loader_aborts_superseded_load() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut loader = OlderMessageLoader::new(SlowFirstOlderMessagesClient, tx);
 
-        loader.spawn_older_messages(1, 10, OlderMessageNavigation::OneLine);
-        loader.spawn_older_messages(1, 9, OlderMessageNavigation::Page);
+        loader.spawn_older_messages(1, None, 10, OlderMessageNavigation::OneLine);
+        loader.spawn_older_messages(1, None, 9, OlderMessageNavigation::Page);
 
         let result = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
@@ -3689,6 +4339,7 @@ mod tests {
                 result: Ok(crate::actions::FolderChatLoad {
                     chats: vec![chat(99)],
                     messages: Ok(Vec::new()),
+                    thread_topics: Vec::new(),
                 }),
             },
             &mark_read_loader,
@@ -3707,6 +4358,7 @@ mod tests {
                 result: Ok(crate::actions::FolderChatLoad {
                     chats: vec![chat(2)],
                     messages: Ok(vec![loaded_message]),
+                    thread_topics: Vec::new(),
                 }),
             },
             &mark_read_loader,
@@ -3745,7 +4397,8 @@ mod tests {
     fn async_send_message_result_replaces_pending_row() {
         let mut app = App::new();
         app.state.chats = vec![chat(1)];
-        let pending = crate::actions::begin_send_message(&mut app.state, 1, "hello".to_string());
+        let pending =
+            crate::actions::begin_send_message(&mut app.state, 1, None, "hello".to_string());
         let mut sent = message(10);
         sent.chat_id = 1;
         sent.content = "hello".to_string();
@@ -3771,6 +4424,7 @@ mod tests {
         let pending = crate::actions::PendingSend {
             temp_id: -1,
             chat_id: 1,
+            thread_top_message_id: None,
             content: "hello".to_string(),
         };
 
@@ -3856,7 +4510,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let loader = ReplyMessageLoader::new(MockTelegramClient::new(), tx);
 
-        loader.spawn_reply_message(1, 7, "reply".to_string());
+        loader.spawn_reply_message(1, None, 7, "reply".to_string());
 
         let result = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
@@ -3915,6 +4569,25 @@ mod tests {
         result.result.expect("mock delete should succeed");
     }
 
+    #[tokio::test]
+    async fn async_reply_message_loader_sends_thread_reply_when_topic_selected() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let loader = ReplyMessageLoader::new(MockTelegramClient::new(), tx);
+
+        loader.spawn_reply_message(3, Some(102), 7, "topic reply".to_string());
+
+        let result = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("background topic reply should respond")
+            .expect("background topic reply channel should stay open");
+        assert_eq!(result.chat_id, 3);
+        assert_eq!(result.message_id, 7);
+        let sent = result.result.expect("mock topic reply should succeed");
+        assert_eq!(sent.chat_id, 3);
+        assert_eq!(sent.content, "topic reply");
+        assert_eq!(sent.reply_to_content.as_deref(), Some("topic 102 reply 7"));
+    }
+
     #[test]
     fn message_submit_progress_statuses_are_shared_constants() {
         assert_eq!(
@@ -3928,6 +4601,7 @@ mod tests {
         assert_eq!(
             message_submit_action_status(&crate::state::MessageSubmitAction::Reply {
                 chat_id: 1,
+                thread_top_message_id: None,
                 message_id: 2,
                 content: "reply".to_string(),
             }),
@@ -3936,6 +4610,7 @@ mod tests {
         assert_eq!(
             message_submit_action_status(&crate::state::MessageSubmitAction::Send {
                 chat_id: 1,
+                thread_top_message_id: None,
                 content: "hello".to_string(),
             }),
             SENDING_MESSAGE_STATUS
@@ -3996,6 +4671,56 @@ mod tests {
         assert_eq!(app.state.messages.len(), 2);
         assert!(app.state.status_message.is_none());
         assert!(app.state.error_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn mouse_click_on_thread_topic_tab_loads_topic_messages() {
+        let mut app = App::new();
+        let mut client = MockTelegramClient::new();
+        app.state.chats = vec![Chat {
+            id: 3,
+            name: "Work Team".to_string(),
+            last_message: None,
+            unread_count: 0,
+            is_group: true,
+            folder_id: None,
+        }];
+        app.state.thread_topics_area = Rect::new(30, 5, 60, 3);
+        app.state.thread_topics = vec![
+            ThreadTopic {
+                id: 101,
+                title: "General".to_string(),
+                top_message_id: 1001,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            },
+            ThreadTopic {
+                id: 102,
+                title: "Deployments".to_string(),
+                top_message_id: 1002,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            },
+        ];
+        app.state.messages = vec![message(101)];
+
+        let topic_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 45,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse_event(&mut app, topic_click, &mut client)
+            .await
+            .expect("topic tab mouse click should load topic messages");
+
+        assert_eq!(app.state.focused_panel, FocusedPanel::Messages);
+        assert_eq!(app.state.selected_thread_topic_index, 1);
+        assert_eq!(app.state.messages.len(), 1);
+        assert_eq!(app.state.messages[0].id, 102);
+        assert!(app.state.messages[0].content.contains("Deployments topic"));
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-use super::{render_chats, render_folders, render_input, render_messages};
+use super::{render_chats, render_folders, render_input, render_messages, render_thread_topics};
 use crate::{
     app::App,
     config::Theme,
@@ -36,6 +36,7 @@ pub(crate) const HELP_BAR_HEIGHT: u16 = 1;
 pub(crate) const HIDE_HELP_CONTROL_LABEL: &str = "? hide help";
 pub(crate) const BANNER_HEIGHT: u16 = 3;
 pub(crate) const FOLDERS_PANEL_HEIGHT: u16 = 3;
+pub(crate) const THREAD_TOPICS_PANEL_HEIGHT: u16 = 3;
 pub(crate) const IMAGE_VIEWPORT_TITLE: &str = "Image preview";
 pub(crate) const IMAGE_VIEWPORT_MIN_WIDTH: u16 = 24;
 pub(crate) const IMAGE_VIEWPORT_MAX_WIDTH: u16 = 48;
@@ -84,16 +85,38 @@ pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
         ])
         .split(horizontal_chunks[0]);
 
-    let (messages_area, image_area) = message_and_image_areas(horizontal_chunks[1], app);
+    let right_chunks = if app.state.thread_topics.is_empty() {
+        None
+    } else {
+        Some(
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(THREAD_TOPICS_PANEL_HEIGHT),
+                    Constraint::Min(MAIN_CONTENT_MIN_HEIGHT),
+                ])
+                .split(horizontal_chunks[1]),
+        )
+    };
+    let message_viewport_area = right_chunks
+        .as_ref()
+        .map_or(horizontal_chunks[1], |chunks| chunks[1]);
+    let (messages_area, image_area) = message_and_image_areas(message_viewport_area, app);
 
     app.state.folders_area = left_chunks[0];
     app.state.chats_area = left_chunks[1];
     app.state.messages_area = messages_area;
+    app.state.thread_topics_area = right_chunks
+        .as_ref()
+        .map_or(Rect::default(), |chunks| chunks[0]);
     app.state.terminal_image_area = image_area;
     app.state.input_area = main_chunks[1];
 
     render_folders(frame, left_chunks[0], app, theme);
     render_chats(frame, left_chunks[1], app, theme);
+    if let Some(chunks) = right_chunks.as_ref() {
+        render_thread_topics(frame, chunks[0], app, theme);
+    }
     render_messages(frame, messages_area, app, theme);
     render_image_viewport(frame, image_area, theme);
     render_input(frame, main_chunks[1], app, theme);
@@ -381,6 +404,11 @@ fn selected_message_help_controls(state: &AppState, message: &Message) -> String
         };
     let mut controls = vec![movement_label];
 
+    if !state.thread_topics.is_empty() {
+        controls.push("Enter load topic");
+        controls.push("Left/Right topics");
+    }
+
     if message.is_own && message.can_edit {
         controls.push("e edit");
     }
@@ -459,7 +487,7 @@ mod tests {
         BANNER_HEIGHT, ERROR_BANNER_PREFIX, FOCUS_LABEL_PREFIX, FOLDERS_PANEL_HEIGHT,
         HELP_BAR_HEIGHT, HELP_SEPARATOR, IMAGE_VIEWPORT_MIN_WIDTH, IMAGE_VIEWPORT_TITLE,
         INPUT_PANEL_HEIGHT, LEGACY_HELP_SEPARATOR, MAIN_CONTENT_MIN_HEIGHT, STATUS_BANNER_PREFIX,
-        help_bar_controls,
+        THREAD_TOPICS_PANEL_HEIGHT, help_bar_controls,
     };
     use crate::app::App;
     use crate::state::{DeleteConfirmation, FocusedPanel};
@@ -493,6 +521,7 @@ mod tests {
         Message {
             id: -1,
             chat_id: 10,
+            thread_topic_id: None,
             sender_name: OWN_SENDER_NAME.to_string(),
             content: "failed draft".to_string(),
             timestamp: Utc::now(),
@@ -525,6 +554,7 @@ mod tests {
         assert_eq!(HELP_BAR_HEIGHT, 1);
         assert_eq!(BANNER_HEIGHT, 3);
         assert_eq!(FOLDERS_PANEL_HEIGHT, 3);
+        assert_eq!(THREAD_TOPICS_PANEL_HEIGHT, 3);
         assert_eq!(IMAGE_VIEWPORT_MIN_WIDTH, 24);
     }
 

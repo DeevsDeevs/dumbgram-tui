@@ -8,7 +8,7 @@ pub use chats::render_chats;
 pub use folders::render_folders;
 pub use input::render_input;
 pub use layout::render_layout;
-pub use messages::render_messages;
+pub use messages::{render_messages, render_thread_topics};
 
 pub(crate) const SELECTED_ROW_SYMBOL: &str = "▶ ";
 pub(crate) const LEGACY_SELECTED_ROW_SYMBOL: &str = ">>";
@@ -59,7 +59,7 @@ mod tests {
     };
     use crate::{
         app::App,
-        telegram::types::{Chat, Message, MessageStatus},
+        telegram::types::{Chat, Message, MessageStatus, ThreadTopic},
     };
     use chrono::Utc;
 
@@ -91,6 +91,7 @@ mod tests {
         app.state.messages = vec![Message {
             id: 10,
             chat_id: 1,
+            thread_topic_id: None,
             sender_name: "Alice".to_string(),
             content: "Hello".to_string(),
             timestamp: Utc::now(),
@@ -135,6 +136,59 @@ mod tests {
                 "rendered emoji-like glyph {emoji_like}"
             );
         }
+    }
+
+    #[test]
+    fn layout_renders_thread_topics_as_tabs_above_messages() {
+        let mut app = App::new();
+        app.state.chats = vec![Chat {
+            id: 3,
+            name: "Work Team".to_string(),
+            last_message: Some("Latest message".to_string()),
+            unread_count: 0,
+            is_group: true,
+            folder_id: None,
+        }];
+        app.state.thread_topics = vec![
+            ThreadTopic {
+                id: 101,
+                title: "General".to_string(),
+                top_message_id: 101,
+                unread_count: 1,
+                is_closed: false,
+                is_pinned: true,
+            },
+            ThreadTopic {
+                id: 102,
+                title: "Deployments".to_string(),
+                top_message_id: 102,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            },
+        ];
+        app.state.messages = vec![Message {
+            id: 10,
+            chat_id: 3,
+            thread_topic_id: None,
+            sender_name: "Alice".to_string(),
+            content: "Hello".to_string(),
+            timestamp: Utc::now(),
+            is_own: false,
+            is_edited: false,
+            reply_to_content: None,
+            media: None,
+            status: MessageStatus::Read,
+            can_edit: false,
+            can_delete: false,
+            error: None,
+        }];
+
+        let rendered = render_app_to_string_for_test(&mut app);
+
+        assert!(rendered.contains("Topics"));
+        assert!(rendered.contains("General (1)"));
+        assert!(rendered.contains("Deployments"));
     }
 
     #[test]

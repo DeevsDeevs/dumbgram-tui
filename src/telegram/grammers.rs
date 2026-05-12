@@ -1,10 +1,8 @@
 use chrono::{DateTime, Utc};
 use color_eyre::Result;
-#[cfg(test)]
-use grammers_client::types::ChatMap;
 use grammers_client::{
     Client, Config, InitParams, InputMessage, grammers_tl_types as tl,
-    types::{Downloadable, photo_sizes::PhotoSize},
+    types::{ChatMap, Downloadable, photo_sizes::PhotoSize},
 };
 use grammers_session::Session;
 use std::collections::{HashMap, HashSet};
@@ -15,7 +13,7 @@ use tokio::sync::mpsc;
 use super::client::{DownloadedMedia, TelegramClient};
 use super::types::{
     Chat, Folder, Message, MessageMedia, MessageMediaKind, MessageStatus, OWN_SENDER_NAME,
-    UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update, all_folder,
+    ThreadTopic, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update, all_folder,
     message_display_preview,
 };
 use crate::diagnostics;
@@ -25,6 +23,7 @@ const CHAT_CACHE_LOCK_FAILED: &str = "Chat cache lock failed";
 const UPDATE_ERROR_PREFIX: &str = "Update error";
 
 type ChatCache = HashMap<i64, grammers_client::types::Chat>;
+type UserNameCache = HashMap<i64, String>;
 type DialogFilterCache = HashMap<i32, tl::enums::DialogFilter>;
 type OutboxReadMaxIdCache = HashMap<i64, i32>;
 
@@ -32,6 +31,7 @@ type OutboxReadMaxIdCache = HashMap<i64, i32>;
 pub struct GrammersClient {
     client: Client,
     chat_cache: Arc<Mutex<ChatCache>>,
+    user_name_cache: Arc<Mutex<UserNameCache>>,
     dialog_filter_cache: Arc<Mutex<DialogFilterCache>>,
     outbox_read_max_id_cache: Arc<Mutex<OutboxReadMaxIdCache>>,
     session_path: String,
@@ -53,6 +53,7 @@ impl GrammersClient {
         Ok(Self {
             client,
             chat_cache: Arc::new(Mutex::new(HashMap::new())),
+            user_name_cache: Arc::new(Mutex::new(HashMap::new())),
             dialog_filter_cache: Arc::new(Mutex::new(HashMap::new())),
             outbox_read_max_id_cache: Arc::new(Mutex::new(HashMap::new())),
             session_path: session_path.to_string(),
@@ -85,6 +86,7 @@ impl GrammersClient {
     }
 
     fn cache_chat(&self, chat: grammers_client::types::Chat) -> Result<()> {
+        cache_user_name_from_chat(&self.user_name_cache, &chat);
         self.chat_cache()?.insert(chat.id(), chat);
         Ok(())
     }
@@ -195,6 +197,97 @@ fn read_outbox_update_from_raw(update: &tl::enums::Update) -> Option<Update> {
     }
 }
 
+fn cached_user_name(cache: &Arc<Mutex<UserNameCache>>, user_id: i64) -> Option<String> {
+    cache.lock().ok()?.get(&user_id).cloned()
+}
+
+fn cache_user_name_from_chat(
+    cache: &Arc<Mutex<UserNameCache>>,
+    chat: &grammers_client::types::Chat,
+) {
+    let grammers_client::types::Chat::User(_) = chat else {
+        return;
+    };
+    let name = chat.name().trim();
+    if name.is_empty() {
+        return;
+    }
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(chat.id(), name.to_string());
+    }
+}
+
+fn cache_sender_name_from_message(
+    cache: &Arc<Mutex<UserNameCache>>,
+    message: &grammers_client::types::Message,
+) {
+    if let Some(sender) = message.sender() {
+        cache_user_name_from_chat(cache, &sender);
+    }
+}
+
+fn typing_user_label(peer: &tl::enums::Peer, user_name: Option<String>) -> String {
+    match peer {
+        tl::enums::Peer::User(peer) => {
+            user_name.unwrap_or_else(|| format!("User {}", peer.user_id))
+        }
+        tl::enums::Peer::Chat(peer) => format!("Chat {}", peer.chat_id),
+        tl::enums::Peer::Channel(peer) => format!("Channel {}", peer.channel_id),
+    }
+}
+
+fn send_action_is_typing(action: &tl::enums::SendMessageAction) -> bool {
+    !matches!(
+        action,
+        tl::enums::SendMessageAction::SendMessageCancelAction
+    )
+}
+
+fn typing_status_update_from_raw_with_user_names(
+    update: &tl::enums::Update,
+    user_name_for_id: impl Fn(i64) -> Option<String>,
+) -> Option<Update> {
+    match update {
+        tl::enums::Update::ChannelUserTyping(update) => {
+            let user_name = match &update.from_id {
+                tl::enums::Peer::User(peer) => user_name_for_id(peer.user_id),
+                _ => None,
+            };
+            Some(Update::TypingStatus {
+                chat_id: update.channel_id,
+                topic_id: update.top_msg_id,
+                user_name: typing_user_label(&update.from_id, user_name),
+                is_typing: send_action_is_typing(&update.action),
+            })
+        }
+        tl::enums::Update::ChatUserTyping(update) => {
+            let user_name = match &update.from_id {
+                tl::enums::Peer::User(peer) => user_name_for_id(peer.user_id),
+                _ => None,
+            };
+            Some(Update::TypingStatus {
+                chat_id: update.chat_id,
+                topic_id: None,
+                user_name: typing_user_label(&update.from_id, user_name),
+                is_typing: send_action_is_typing(&update.action),
+            })
+        }
+        tl::enums::Update::UserTyping(update) => Some(Update::TypingStatus {
+            chat_id: update.user_id,
+            topic_id: None,
+            user_name: user_name_for_id(update.user_id)
+                .unwrap_or_else(|| format!("User {}", update.user_id)),
+            is_typing: send_action_is_typing(&update.action),
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn typing_status_update_from_raw(update: &tl::enums::Update) -> Option<Update> {
+    typing_status_update_from_raw_with_user_names(update, |_| None)
+}
+
 fn non_empty_text(value: Option<String>) -> Option<String> {
     value.filter(|text| !text.trim().is_empty())
 }
@@ -244,6 +337,41 @@ fn message_sender_name(
     }
 }
 
+fn grammers_chat_is_forum(chat: &grammers_client::types::Chat) -> bool {
+    match chat {
+        grammers_client::types::Chat::Group(group) => match &group.raw {
+            tl::enums::Chat::Channel(channel) => channel.forum,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn thread_topic_from_tl(topic: tl::enums::ForumTopic) -> Option<ThreadTopic> {
+    match topic {
+        tl::enums::ForumTopic::Topic(topic) => Some(ThreadTopic {
+            id: topic.id,
+            title: topic.title,
+            top_message_id: topic.top_message,
+            unread_count: topic.unread_count.max(0) as usize,
+            is_closed: topic.closed,
+            is_pinned: topic.pinned,
+        }),
+        tl::enums::ForumTopic::Deleted(_) => None,
+    }
+}
+
+fn message_thread_topic_id(reply_to: Option<&tl::enums::MessageReplyHeader>) -> Option<i32> {
+    match reply_to {
+        Some(tl::enums::MessageReplyHeader::Header(header))
+            if header.forum_topic || header.reply_to_top_id.is_some() =>
+        {
+            header.reply_to_top_id.or(header.reply_to_msg_id)
+        }
+        _ => None,
+    }
+}
+
 fn convert_message(
     msg: grammers_client::types::Message,
     outbox_read_max_id: Option<i32>,
@@ -251,9 +379,11 @@ fn convert_message(
     let is_outgoing = msg.outgoing();
     let chat = msg.chat();
     let media = message_media(msg.media().as_ref());
+    let thread_topic_id = message_thread_topic_id(msg.raw.reply_to.as_ref());
     Message {
         id: msg.id(),
         chat_id: chat.id(),
+        thread_topic_id,
         sender_name: message_sender_name(
             is_outgoing,
             msg.sender().map(|s| s.name().to_string()),
@@ -483,10 +613,12 @@ async fn convert_message_with_media_preview(
         media.as_ref(),
     )
     .await;
+    let thread_topic_id = message_thread_topic_id(msg.raw.reply_to.as_ref());
 
     Message {
         id: msg.id(),
         chat_id: chat.id(),
+        thread_topic_id,
         sender_name: message_sender_name(
             is_outgoing,
             msg.sender().map(|s| s.name().to_string()),
@@ -769,6 +901,7 @@ fn folders_from_dialog_filters(
 async fn collect_message_page(
     client: &Client,
     media_cache_dir: &Path,
+    user_name_cache: &Arc<Mutex<UserNameCache>>,
     mut iter: grammers_client::client::messages::MessageIter,
     chat_id: i64,
     outbox_read_max_id: Option<i32>,
@@ -778,6 +911,7 @@ async fn collect_message_page(
     let mut messages = Vec::new();
 
     while let Some(msg) = iter.next().await? {
+        cache_sender_name_from_message(user_name_cache, &msg);
         messages.push(
             convert_message_with_media_preview(client, media_cache_dir, msg, outbox_read_max_id)
                 .await,
@@ -800,9 +934,241 @@ async fn collect_message_page(
     Ok(messages)
 }
 
+fn messages_response_parts(
+    response: tl::enums::messages::Messages,
+) -> (
+    Vec<tl::enums::Message>,
+    Vec<tl::enums::Chat>,
+    Vec<tl::enums::User>,
+) {
+    match response {
+        tl::enums::messages::Messages::Messages(messages) => {
+            (messages.messages, messages.chats, messages.users)
+        }
+        tl::enums::messages::Messages::Slice(messages) => {
+            (messages.messages, messages.chats, messages.users)
+        }
+        tl::enums::messages::Messages::ChannelMessages(messages) => {
+            (messages.messages, messages.chats, messages.users)
+        }
+        tl::enums::messages::Messages::NotModified(_) => (Vec::new(), Vec::new(), Vec::new()),
+    }
+}
+
+fn topic_send_random_id() -> i64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as i64);
+    nanos ^ i64::from(std::process::id())
+}
+
+fn sent_message_id_from_updates(updates: &tl::enums::Updates, random_id: i64) -> Option<i32> {
+    fn from_update(update: &tl::enums::Update, random_id: i64) -> Option<i32> {
+        match update {
+            tl::enums::Update::MessageId(update) if update.random_id == random_id => {
+                Some(update.id)
+            }
+            tl::enums::Update::NewMessage(update) => raw_message_id(&update.message),
+            tl::enums::Update::NewChannelMessage(update) => raw_message_id(&update.message),
+            tl::enums::Update::NewScheduledMessage(update) => raw_message_id(&update.message),
+            _ => None,
+        }
+    }
+
+    match updates {
+        tl::enums::Updates::UpdateShortSentMessage(update) => Some(update.id),
+        tl::enums::Updates::Updates(updates) => updates
+            .updates
+            .iter()
+            .find_map(|update| from_update(update, random_id)),
+        tl::enums::Updates::Combined(updates) => updates
+            .updates
+            .iter()
+            .find_map(|update| from_update(update, random_id)),
+        _ => None,
+    }
+}
+
+fn raw_message_id(message: &tl::enums::Message) -> Option<i32> {
+    match message {
+        tl::enums::Message::Message(message) => Some(message.id),
+        tl::enums::Message::Service(message) => Some(message.id),
+        tl::enums::Message::Empty(_) => None,
+    }
+}
+
+async fn collect_raw_message_page(
+    client: &Client,
+    media_cache_dir: &Path,
+    user_name_cache: &Arc<Mutex<UserNameCache>>,
+    response: tl::enums::messages::Messages,
+    chat_id: i64,
+    outbox_read_max_id: Option<i32>,
+    limit: usize,
+    direction: &str,
+) -> Vec<Message> {
+    let (raw_messages, chats, users) = messages_response_parts(response);
+    let chat_map = Arc::new(ChatMap::new(users, chats));
+    let mut messages = Vec::new();
+
+    for raw_message in raw_messages.into_iter().take(limit) {
+        if let Some(message) =
+            grammers_client::types::Message::from_raw(client, raw_message, &chat_map)
+        {
+            cache_sender_name_from_message(user_name_cache, &message);
+            messages.push(
+                convert_message_with_media_preview(
+                    client,
+                    media_cache_dir,
+                    message,
+                    outbox_read_max_id,
+                )
+                .await,
+            );
+        }
+    }
+
+    diagnostics::event(
+        "message_iter_progress",
+        format!(
+            "chat_id={chat_id} direction={direction} count={} limit={limit}",
+            messages.len()
+        ),
+    );
+    messages.reverse();
+    messages
+}
+
 impl TelegramClient for GrammersClient {
     async fn connect(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn get_thread_topics(
+        &self,
+        chat_id: i64,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<ThreadTopic>>> + Send + '_ {
+        async move {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+
+            let chat = self.cached_chat(chat_id)?;
+            if !grammers_chat_is_forum(&chat) {
+                return Ok(Vec::new());
+            }
+
+            let Some(channel) = chat.pack().try_to_input_channel() else {
+                return Ok(Vec::new());
+            };
+
+            let topics = self
+                .client
+                .invoke(&tl::functions::channels::GetForumTopics {
+                    channel,
+                    q: None,
+                    offset_date: 0,
+                    offset_id: 0,
+                    offset_topic: 0,
+                    limit: limit.min(i32::MAX as usize) as i32,
+                })
+                .await?;
+            let tl::enums::messages::ForumTopics::Topics(topics) = topics;
+            Ok(topics
+                .topics
+                .into_iter()
+                .filter_map(thread_topic_from_tl)
+                .collect())
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn get_thread_messages(
+        &self,
+        chat_id: i64,
+        topic_id: i32,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<Message>>> + Send + '_ {
+        async move {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+
+            let chat = self.cached_chat(chat_id)?;
+            let outbox_read_max_id = self.cached_outbox_read_max_id(chat_id)?;
+            let response = self
+                .client
+                .invoke(&tl::functions::messages::GetReplies {
+                    peer: chat.pack().to_input_peer(),
+                    msg_id: topic_id,
+                    offset_id: 0,
+                    offset_date: 0,
+                    add_offset: 0,
+                    limit: limit.min(i32::MAX as usize) as i32,
+                    max_id: 0,
+                    min_id: 0,
+                    hash: 0,
+                })
+                .await?;
+
+            Ok(collect_raw_message_page(
+                &self.client,
+                &self.media_cache_dir,
+                &self.user_name_cache,
+                response,
+                chat_id,
+                outbox_read_max_id,
+                limit,
+                "thread",
+            )
+            .await)
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn get_thread_messages_before(
+        &self,
+        chat_id: i64,
+        topic_id: i32,
+        before_message_id: i32,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<Message>>> + Send + '_ {
+        async move {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+
+            let chat = self.cached_chat(chat_id)?;
+            let outbox_read_max_id = self.cached_outbox_read_max_id(chat_id)?;
+            let response = self
+                .client
+                .invoke(&tl::functions::messages::GetReplies {
+                    peer: chat.pack().to_input_peer(),
+                    msg_id: topic_id,
+                    offset_id: before_message_id,
+                    offset_date: 0,
+                    add_offset: 0,
+                    limit: limit.min(i32::MAX as usize) as i32,
+                    max_id: 0,
+                    min_id: 0,
+                    hash: 0,
+                })
+                .await?;
+
+            Ok(collect_raw_message_page(
+                &self.client,
+                &self.media_cache_dir,
+                &self.user_name_cache,
+                response,
+                chat_id,
+                outbox_read_max_id,
+                limit,
+                "older_thread",
+            )
+            .await)
+        }
     }
 
     #[allow(clippy::manual_async_fn)]
@@ -852,6 +1218,59 @@ impl TelegramClient for GrammersClient {
     }
 
     #[allow(clippy::manual_async_fn)]
+    fn send_message_to_thread(
+        &self,
+        chat_id: i64,
+        topic_id: i32,
+        content: String,
+    ) -> impl std::future::Future<Output = Result<Message>> + Send + '_ {
+        async move {
+            let chat = self.cached_chat(chat_id)?;
+            let random_id = topic_send_random_id();
+            let updates = self
+                .client
+                .invoke(&tl::functions::messages::SendMessage {
+                    no_webpage: true,
+                    silent: false,
+                    background: false,
+                    clear_draft: false,
+                    noforwards: false,
+                    update_stickersets_order: false,
+                    invert_media: false,
+                    peer: chat.pack().to_input_peer(),
+                    reply_to: Some(
+                        tl::types::InputReplyToMessage {
+                            reply_to_msg_id: topic_id,
+                            top_msg_id: Some(topic_id),
+                            reply_to_peer_id: None,
+                            quote_text: None,
+                            quote_entities: None,
+                            quote_offset: None,
+                        }
+                        .into(),
+                    ),
+                    message: content,
+                    random_id,
+                    reply_markup: None,
+                    entities: None,
+                    schedule_date: None,
+                    send_as: None,
+                    quick_reply_shortcut: None,
+                    effect: None,
+                })
+                .await?;
+            let message_id = sent_message_id_from_updates(&updates, random_id)
+                .ok_or_else(|| color_eyre::eyre::eyre!("Sent topic message id not found"))?;
+            let mut messages = self.client.get_messages_by_id(&chat, &[message_id]).await?;
+            let message = messages
+                .pop()
+                .flatten()
+                .ok_or_else(|| color_eyre::eyre::eyre!("Sent topic message not found"))?;
+            Ok(convert_message(message, None))
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
     fn edit_message(
         &self,
         chat_id: i64,
@@ -883,6 +1302,60 @@ impl TelegramClient for GrammersClient {
     }
 
     #[allow(clippy::manual_async_fn)]
+    fn reply_to_message_in_thread(
+        &self,
+        chat_id: i64,
+        topic_id: i32,
+        reply_to: i32,
+        content: String,
+    ) -> impl std::future::Future<Output = Result<Message>> + Send + '_ {
+        async move {
+            let chat = self.cached_chat(chat_id)?;
+            let random_id = topic_send_random_id();
+            let updates = self
+                .client
+                .invoke(&tl::functions::messages::SendMessage {
+                    no_webpage: true,
+                    silent: false,
+                    background: false,
+                    clear_draft: false,
+                    noforwards: false,
+                    update_stickersets_order: false,
+                    invert_media: false,
+                    peer: chat.pack().to_input_peer(),
+                    reply_to: Some(
+                        tl::types::InputReplyToMessage {
+                            reply_to_msg_id: reply_to,
+                            top_msg_id: Some(topic_id),
+                            reply_to_peer_id: None,
+                            quote_text: None,
+                            quote_entities: None,
+                            quote_offset: None,
+                        }
+                        .into(),
+                    ),
+                    message: content,
+                    random_id,
+                    reply_markup: None,
+                    entities: None,
+                    schedule_date: None,
+                    send_as: None,
+                    quick_reply_shortcut: None,
+                    effect: None,
+                })
+                .await?;
+            let message_id = sent_message_id_from_updates(&updates, random_id)
+                .ok_or_else(|| color_eyre::eyre::eyre!("Sent topic reply id not found"))?;
+            let mut messages = self.client.get_messages_by_id(&chat, &[message_id]).await?;
+            let message = messages
+                .pop()
+                .flatten()
+                .ok_or_else(|| color_eyre::eyre::eyre!("Sent topic reply not found"))?;
+            Ok(convert_message(message, None))
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
     fn delete_message(
         &self,
         chat_id: i64,
@@ -908,6 +1381,7 @@ impl TelegramClient for GrammersClient {
             collect_message_page(
                 &self.client,
                 &self.media_cache_dir,
+                &self.user_name_cache,
                 iter,
                 chat_id,
                 outbox_read_max_id,
@@ -932,6 +1406,7 @@ impl TelegramClient for GrammersClient {
             collect_message_page(
                 &self.client,
                 &self.media_cache_dir,
+                &self.user_name_cache,
                 iter,
                 chat_id,
                 outbox_read_max_id,
@@ -950,6 +1425,45 @@ impl TelegramClient for GrammersClient {
         async move {
             let chat = self.cached_chat(chat_id)?;
             self.client.mark_as_read(chat).await?;
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn mark_thread_read(
+        &self,
+        chat_id: i64,
+        topic_id: i32,
+        max_message_id: i32,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        async move {
+            let chat = self.cached_chat(chat_id)?;
+            self.client
+                .invoke(&tl::functions::messages::ReadDiscussion {
+                    peer: chat.pack().to_input_peer(),
+                    msg_id: topic_id,
+                    read_max_id: max_message_id,
+                })
+                .await?;
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn send_typing_action(
+        &self,
+        chat_id: i64,
+        topic_id: Option<i32>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        async move {
+            let chat = self.cached_chat(chat_id)?;
+            self.client
+                .invoke(&tl::functions::messages::SetTyping {
+                    peer: chat.pack().to_input_peer(),
+                    top_msg_id: topic_id,
+                    action: tl::enums::SendMessageAction::SendMessageTypingAction,
+                })
+                .await?;
             Ok(())
         }
     }
@@ -1050,6 +1564,7 @@ impl TelegramClient for GrammersClient {
         async move {
             let (tx, rx) = mpsc::unbounded_channel();
             let client = self.client.clone();
+            let user_name_cache = Arc::clone(&self.user_name_cache);
             let outbox_read_max_id_cache = Arc::clone(&self.outbox_read_max_id_cache);
 
             tokio::spawn(async move {
@@ -1069,6 +1584,7 @@ impl TelegramClient for GrammersClient {
                                             msg.outgoing()
                                         ),
                                     );
+                                    cache_sender_name_from_message(&user_name_cache, &msg);
                                     if !msg.outgoing() {
                                         vec![Update::NewMessage(convert_message(msg, None))]
                                     } else {
@@ -1076,6 +1592,7 @@ impl TelegramClient for GrammersClient {
                                     }
                                 }
                                 grammers_client::Update::MessageEdited(msg) => {
+                                    cache_sender_name_from_message(&user_name_cache, &msg);
                                     vec![Update::EditMessage {
                                         chat_id: msg.chat().id(),
                                         message_id: msg.id(),
@@ -1114,6 +1631,13 @@ impl TelegramClient for GrammersClient {
                                             chat_id,
                                             max_message_id,
                                         }]
+                                    } else if let Some(update) =
+                                        typing_status_update_from_raw_with_user_names(
+                                            &raw,
+                                            |user_id| cached_user_name(&user_name_cache, user_id),
+                                        )
+                                    {
+                                        vec![update]
                                     } else {
                                         Vec::new()
                                     }
@@ -1150,7 +1674,8 @@ mod tests {
         chat_not_found_in_cache_message, delete_message_updates, delete_update_chat_id,
         dialog_chats_from_page_parts, dumbgram_init_params, folders_from_dialog_filters,
         input_peers_contain_chat, message_sender_name, message_status_for_read_state,
-        read_outbox_update_from_raw, update_error_message,
+        message_thread_topic_id, read_outbox_update_from_raw, typing_status_update_from_raw,
+        typing_status_update_from_raw_with_user_names, update_error_message,
     };
     use crate::telegram::types::{
         MessageStatus, OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update,
@@ -1207,6 +1732,116 @@ mod tests {
             message_status_for_read_state(false, 10, Some(10)),
             MessageStatus::Delivered
         );
+    }
+
+    #[test]
+    fn message_thread_topic_id_uses_forum_reply_top_id() {
+        let reply_to = tl::enums::MessageReplyHeader::Header(tl::types::MessageReplyHeader {
+            reply_to_scheduled: false,
+            forum_topic: true,
+            quote: false,
+            reply_to_msg_id: Some(555),
+            reply_to_peer_id: None,
+            reply_from: None,
+            reply_media: None,
+            reply_to_top_id: Some(101),
+            quote_text: None,
+            quote_entities: None,
+            quote_offset: None,
+        });
+
+        assert_eq!(message_thread_topic_id(Some(&reply_to)), Some(101));
+    }
+
+    #[test]
+    fn regular_replies_do_not_become_thread_topics() {
+        let reply_to = tl::enums::MessageReplyHeader::Header(tl::types::MessageReplyHeader {
+            reply_to_scheduled: false,
+            forum_topic: false,
+            quote: false,
+            reply_to_msg_id: Some(555),
+            reply_to_peer_id: None,
+            reply_from: None,
+            reply_media: None,
+            reply_to_top_id: None,
+            quote_text: None,
+            quote_entities: None,
+            quote_offset: None,
+        });
+
+        assert_eq!(message_thread_topic_id(Some(&reply_to)), None);
+    }
+
+    #[test]
+    fn raw_topic_typing_updates_keep_topic_id() {
+        let update = typing_status_update_from_raw(&tl::enums::Update::ChannelUserTyping(
+            tl::types::UpdateChannelUserTyping {
+                channel_id: 99,
+                top_msg_id: Some(101),
+                from_id: tl::enums::Peer::User(tl::types::PeerUser { user_id: 42 }),
+                action: tl::enums::SendMessageAction::SendMessageTypingAction,
+            },
+        ));
+
+        match update {
+            Some(Update::TypingStatus {
+                chat_id,
+                topic_id,
+                user_name,
+                is_typing,
+            }) => {
+                assert_eq!(chat_id, 99);
+                assert_eq!(topic_id, Some(101));
+                assert_eq!(user_name, "User 42");
+                assert!(is_typing);
+            }
+            other => panic!("expected typing update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_typing_updates_use_cached_user_name_when_available() {
+        let update = typing_status_update_from_raw_with_user_names(
+            &tl::enums::Update::ChannelUserTyping(tl::types::UpdateChannelUserTyping {
+                channel_id: 99,
+                top_msg_id: Some(101),
+                from_id: tl::enums::Peer::User(tl::types::PeerUser { user_id: 42 }),
+                action: tl::enums::SendMessageAction::SendMessageTypingAction,
+            }),
+            |user_id| (user_id == 42).then(|| "Alice".to_string()),
+        );
+
+        match update {
+            Some(Update::TypingStatus { user_name, .. }) => assert_eq!(user_name, "Alice"),
+            other => panic!("expected typing update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_cancel_typing_updates_clear_topic_user() {
+        let update = typing_status_update_from_raw(&tl::enums::Update::ChannelUserTyping(
+            tl::types::UpdateChannelUserTyping {
+                channel_id: 99,
+                top_msg_id: Some(101),
+                from_id: tl::enums::Peer::User(tl::types::PeerUser { user_id: 42 }),
+                action: tl::enums::SendMessageAction::SendMessageCancelAction,
+            },
+        ));
+
+        match update {
+            Some(Update::TypingStatus {
+                chat_id,
+                topic_id,
+                user_name,
+                is_typing,
+            }) => {
+                assert_eq!(chat_id, 99);
+                assert_eq!(topic_id, Some(101));
+                assert_eq!(user_name, "User 42");
+                assert!(!is_typing);
+            }
+            other => panic!("expected cancel typing update, got {other:?}"),
+        }
     }
 
     #[test]
