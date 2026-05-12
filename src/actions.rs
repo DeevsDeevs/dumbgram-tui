@@ -2,7 +2,7 @@ use crate::diagnostics;
 use crate::state::{AppState, DeleteConfirmation, MessageSubmitAction, NO_CHAT_SELECTED_ERROR};
 use crate::telegram::{
     DownloadedMedia, TelegramClient,
-    types::{ALL_FOLDER_ID, Chat, Folder, Message, MessageMediaKind},
+    types::{ALL_FOLDER_ID, Chat, Folder, Message, MessageMediaKind, ThreadTopic},
 };
 use color_eyre::Result;
 use std::path::PathBuf;
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 static TEMP_ID_COUNTER: AtomicI32 = AtomicI32::new(-1);
 pub(crate) const CHAT_LIST_PAGE_SIZE: usize = 50;
 const MESSAGE_HISTORY_PAGE_SIZE: usize = 20;
+const CHAT_THREAD_TOPIC_PAGE_SIZE: usize = 50;
 #[cfg(not(test))]
 const MESSAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
@@ -24,6 +25,10 @@ const CHAT_LIST_LOAD_TIMEOUT: Duration = Duration::from_millis(10);
 const MARK_CHAT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const MARK_CHAT_READ_TIMEOUT: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+const SEND_TYPING_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const SEND_TYPING_TIMEOUT: Duration = Duration::from_millis(10);
 pub(crate) const NO_OLDER_MESSAGES_STATUS: &str = "No older messages";
 pub(crate) const LOAD_MESSAGES_TIMED_OUT_STATUS: &str = "Load messages timed out";
 pub(crate) const LOAD_OLDER_MESSAGES_TIMED_OUT_STATUS: &str = "Load older messages timed out";
@@ -94,6 +99,7 @@ pub async fn download_message_media_result<C: TelegramClient>(
 pub struct PendingSend {
     pub(crate) temp_id: i32,
     pub(crate) chat_id: i64,
+    pub(crate) thread_top_message_id: Option<i32>,
     pub(crate) content: String,
 }
 
@@ -162,6 +168,89 @@ pub async fn mark_chat_read_best_effort<C: TelegramClient>(client: &C, chat_id: 
                 "chat_id={chat_id} elapsed_ms={} timeout_ms={}",
                 started.elapsed().as_millis(),
                 MARK_CHAT_READ_TIMEOUT.as_millis()
+            ),
+        ),
+    }
+}
+
+pub async fn mark_thread_read_best_effort<C: TelegramClient>(
+    client: &C,
+    chat_id: i64,
+    topic_id: i32,
+    max_message_id: i32,
+) {
+    diagnostics::event(
+        "mark_thread_read_start",
+        format!("chat_id={chat_id} topic_id={topic_id} max_message_id={max_message_id}"),
+    );
+    let started = Instant::now();
+    match tokio::time::timeout(
+        MARK_CHAT_READ_TIMEOUT,
+        client.mark_thread_read(chat_id, topic_id, max_message_id),
+    )
+    .await
+    {
+        Ok(Ok(())) => diagnostics::event(
+            "mark_thread_read_finish",
+            format!(
+                "chat_id={chat_id} topic_id={topic_id} max_message_id={max_message_id} elapsed_ms={}",
+                started.elapsed().as_millis()
+            ),
+        ),
+        Ok(Err(error)) => diagnostics::event(
+            "mark_thread_read_error",
+            format!(
+                "chat_id={chat_id} topic_id={topic_id} max_message_id={max_message_id} elapsed_ms={} error={error}",
+                started.elapsed().as_millis()
+            ),
+        ),
+        Err(_) => diagnostics::event(
+            "mark_thread_read_timeout",
+            format!(
+                "chat_id={chat_id} topic_id={topic_id} max_message_id={max_message_id} elapsed_ms={} timeout_ms={}",
+                started.elapsed().as_millis(),
+                MARK_CHAT_READ_TIMEOUT.as_millis()
+            ),
+        ),
+    }
+}
+
+pub async fn send_typing_action_best_effort<C: TelegramClient>(
+    client: &C,
+    chat_id: i64,
+    topic_id: Option<i32>,
+) {
+    diagnostics::event(
+        "typing_action_start",
+        format!("chat_id={chat_id} topic_id={topic_id:?}"),
+    );
+    let started = Instant::now();
+    match tokio::time::timeout(
+        SEND_TYPING_TIMEOUT,
+        client.send_typing_action(chat_id, topic_id),
+    )
+    .await
+    {
+        Ok(Ok(())) => diagnostics::event(
+            "typing_action_finish",
+            format!(
+                "chat_id={chat_id} topic_id={topic_id:?} elapsed_ms={}",
+                started.elapsed().as_millis()
+            ),
+        ),
+        Ok(Err(error)) => diagnostics::event(
+            "typing_action_error",
+            format!(
+                "chat_id={chat_id} topic_id={topic_id:?} elapsed_ms={} error={error}",
+                started.elapsed().as_millis()
+            ),
+        ),
+        Err(_) => diagnostics::event(
+            "typing_action_timeout",
+            format!(
+                "chat_id={chat_id} topic_id={topic_id:?} elapsed_ms={} timeout_ms={}",
+                started.elapsed().as_millis(),
+                SEND_TYPING_TIMEOUT.as_millis()
             ),
         ),
     }
@@ -243,6 +332,119 @@ pub fn begin_open_chat_at(state: &mut AppState, chat_index: usize) -> Option<i64
     None
 }
 
+pub async fn fetch_chat_thread_topics<C: TelegramClient>(
+    client: &C,
+    chat_id: i64,
+) -> std::result::Result<Vec<ThreadTopic>, String> {
+    diagnostics::event(
+        "thread_topics_load_start",
+        format!("chat_id={chat_id} limit={CHAT_THREAD_TOPIC_PAGE_SIZE}"),
+    );
+    let started = Instant::now();
+    match client
+        .get_thread_topics(chat_id, CHAT_THREAD_TOPIC_PAGE_SIZE)
+        .await
+    {
+        Ok(thread_topics) => {
+            diagnostics::event(
+                "thread_topics_load_finish",
+                format!(
+                    "chat_id={chat_id} count={} elapsed_ms={}",
+                    thread_topics.len(),
+                    started.elapsed().as_millis()
+                ),
+            );
+            Ok(thread_topics)
+        }
+        Err(error) => {
+            diagnostics::event(
+                "thread_topics_load_error",
+                format!(
+                    "chat_id={chat_id} elapsed_ms={} error={error}",
+                    started.elapsed().as_millis()
+                ),
+            );
+            Err(error.to_string())
+        }
+    }
+}
+
+pub async fn fetch_thread_topic_messages<C: TelegramClient>(
+    client: &C,
+    chat_id: i64,
+    topic_id: i32,
+) -> std::result::Result<Vec<Message>, String> {
+    diagnostics::event(
+        "thread_messages_load_start",
+        format!("chat_id={chat_id} topic_id={topic_id} limit={MESSAGE_HISTORY_PAGE_SIZE}"),
+    );
+    let started = Instant::now();
+    match tokio::time::timeout(
+        MESSAGE_LOAD_TIMEOUT,
+        client.get_thread_messages(chat_id, topic_id, MESSAGE_HISTORY_PAGE_SIZE),
+    )
+    .await
+    {
+        Err(_) => {
+            diagnostics::event(
+                "thread_messages_load_timeout",
+                format!(
+                    "chat_id={chat_id} topic_id={topic_id} elapsed_ms={} timeout_ms={}",
+                    started.elapsed().as_millis(),
+                    MESSAGE_LOAD_TIMEOUT.as_millis()
+                ),
+            );
+            Err(LOAD_MESSAGES_TIMED_OUT_STATUS.to_string())
+        }
+        Ok(Ok(messages)) => {
+            diagnostics::event(
+                "thread_messages_load_finish",
+                format!(
+                    "chat_id={chat_id} topic_id={topic_id} count={} elapsed_ms={}",
+                    messages.len(),
+                    started.elapsed().as_millis()
+                ),
+            );
+            Ok(messages)
+        }
+        Ok(Err(error)) => {
+            diagnostics::event(
+                "thread_messages_load_error",
+                format!(
+                    "chat_id={chat_id} topic_id={topic_id} elapsed_ms={} error={error}",
+                    started.elapsed().as_millis()
+                ),
+            );
+            Err(error.to_string())
+        }
+    }
+}
+
+pub async fn load_selected_thread_topic_messages<C: TelegramClient>(
+    state: &mut AppState,
+    client: &mut C,
+) -> Result<()> {
+    let Some(chat_id) = state.selected_chat_id() else {
+        return Ok(());
+    };
+    let Some(topic_id) = state.selected_thread_topic().map(|topic| topic.id) else {
+        return Ok(());
+    };
+
+    match fetch_thread_topic_messages(client, chat_id, topic_id).await {
+        Ok(messages) => {
+            let max_message_id = messages.iter().map(|message| message.id).max();
+            state.apply_loaded_selected_chat_messages(messages);
+            if let Some(max_message_id) = max_message_id {
+                mark_thread_read_best_effort(client, chat_id, topic_id, max_message_id).await;
+            }
+        }
+        Err(error) => state.set_error(error),
+    }
+
+    Ok(())
+}
+
 pub async fn load_selected_chat_messages<C: TelegramClient>(
     state: &mut AppState,
     client: &mut C,
@@ -252,6 +454,9 @@ pub async fn load_selected_chat_messages<C: TelegramClient>(
         match fetch_latest_chat_messages(client, chat_id).await {
             Ok(messages) => {
                 state.apply_loaded_selected_chat_messages(messages);
+                if let Ok(thread_topics) = fetch_chat_thread_topics(client, chat_id).await {
+                    state.apply_loaded_selected_chat_thread_topics(thread_topics);
+                }
                 mark_chat_read_best_effort(client, chat_id).await;
             }
             Err(error) => state.set_error(error),
@@ -263,29 +468,29 @@ pub async fn load_selected_chat_messages<C: TelegramClient>(
     Ok(())
 }
 
-pub async fn fetch_older_chat_messages<C: TelegramClient>(
-    client: &C,
+async fn fetch_older_messages_with<F>(
+    client_call: F,
     chat_id: i64,
+    topic_id: Option<i32>,
     before_message_id: i32,
-) -> std::result::Result<Vec<Message>, String> {
+) -> std::result::Result<Vec<Message>, String>
+where
+    F: std::future::Future<Output = color_eyre::Result<Vec<Message>>>,
+{
+    let scope = topic_id
+        .map(|topic_id| format!("chat_id={chat_id} topic_id={topic_id}"))
+        .unwrap_or_else(|| format!("chat_id={chat_id}"));
     diagnostics::event(
         "older_messages_load_start",
-        format!(
-            "chat_id={chat_id} before_message_id={before_message_id} limit={MESSAGE_HISTORY_PAGE_SIZE}"
-        ),
+        format!("{scope} before_message_id={before_message_id} limit={MESSAGE_HISTORY_PAGE_SIZE}"),
     );
     let started = Instant::now();
-    match tokio::time::timeout(
-        MESSAGE_LOAD_TIMEOUT,
-        client.get_messages_before(chat_id, before_message_id, MESSAGE_HISTORY_PAGE_SIZE),
-    )
-    .await
-    {
+    match tokio::time::timeout(MESSAGE_LOAD_TIMEOUT, client_call).await {
         Err(_) => {
             diagnostics::event(
                 "older_messages_load_timeout",
                 format!(
-                    "chat_id={chat_id} elapsed_ms={} timeout_ms={}",
+                    "{scope} elapsed_ms={} timeout_ms={}",
                     started.elapsed().as_millis(),
                     MESSAGE_LOAD_TIMEOUT.as_millis()
                 ),
@@ -296,7 +501,7 @@ pub async fn fetch_older_chat_messages<C: TelegramClient>(
             diagnostics::event(
                 "older_messages_load_finish",
                 format!(
-                    "chat_id={chat_id} count={} max_chars={} elapsed_ms={}",
+                    "{scope} count={} max_chars={} elapsed_ms={}",
                     messages.len(),
                     messages
                         .iter()
@@ -312,7 +517,7 @@ pub async fn fetch_older_chat_messages<C: TelegramClient>(
             diagnostics::event(
                 "older_messages_load_error",
                 format!(
-                    "chat_id={chat_id} elapsed_ms={} error={error}",
+                    "{scope} elapsed_ms={} error={error}",
                     started.elapsed().as_millis()
                 ),
             );
@@ -321,18 +526,53 @@ pub async fn fetch_older_chat_messages<C: TelegramClient>(
     }
 }
 
-pub fn selected_older_messages_request(state: &mut AppState) -> Option<(i64, i32)> {
+pub async fn fetch_older_chat_messages<C: TelegramClient>(
+    client: &C,
+    chat_id: i64,
+    before_message_id: i32,
+) -> std::result::Result<Vec<Message>, String> {
+    fetch_older_messages_with(
+        client.get_messages_before(chat_id, before_message_id, MESSAGE_HISTORY_PAGE_SIZE),
+        chat_id,
+        None,
+        before_message_id,
+    )
+    .await
+}
+
+pub async fn fetch_older_thread_topic_messages<C: TelegramClient>(
+    client: &C,
+    chat_id: i64,
+    topic_id: i32,
+    before_message_id: i32,
+) -> std::result::Result<Vec<Message>, String> {
+    fetch_older_messages_with(
+        client.get_thread_messages_before(
+            chat_id,
+            topic_id,
+            before_message_id,
+            MESSAGE_HISTORY_PAGE_SIZE,
+        ),
+        chat_id,
+        Some(topic_id),
+        before_message_id,
+    )
+    .await
+}
+
+pub fn selected_older_messages_request(state: &mut AppState) -> Option<(i64, Option<i32>, i32)> {
     let Some(chat_id) = state.selected_chat_id() else {
         state.set_error(NO_CHAT_SELECTED_ERROR.to_string());
         return None;
     };
+    let topic_id = state.selected_thread_topic().map(|topic| topic.id);
     let before_message_id = state.messages.first().map(|message| message.id)?;
     if state.selected_chat_older_history_exhausted() {
         state.set_status(NO_OLDER_MESSAGES_STATUS);
         return None;
     }
 
-    Some((chat_id, before_message_id))
+    Some((chat_id, topic_id, before_message_id))
 }
 
 pub fn apply_older_chat_messages_result(
@@ -359,10 +599,15 @@ pub async fn load_older_selected_chat_messages<C: TelegramClient>(
     state: &mut AppState,
     client: &mut C,
 ) -> Result<usize> {
-    let Some((chat_id, before_message_id)) = selected_older_messages_request(state) else {
+    let Some((chat_id, topic_id, before_message_id)) = selected_older_messages_request(state)
+    else {
         return Ok(0);
     };
-    let result = fetch_older_chat_messages(client, chat_id, before_message_id).await;
+    let result = if let Some(topic_id) = topic_id {
+        fetch_older_thread_topic_messages(client, chat_id, topic_id, before_message_id).await
+    } else {
+        fetch_older_chat_messages(client, chat_id, before_message_id).await
+    };
     Ok(apply_older_chat_messages_result(state, result))
 }
 
@@ -370,6 +615,7 @@ pub struct InitialStateLoad {
     pub folders: Vec<Folder>,
     pub chats: Vec<Chat>,
     pub messages: std::result::Result<Vec<Message>, String>,
+    pub thread_topics: Vec<ThreadTopic>,
 }
 
 fn folder_filter_id(folder: &Folder) -> Option<i32> {
@@ -398,10 +644,10 @@ pub async fn fetch_initial_state<C: TelegramClient>(
         }
     };
 
-    let (chats, messages) = if let Some(folder) = folders.first() {
+    let (chats, messages, thread_topics) = if let Some(folder) = folders.first() {
         let folder_id = folder_filter_id(folder);
         match fetch_folder_chats_and_selected_messages(client, folder_id).await {
-            Ok(load) => (load.chats, load.messages),
+            Ok(load) => (load.chats, load.messages, load.thread_topics),
             Err(error) => {
                 diagnostics::event(
                     "initial_load_error",
@@ -414,16 +660,17 @@ pub async fn fetch_initial_state<C: TelegramClient>(
             }
         }
     } else {
-        (Vec::new(), Ok(Vec::new()))
+        (Vec::new(), Ok(Vec::new()), Vec::new())
     };
 
     diagnostics::event(
         "initial_load_finish",
         format!(
-            "folders={} chats={} messages={} elapsed_ms={}",
+            "folders={} chats={} messages={} thread_topics={} elapsed_ms={}",
             folders.len(),
             chats.len(),
             messages.as_ref().map_or(0, Vec::len),
+            thread_topics.len(),
             started.elapsed().as_millis()
         ),
     );
@@ -432,6 +679,7 @@ pub async fn fetch_initial_state<C: TelegramClient>(
         folders,
         chats,
         messages,
+        thread_topics,
     })
 }
 
@@ -459,6 +707,7 @@ pub fn apply_initial_state_load_result(
                 Ok(messages) => state.apply_loaded_selected_chat_messages(messages),
                 Err(error) => state.set_error(error),
             }
+            state.apply_loaded_selected_chat_thread_topics(load.thread_topics);
         }
         Err(error) => state.set_error(error),
     }
@@ -478,6 +727,7 @@ pub async fn load_initial_state<C: TelegramClient>(
 pub struct FolderChatLoad {
     pub chats: Vec<Chat>,
     pub messages: std::result::Result<Vec<Message>, String>,
+    pub thread_topics: Vec<ThreadTopic>,
 }
 
 pub async fn fetch_folder_chats_and_selected_messages<C: TelegramClient>(
@@ -526,11 +776,21 @@ pub async fn fetch_folder_chats_and_selected_messages<C: TelegramClient>(
             started.elapsed().as_millis()
         ),
     );
-    let messages = match chats.first() {
-        Some(chat) => fetch_latest_chat_messages(client, chat.id).await,
-        None => Ok(Vec::new()),
+    let (messages, thread_topics) = match chats.first() {
+        Some(chat) => {
+            let messages = fetch_latest_chat_messages(client, chat.id).await;
+            let thread_topics = fetch_chat_thread_topics(client, chat.id)
+                .await
+                .unwrap_or_default();
+            (messages, thread_topics)
+        }
+        None => (Ok(Vec::new()), Vec::new()),
     };
-    Ok(FolderChatLoad { chats, messages })
+    Ok(FolderChatLoad {
+        chats,
+        messages,
+        thread_topics,
+    })
 }
 
 pub fn begin_selected_folder_reload(state: &mut AppState) -> Option<(usize, Option<i32>)> {
@@ -565,6 +825,7 @@ pub fn apply_folder_chat_load_result(
                 Ok(messages) => state.apply_loaded_selected_chat_messages(messages),
                 Err(error) => state.set_error(error),
             }
+            state.apply_loaded_selected_chat_thread_topics(load.thread_topics);
         }
         Err(error) => state.set_error(error),
     }
@@ -702,14 +963,21 @@ pub async fn execute_message_submit_action<C: TelegramClient>(
         }
         MessageSubmitAction::Reply {
             chat_id,
+            thread_top_message_id,
             message_id,
             content,
         } => {
-            let result = reply_message_result(client, chat_id, message_id, content).await;
+            let result =
+                reply_message_result(client, chat_id, thread_top_message_id, message_id, content)
+                    .await;
             apply_reply_message_result(state, result);
         }
-        MessageSubmitAction::Send { chat_id, content } => {
-            let pending = begin_send_message(state, chat_id, content);
+        MessageSubmitAction::Send {
+            chat_id,
+            thread_top_message_id,
+            content,
+        } => {
+            let pending = begin_send_message(state, chat_id, thread_top_message_id, content);
             finish_send_message(state, client, pending).await?;
         }
     }
@@ -744,10 +1012,18 @@ pub fn apply_edit_message_result(
 pub async fn reply_message_result<C: TelegramClient>(
     client: &C,
     chat_id: i64,
+    thread_top_message_id: Option<i32>,
     message_id: i32,
     content: String,
 ) -> std::result::Result<Message, String> {
-    match client.reply_to_message(chat_id, message_id, content).await {
+    let result = if let Some(topic_id) = thread_top_message_id {
+        client
+            .reply_to_message_in_thread(chat_id, topic_id, message_id, content)
+            .await
+    } else {
+        client.reply_to_message(chat_id, message_id, content).await
+    };
+    match result {
         Ok(message) => Ok(message),
         Err(error) => Err(error.to_string()),
     }
@@ -763,12 +1039,18 @@ pub fn apply_reply_message_result(
     }
 }
 
-pub fn begin_send_message(state: &mut AppState, chat_id: i64, content: String) -> PendingSend {
+pub fn begin_send_message(
+    state: &mut AppState,
+    chat_id: i64,
+    thread_top_message_id: Option<i32>,
+    content: String,
+) -> PendingSend {
     let temp_id = TEMP_ID_COUNTER.fetch_sub(1, Ordering::SeqCst);
-    state.apply_send_pending(temp_id, chat_id, content.clone());
+    state.apply_send_pending(temp_id, chat_id, thread_top_message_id, content.clone());
     PendingSend {
         temp_id,
         chat_id,
+        thread_top_message_id,
         content,
     }
 }
@@ -776,9 +1058,17 @@ pub fn begin_send_message(state: &mut AppState, chat_id: i64, content: String) -
 pub async fn send_message_result<C: TelegramClient>(
     client: &C,
     chat_id: i64,
+    thread_top_message_id: Option<i32>,
     content: String,
 ) -> std::result::Result<Message, String> {
-    match client.send_message(chat_id, content).await {
+    let result = if let Some(top_message_id) = thread_top_message_id {
+        client
+            .send_message_to_thread(chat_id, top_message_id, content)
+            .await
+    } else {
+        client.send_message(chat_id, content).await
+    };
+    match result {
         Ok(sent_msg) => Ok(sent_msg),
         Err(error) => Err(error.to_string()),
     }
@@ -800,7 +1090,13 @@ pub async fn finish_send_message<C: TelegramClient>(
     client: &mut C,
     pending: PendingSend,
 ) -> Result<()> {
-    let result = send_message_result(client, pending.chat_id, pending.content).await;
+    let result = send_message_result(
+        client,
+        pending.chat_id,
+        pending.thread_top_message_id,
+        pending.content,
+    )
+    .await;
     apply_send_message_result(state, pending.temp_id, result);
 
     Ok(())
@@ -813,15 +1109,17 @@ mod tests {
         begin_open_folder_at, begin_send_message, confirm_delete, download_message_media_result,
         fetch_folder_chats_and_selected_messages, fetch_initial_state, fetch_latest_chat_messages,
         finish_send_message, load_initial_state, load_older_messages_failed_error,
-        load_older_selected_chat_messages, load_selected_chat_messages, open_chat_at,
-        open_folder_at, open_next_chat, open_next_folder, open_previous_chat, open_previous_folder,
-        reload_selected_folder_chats, submit_message,
+        load_older_selected_chat_messages, load_selected_chat_messages,
+        load_selected_thread_topic_messages, open_chat_at, open_folder_at, open_next_chat,
+        open_next_folder, open_previous_chat, open_previous_folder, reload_selected_folder_chats,
+        send_typing_action_best_effort, submit_message,
     };
     use crate::state::{
         AppState, DeleteConfirmation, MESSAGE_DELETED_STATUS, NO_CHAT_SELECTED_ERROR,
     };
     use crate::telegram::types::{
-        Chat, Folder, Message, MessageMediaKind, MessageStatus, OWN_SENDER_NAME, Update, all_folder,
+        Chat, Folder, Message, MessageMediaKind, MessageStatus, OWN_SENDER_NAME, ThreadTopic,
+        Update, all_folder,
     };
     use crate::telegram::{MockTelegramClient, TelegramClient};
     use chrono::Utc;
@@ -865,6 +1163,7 @@ mod tests {
         Message {
             id,
             chat_id,
+            thread_topic_id: None,
             sender_name: OWN_SENDER_NAME.to_string(),
             content: content.to_string(),
             timestamp: Utc::now(),
@@ -1566,6 +1865,249 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_selected_thread_topic_messages_replaces_messages_with_topic_history() {
+        let mut state = AppState::new();
+        state.chats = vec![Chat {
+            id: 3,
+            name: "Work Team".to_string(),
+            last_message: None,
+            unread_count: 0,
+            is_group: true,
+            folder_id: None,
+        }];
+        let mut client = MockTelegramClient::new();
+        action_should_succeed(load_selected_chat_messages(&mut state, &mut client).await);
+        state.select_next_thread_topic();
+
+        action_should_succeed(load_selected_thread_topic_messages(&mut state, &mut client).await);
+
+        assert_eq!(state.selected_thread_topic().unwrap().title, "Deployments");
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].id, 102);
+        assert!(state.messages[0].content.contains("Deployments topic"));
+        assert_eq!(state.thread_topics.len(), 2);
+    }
+
+    struct TypingRecordingClient {
+        typed: Mutex<Option<(i64, Option<i32>)>>,
+    }
+
+    impl TelegramClient for TypingRecordingClient {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_folders(&self) -> Result<Vec<Folder>> {
+            unexpected_client_call("typing client", "fetch folders")
+        }
+
+        async fn get_chats(&self, _folder_id: Option<i32>, _limit: usize) -> Result<Vec<Chat>> {
+            unexpected_client_call("typing client", "fetch chats")
+        }
+
+        async fn get_messages(&self, _chat_id: i64, _limit: usize) -> Result<Vec<Message>> {
+            unexpected_client_call("typing client", "fetch messages")
+        }
+
+        async fn get_messages_before(
+            &self,
+            _chat_id: i64,
+            _before_message_id: i32,
+            _limit: usize,
+        ) -> Result<Vec<Message>> {
+            unexpected_client_call("typing client", "fetch older messages")
+        }
+
+        fn send_typing_action(
+            &self,
+            chat_id: i64,
+            topic_id: Option<i32>,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+            async move {
+                *self.typed.lock().unwrap() = Some((chat_id, topic_id));
+                Ok(())
+            }
+        }
+
+        async fn send_message(&self, _chat_id: i64, _content: String) -> Result<Message> {
+            unexpected_client_call("typing client", "send messages")
+        }
+
+        async fn edit_message(
+            &self,
+            _chat_id: i64,
+            _message_id: i32,
+            _content: String,
+        ) -> Result<()> {
+            unexpected_client_call("typing client", "edit messages")
+        }
+
+        async fn reply_to_message(
+            &self,
+            _chat_id: i64,
+            _reply_to: i32,
+            _content: String,
+        ) -> Result<Message> {
+            unexpected_client_call("typing client", "reply to messages")
+        }
+
+        async fn delete_message(&self, _chat_id: i64, _message_id: i32) -> Result<()> {
+            unexpected_client_call("typing client", "delete messages")
+        }
+
+        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+            unexpected_client_call("typing client", "subscribe to updates")
+        }
+    }
+
+    #[tokio::test]
+    async fn send_typing_action_best_effort_preserves_topic_scope() {
+        let client = TypingRecordingClient {
+            typed: Mutex::new(None),
+        };
+
+        send_typing_action_best_effort(&client, 3, Some(101)).await;
+
+        assert_eq!(*client.typed.lock().unwrap(), Some((3, Some(101))));
+    }
+
+    struct ThreadReadRecordingClient {
+        marked: Mutex<Option<(i64, i32, i32)>>,
+    }
+
+    impl TelegramClient for ThreadReadRecordingClient {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_folders(&self) -> Result<Vec<Folder>> {
+            unexpected_client_call("thread-read client", "fetch folders")
+        }
+
+        async fn get_chats(&self, _folder_id: Option<i32>, _limit: usize) -> Result<Vec<Chat>> {
+            unexpected_client_call("thread-read client", "fetch chats")
+        }
+
+        async fn get_messages(&self, _chat_id: i64, _limit: usize) -> Result<Vec<Message>> {
+            unexpected_client_call("thread-read client", "fetch messages")
+        }
+
+        async fn get_messages_before(
+            &self,
+            _chat_id: i64,
+            _before_message_id: i32,
+            _limit: usize,
+        ) -> Result<Vec<Message>> {
+            unexpected_client_call("thread-read client", "fetch older messages")
+        }
+
+        async fn get_thread_messages(
+            &self,
+            chat_id: i64,
+            topic_id: i32,
+            _limit: usize,
+        ) -> Result<Vec<Message>> {
+            let mut first = message(10, chat_id, "older topic message");
+            first.thread_topic_id = Some(topic_id);
+            let mut latest = message(30, chat_id, "latest topic message");
+            latest.thread_topic_id = Some(topic_id);
+            Ok(vec![first, latest])
+        }
+
+        fn mark_thread_read(
+            &self,
+            chat_id: i64,
+            topic_id: i32,
+            max_message_id: i32,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+            async move {
+                *self.marked.lock().unwrap() = Some((chat_id, topic_id, max_message_id));
+                Ok(())
+            }
+        }
+
+        async fn send_message(&self, _chat_id: i64, _content: String) -> Result<Message> {
+            unexpected_client_call("thread-read client", "send messages")
+        }
+
+        async fn edit_message(
+            &self,
+            _chat_id: i64,
+            _message_id: i32,
+            _content: String,
+        ) -> Result<()> {
+            unexpected_client_call("thread-read client", "edit messages")
+        }
+
+        async fn reply_to_message(
+            &self,
+            _chat_id: i64,
+            _reply_to: i32,
+            _content: String,
+        ) -> Result<Message> {
+            unexpected_client_call("thread-read client", "reply to messages")
+        }
+
+        async fn delete_message(&self, _chat_id: i64, _message_id: i32) -> Result<()> {
+            unexpected_client_call("thread-read client", "delete messages")
+        }
+
+        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+            unexpected_client_call("thread-read client", "subscribe to updates")
+        }
+    }
+
+    #[tokio::test]
+    async fn load_selected_thread_topic_messages_marks_thread_read_to_latest_loaded_message() {
+        let mut state = AppState::new();
+        state.chats = vec![Chat {
+            id: 3,
+            name: "Work Team".to_string(),
+            last_message: None,
+            unread_count: 0,
+            is_group: true,
+            folder_id: None,
+        }];
+        state.apply_loaded_selected_chat_thread_topics(vec![ThreadTopic {
+            id: 101,
+            title: "General".to_string(),
+            top_message_id: 101,
+            unread_count: 2,
+            is_closed: false,
+            is_pinned: false,
+        }]);
+        let mut client = ThreadReadRecordingClient {
+            marked: Mutex::new(None),
+        };
+
+        action_should_succeed(load_selected_thread_topic_messages(&mut state, &mut client).await);
+
+        assert_eq!(*client.marked.lock().unwrap(), Some((3, 101, 30)));
+        assert_eq!(state.thread_topics[0].unread_count, 0);
+    }
+
+    #[tokio::test]
+    async fn load_selected_chat_messages_loads_thread_topics_for_threaded_group() {
+        let mut state = AppState::new();
+        state.chats = vec![Chat {
+            id: 3,
+            name: "Work Team".to_string(),
+            last_message: None,
+            unread_count: 1,
+            is_group: true,
+            folder_id: Some(3),
+        }];
+        let mut client = MockTelegramClient::new();
+
+        action_should_succeed(load_selected_chat_messages(&mut state, &mut client).await);
+
+        assert_eq!(state.thread_topics.len(), 2);
+        assert_eq!(state.thread_topics[0].title, "General");
+        assert_eq!(state.thread_topics[0].id, 101);
+        assert_eq!(state.thread_topics[0].top_message_id, 1001);
+    }
+
+    #[tokio::test]
     async fn load_older_selected_chat_messages_reports_missing_selected_chat() {
         let mut state = AppState::new();
         let mut client = OlderMessagesClient;
@@ -1611,6 +2153,37 @@ mod tests {
         assert_eq!(state.selected_message_index, 2);
         assert_eq!(state.message_scroll_offset, 2);
         assert_eq!(state.messages[state.selected_message_index].id, 10);
+    }
+
+    #[tokio::test]
+    async fn load_older_selected_thread_topic_messages_stays_in_topic() {
+        let mut state = AppState::new();
+        state.chats = vec![Chat {
+            id: 3,
+            name: "Work Team".to_string(),
+            last_message: None,
+            unread_count: 0,
+            is_group: true,
+            folder_id: None,
+        }];
+        state.apply_loaded_selected_chat_thread_topics(vec![ThreadTopic {
+            id: 101,
+            title: "General".to_string(),
+            top_message_id: 1001,
+            unread_count: 0,
+            is_closed: false,
+            is_pinned: false,
+        }]);
+        state.messages = vec![message(103, 3, "current topic first")];
+        let mut client = MockTelegramClient::new();
+
+        let loaded =
+            action_should_succeed(load_older_selected_chat_messages(&mut state, &mut client).await);
+
+        assert_eq!(loaded, 1);
+        assert_eq!(state.messages[0].id, 101);
+        assert!(state.messages[0].content.contains("General topic"));
+        assert_eq!(state.messages[1].id, 103);
     }
 
     #[tokio::test]
@@ -1854,6 +2427,21 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn open_folder_at_loads_thread_topics_for_selected_threaded_group() {
+        let mut state = AppState::new();
+        let mut client = MockTelegramClient::new();
+        action_should_succeed(load_initial_state(&mut state, &mut client).await);
+
+        action_should_succeed(open_folder_at(&mut state, &mut client, 2).await);
+
+        assert_eq!(state.selected_folder_index, 2);
+        assert_eq!(state.chats[0].id, 3);
+        assert_eq!(state.messages[0].chat_id, 3);
+        assert_eq!(state.thread_topics.len(), 2);
+        assert_eq!(state.thread_topics[0].title, "General");
+    }
+
     #[test]
     fn begin_open_folder_at_restores_cached_chats_while_refreshing() {
         let mut state = AppState::new();
@@ -2080,7 +2668,7 @@ mod tests {
         }];
         let mut client = MockTelegramClient::new();
 
-        let pending = begin_send_message(&mut state, 10, "hello".to_string());
+        let pending = begin_send_message(&mut state, 10, None, "hello".to_string());
 
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].content, "hello");
@@ -2094,6 +2682,32 @@ mod tests {
         assert_eq!(state.messages[0].id, 999);
         assert_eq!(state.messages[0].status, MessageStatus::Sent);
         assert!(state.status_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn finish_send_message_uses_selected_thread_topic_when_present() {
+        let mut state = AppState::new();
+        state.chats = vec![Chat {
+            id: 3,
+            name: "Work Team".to_string(),
+            last_message: None,
+            unread_count: 0,
+            is_group: true,
+            folder_id: None,
+        }];
+        let mut client = MockTelegramClient::new();
+
+        let pending = begin_send_message(&mut state, 3, Some(102), "ship it".to_string());
+        action_should_succeed(finish_send_message(&mut state, &mut client, pending).await);
+
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].id, 1102);
+        assert_eq!(state.messages[0].content, "ship it");
+        assert_eq!(
+            state.messages[0].reply_to_content.as_deref(),
+            Some("topic 102")
+        );
+        assert_eq!(state.messages[0].status, MessageStatus::Sent);
     }
 
     #[tokio::test]

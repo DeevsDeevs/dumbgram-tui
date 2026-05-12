@@ -1,7 +1,8 @@
 use crate::diagnostics;
 use crate::telegram::types::{
-    Chat, Folder, Message, MessageStatus, OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID, Update,
-    is_all_folder, message_display_content, message_display_preview,
+    Chat, Folder, Message, MessageStatus, OWN_SENDER_NAME, ThreadTopic,
+    UNKNOWN_DELETE_UPDATE_CHAT_ID, Update, is_all_folder, message_display_content,
+    message_display_preview,
 };
 use crate::text::{display_width, wrap_display_lines_limited};
 use chrono::{DateTime, Utc};
@@ -16,6 +17,7 @@ pub(crate) const FOLDER_LEFT_SCROLL_INDICATOR: &str = "◀ ";
 pub(crate) const FOLDER_SEPARATOR: &str = " │ ";
 pub(crate) const FOLDER_RIGHT_SCROLL_INDICATOR: &str = " ▶";
 pub(crate) const FOLDER_LABEL_HORIZONTAL_PADDING: &str = "  ";
+pub(crate) const THREAD_TOPIC_LABEL_HORIZONTAL_PADDING: &str = "  ";
 pub(crate) const NO_CHAT_SELECTED_ERROR: &str = "No chat selected";
 pub(crate) const MESSAGE_EDITED_STATUS: &str = "Message edited";
 pub(crate) const REPLY_SENT_STATUS: &str = "Reply sent";
@@ -184,6 +186,12 @@ impl FocusedPanel {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum OlderHistoryKey {
+    Chat(i64),
+    Topic { chat_id: i64, topic_id: i32 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeleteConfirmation {
     pub chat_id: i64,
@@ -199,11 +207,13 @@ pub enum MessageSubmitAction {
     },
     Reply {
         chat_id: i64,
+        thread_top_message_id: Option<i32>,
         message_id: i32,
         content: String,
     },
     Send {
         chat_id: i64,
+        thread_top_message_id: Option<i32>,
         content: String,
     },
 }
@@ -219,6 +229,9 @@ pub struct AppState {
     pub folders: Vec<Folder>,
     pub chats: Vec<Chat>,
     pub messages: Vec<Message>,
+    pub thread_topics: Vec<ThreadTopic>,
+    pub selected_thread_topic_index: usize,
+    pub thread_topic_scroll_offset: usize,
     pub selected_folder_index: usize,
     pub selected_chat_index: usize,
     pub chat_scroll_offset: usize,
@@ -232,12 +245,13 @@ pub struct AppState {
     pub input_scroll_offset: usize,
     pub chat_drafts: HashMap<i64, String>,
     cached_folder_chats: HashMap<Option<i32>, Vec<Chat>>,
-    older_history_exhausted_chats: HashSet<i64>,
+    older_history_exhausted: HashSet<OlderHistoryKey>,
     pub split_ratio: f32,
     pub show_help_bar: bool,
     pub folders_area: Rect,
     pub chats_area: Rect,
     pub messages_area: Rect,
+    pub thread_topics_area: Rect,
     pub terminal_image_area: Rect,
     pub input_area: Rect,
     pub folder_scroll_offset: usize,
@@ -250,6 +264,7 @@ pub struct AppState {
     pub last_downloaded_media: Option<DownloadedMediaReference>,
     pub delete_confirmation: Option<DeleteConfirmation>,
     pub typing_users: HashMap<i64, Vec<String>>,
+    pub thread_typing_users: HashMap<(i64, i32), Vec<String>>,
 }
 
 impl AppState {
@@ -258,6 +273,9 @@ impl AppState {
             folders: Vec::new(),
             chats: Vec::new(),
             messages: Vec::new(),
+            thread_topics: Vec::new(),
+            selected_thread_topic_index: 0,
+            thread_topic_scroll_offset: 0,
             selected_folder_index: 0,
             selected_chat_index: 0,
             chat_scroll_offset: 0,
@@ -271,12 +289,13 @@ impl AppState {
             input_scroll_offset: 0,
             chat_drafts: HashMap::new(),
             cached_folder_chats: HashMap::new(),
-            older_history_exhausted_chats: HashSet::new(),
+            older_history_exhausted: HashSet::new(),
             split_ratio: DEFAULT_SPLIT_RATIO,
             show_help_bar: true,
             folders_area: Rect::default(),
             chats_area: Rect::default(),
             messages_area: Rect::default(),
+            thread_topics_area: Rect::default(),
             terminal_image_area: Rect::default(),
             input_area: Rect::default(),
             folder_scroll_offset: 0,
@@ -289,6 +308,7 @@ impl AppState {
             last_downloaded_media: None,
             delete_confirmation: None,
             typing_users: HashMap::new(),
+            thread_typing_users: HashMap::new(),
         }
     }
 
@@ -304,6 +324,18 @@ impl AppState {
         };
 
         display_width(&folder.name) + unread_width + display_width(FOLDER_LABEL_HORIZONTAL_PADDING)
+    }
+
+    fn thread_topic_label_display_width(topic: &ThreadTopic) -> usize {
+        let unread_width = if topic.unread_count > 0 {
+            display_width(&format!(" ({})", topic.unread_count))
+        } else {
+            0
+        };
+
+        display_width(&topic.title)
+            + unread_width
+            + display_width(THREAD_TOPIC_LABEL_HORIZONTAL_PADDING)
     }
 
     fn visible_folder_count_from_offset(&self, offset: usize) -> usize {
@@ -396,6 +428,149 @@ impl AppState {
         }
 
         None
+    }
+
+    fn visible_thread_topic_count_from_offset(&self, offset: usize) -> usize {
+        if self.thread_topics.is_empty() || offset >= self.thread_topics.len() {
+            return 0;
+        }
+
+        let available_width =
+            self.thread_topics_area
+                .width
+                .saturating_sub(FOLDER_VIEWPORT_RESERVED_COLUMNS) as usize;
+        let mut visible_count = 0usize;
+        let mut current_width = 0usize;
+
+        if offset > 0 {
+            current_width += display_width(FOLDER_LEFT_SCROLL_INDICATOR);
+        }
+
+        for (relative_idx, topic) in self.thread_topics.iter().skip(offset).enumerate() {
+            let separator_width = if visible_count == 0 {
+                0
+            } else {
+                display_width(FOLDER_SEPARATOR)
+            };
+            let right_indicator_width = if offset + relative_idx + 1 < self.thread_topics.len() {
+                display_width(FOLDER_RIGHT_SCROLL_INDICATOR)
+            } else {
+                0
+            };
+            let topic_width = Self::thread_topic_label_display_width(topic);
+
+            if current_width + separator_width + topic_width + right_indicator_width
+                > available_width
+            {
+                return visible_count;
+            }
+            visible_count += 1;
+            current_width += separator_width + topic_width;
+        }
+
+        visible_count
+    }
+
+    pub fn get_visible_thread_topics(&self) -> (Vec<&ThreadTopic>, bool, bool) {
+        let visible_count =
+            self.visible_thread_topic_count_from_offset(self.thread_topic_scroll_offset);
+        if visible_count == 0 {
+            return (Vec::new(), self.thread_topic_scroll_offset > 0, false);
+        }
+
+        let visible_topics = self
+            .thread_topics
+            .iter()
+            .skip(self.thread_topic_scroll_offset)
+            .take(visible_count)
+            .collect::<Vec<_>>();
+        let has_left_scroll = self.thread_topic_scroll_offset > 0;
+        let has_right_scroll =
+            self.thread_topic_scroll_offset + visible_count < self.thread_topics.len();
+        (visible_topics, has_left_scroll, has_right_scroll)
+    }
+
+    pub fn thread_topic_index_at_visible_column(&self, column: usize) -> Option<usize> {
+        let (visible_topics, has_left_scroll, _) = self.get_visible_thread_topics();
+        if visible_topics.is_empty() {
+            return None;
+        }
+
+        let mut current_column = 0usize;
+        if has_left_scroll {
+            let indicator_width = display_width(FOLDER_LEFT_SCROLL_INDICATOR);
+            if column < current_column + indicator_width {
+                return None;
+            }
+            current_column += indicator_width;
+        }
+
+        for (idx, topic) in visible_topics.iter().enumerate() {
+            if idx > 0 {
+                let separator_width = display_width(FOLDER_SEPARATOR);
+                if column < current_column + separator_width {
+                    return None;
+                }
+                current_column += separator_width;
+            }
+
+            let topic_width = Self::thread_topic_label_display_width(topic);
+            if column < current_column + topic_width {
+                return Some(self.thread_topic_scroll_offset + idx);
+            }
+            current_column += topic_width;
+        }
+
+        None
+    }
+
+    pub fn ensure_selected_thread_topic_visible(&mut self) {
+        if self.thread_topics.is_empty() {
+            self.selected_thread_topic_index = 0;
+            self.thread_topic_scroll_offset = 0;
+            return;
+        }
+
+        self.selected_thread_topic_index = self
+            .selected_thread_topic_index
+            .min(last_index(self.thread_topics.len()));
+        self.thread_topic_scroll_offset = self
+            .thread_topic_scroll_offset
+            .min(last_index(self.thread_topics.len()));
+
+        if self.selected_thread_topic_index < self.thread_topic_scroll_offset {
+            self.thread_topic_scroll_offset = self.selected_thread_topic_index;
+        }
+
+        while self.thread_topic_scroll_offset > 0 {
+            let candidate = self.thread_topic_scroll_offset - 1;
+            let visible_count = self.visible_thread_topic_count_from_offset(candidate);
+            let max_visible_index = candidate + last_index(visible_count);
+            if visible_count > 0 && self.selected_thread_topic_index <= max_visible_index {
+                self.thread_topic_scroll_offset = candidate;
+            } else {
+                break;
+            }
+        }
+
+        let visible_count =
+            self.visible_thread_topic_count_from_offset(self.thread_topic_scroll_offset);
+        let max_visible_index = self.thread_topic_scroll_offset + last_index(visible_count);
+        if visible_count == 0 || self.selected_thread_topic_index > max_visible_index {
+            self.thread_topic_scroll_offset = self
+                .selected_thread_topic_index
+                .saturating_sub(last_index(visible_count));
+        }
+    }
+
+    pub fn select_thread_topic_at(&mut self, index: usize) {
+        if self.thread_topics.is_empty() {
+            self.selected_thread_topic_index = 0;
+            self.thread_topic_scroll_offset = 0;
+        } else {
+            self.selected_thread_topic_index = index.min(last_index(self.thread_topics.len()));
+            self.ensure_selected_thread_topic_visible();
+        }
     }
 
     pub fn ensure_selected_folder_visible(&mut self) {
@@ -629,25 +804,46 @@ impl AppState {
         if let Some(chat) = self.chats.get_mut(self.selected_chat_index) {
             chat.unread_count = 0;
         }
+        if let Some(topic_index) = self.selected_thread_topic_index_for_loaded_topics() {
+            self.thread_topics[topic_index].unread_count = 0;
+        }
         self.refresh_selected_chat_last_message_from_loaded_messages();
         self.sync_folder_unread_counts_from_loaded_chats();
         self.restore_draft_for_selected_chat();
     }
 
+    fn selected_older_history_key(&self) -> Option<OlderHistoryKey> {
+        let chat_id = self.selected_chat_id()?;
+        Some(
+            self.selected_thread_topic()
+                .map(|topic| OlderHistoryKey::Topic {
+                    chat_id,
+                    topic_id: topic.id,
+                })
+                .unwrap_or(OlderHistoryKey::Chat(chat_id)),
+        )
+    }
+
     pub fn selected_chat_older_history_exhausted(&self) -> bool {
-        self.selected_chat_id()
-            .is_some_and(|chat_id| self.older_history_exhausted_chats.contains(&chat_id))
+        self.selected_older_history_key()
+            .is_some_and(|key| self.older_history_exhausted.contains(&key))
     }
 
     pub fn mark_selected_chat_older_history_exhausted(&mut self) {
-        if let Some(chat_id) = self.selected_chat_id() {
-            self.older_history_exhausted_chats.insert(chat_id);
+        if let Some(key) = self.selected_older_history_key() {
+            self.older_history_exhausted.insert(key);
         }
     }
 
     fn clear_selected_chat_older_history_exhausted(&mut self) {
         if let Some(chat_id) = self.selected_chat_id() {
-            self.older_history_exhausted_chats.remove(&chat_id);
+            self.older_history_exhausted.retain(|key| match key {
+                OlderHistoryKey::Chat(key_chat_id) => *key_chat_id != chat_id,
+                OlderHistoryKey::Topic {
+                    chat_id: key_chat_id,
+                    ..
+                } => *key_chat_id != chat_id,
+            });
         }
     }
 
@@ -673,8 +869,71 @@ impl AppState {
         added
     }
 
+    pub fn apply_loaded_selected_chat_thread_topics(&mut self, thread_topics: Vec<ThreadTopic>) {
+        self.thread_topics = thread_topics;
+        self.selected_thread_topic_index = self
+            .selected_thread_topic_index
+            .min(last_index(self.thread_topics.len()));
+        self.ensure_selected_thread_topic_visible();
+    }
+
+    pub fn selected_thread_topic(&self) -> Option<&ThreadTopic> {
+        self.thread_topics.get(self.selected_thread_topic_index)
+    }
+
+    fn selected_thread_topic_index_for_loaded_topics(&self) -> Option<usize> {
+        (!self.thread_topics.is_empty()).then_some(self.selected_thread_topic_index)
+    }
+
+    fn reconcile_thread_topic_unread_for_message(&mut self, message: &Message) {
+        let Some(topic_id) = message.thread_topic_id else {
+            return;
+        };
+        let Some(topic_index) = self
+            .thread_topics
+            .iter()
+            .position(|topic| topic.id == topic_id)
+        else {
+            return;
+        };
+
+        let topic = &mut self.thread_topics[topic_index];
+        if topic_index == self.selected_thread_topic_index {
+            topic.unread_count = 0;
+        } else if !message.is_own {
+            topic.unread_count += 1;
+        }
+    }
+
+    pub fn select_next_thread_topic(&mut self) {
+        if self.thread_topics.is_empty() {
+            self.selected_thread_topic_index = 0;
+            self.thread_topic_scroll_offset = 0;
+        } else {
+            self.selected_thread_topic_index =
+                (self.selected_thread_topic_index + 1) % self.thread_topics.len();
+            self.ensure_selected_thread_topic_visible();
+        }
+    }
+
+    pub fn select_prev_thread_topic(&mut self) {
+        if self.thread_topics.is_empty() {
+            self.selected_thread_topic_index = 0;
+            self.thread_topic_scroll_offset = 0;
+        } else if self.selected_thread_topic_index == 0 {
+            self.selected_thread_topic_index = last_index(self.thread_topics.len());
+            self.ensure_selected_thread_topic_visible();
+        } else {
+            self.selected_thread_topic_index -= 1;
+            self.ensure_selected_thread_topic_visible();
+        }
+    }
+
     pub fn clear_loaded_chat_messages(&mut self) {
         self.messages.clear();
+        self.thread_topics.clear();
+        self.selected_thread_topic_index = 0;
+        self.thread_topic_scroll_offset = 0;
         self.reset_message_selection();
         self.input_buffer.clear();
         self.input_cursor = 0;
@@ -996,7 +1255,12 @@ impl AppState {
         match update {
             Update::NewMessage(msg) => {
                 let current_chat_id = self.chats.get(self.selected_chat_index).map(|c| c.id);
-                if current_chat_id == Some(msg.chat_id)
+                let selected_thread_topic_id = self.selected_thread_topic().map(|topic| topic.id);
+                let matches_selected_thread_topic = selected_thread_topic_id
+                    .is_none_or(|topic_id| msg.thread_topic_id == Some(topic_id));
+                let should_append_to_loaded_messages =
+                    current_chat_id == Some(msg.chat_id) && matches_selected_thread_topic;
+                if should_append_to_loaded_messages
                     && self
                         .messages
                         .iter()
@@ -1015,9 +1279,18 @@ impl AppState {
                 }
 
                 self.clear_typing_user(msg.chat_id, &msg.sender_name);
+                if let Some(topic_id) = msg.thread_topic_id {
+                    self.clear_thread_typing_user(msg.chat_id, topic_id, &msg.sender_name);
+                } else {
+                    self.clear_thread_typing_user_for_chat(msg.chat_id, &msg.sender_name);
+                }
+
+                if should_append_to_loaded_messages {
+                    self.messages.push(msg.clone());
+                }
 
                 if current_chat_id == Some(msg.chat_id) {
-                    self.messages.push(msg.clone());
+                    self.reconcile_thread_topic_unread_for_message(&msg);
                 }
 
                 if let Some(chat) = self.chats.iter_mut().find(|c| c.id == msg.chat_id) {
@@ -1103,19 +1376,37 @@ impl AppState {
             }
             Update::TypingStatus {
                 chat_id,
+                topic_id,
                 user_name,
                 is_typing,
             } => {
                 if is_typing {
-                    let users = self.typing_users.entry(chat_id).or_default();
+                    let users = if let Some(topic_id) = topic_id {
+                        self.thread_typing_users
+                            .entry((chat_id, topic_id))
+                            .or_default()
+                    } else {
+                        self.typing_users.entry(chat_id).or_default()
+                    };
                     if !users.contains(&user_name) {
                         users.push(user_name);
                     }
+                } else if let Some(topic_id) = topic_id {
+                    self.clear_thread_typing_user(chat_id, topic_id, &user_name);
                 } else {
                     self.clear_typing_user(chat_id, &user_name);
                 }
             }
             Update::Error(error) => self.set_error(error),
+        }
+    }
+
+    pub fn selected_typing_users(&self) -> Option<&Vec<String>> {
+        let chat_id = self.selected_chat_id()?;
+        if let Some(topic) = self.selected_thread_topic() {
+            self.thread_typing_users.get(&(chat_id, topic.id))
+        } else {
+            self.typing_users.get(&chat_id)
         }
     }
 
@@ -1126,6 +1417,25 @@ impl AppState {
                 self.typing_users.remove(&chat_id);
             }
         }
+    }
+
+    fn clear_thread_typing_user(&mut self, chat_id: i64, topic_id: i32, user_name: &str) {
+        if let Some(users) = self.thread_typing_users.get_mut(&(chat_id, topic_id)) {
+            users.retain(|user| user != user_name);
+            if users.is_empty() {
+                self.thread_typing_users.remove(&(chat_id, topic_id));
+            }
+        }
+    }
+
+    fn clear_thread_typing_user_for_chat(&mut self, chat_id: i64, user_name: &str) {
+        self.thread_typing_users
+            .retain(|(typing_chat_id, _), users| {
+                if *typing_chat_id == chat_id {
+                    users.retain(|user| user != user_name);
+                }
+                !users.is_empty()
+            });
     }
 
     #[cfg(test)]
@@ -1511,11 +1821,16 @@ impl AppState {
         } else if let Some(message_id) = self.replying_to_message_id {
             Some(MessageSubmitAction::Reply {
                 chat_id,
+                thread_top_message_id: self.selected_thread_topic().map(|topic| topic.id),
                 message_id,
                 content,
             })
         } else {
-            Some(MessageSubmitAction::Send { chat_id, content })
+            Some(MessageSubmitAction::Send {
+                chat_id,
+                thread_top_message_id: self.selected_thread_topic().map(|topic| topic.id),
+                content,
+            })
         }
     }
 
@@ -1560,10 +1875,17 @@ impl AppState {
         self.set_error(reply_failed_error(error));
     }
 
-    pub fn apply_send_pending(&mut self, temp_id: i32, chat_id: i64, content: String) {
+    pub fn apply_send_pending(
+        &mut self,
+        temp_id: i32,
+        chat_id: i64,
+        thread_topic_id: Option<i32>,
+        content: String,
+    ) {
         self.messages.push(Message {
             id: temp_id,
             chat_id,
+            thread_topic_id,
             sender_name: OWN_SENDER_NAME.to_string(),
             content,
             timestamp: Utc::now(),
@@ -1728,7 +2050,7 @@ mod tests {
         reply_failed_error, send_failed_error,
     };
     use crate::telegram::types::{
-        Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME,
+        Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, ThreadTopic,
         UNKNOWN_DELETE_UPDATE_CHAT_ID, Update, all_folder,
     };
     use chrono::{Duration, Utc};
@@ -1762,6 +2084,17 @@ mod tests {
 
     fn folder_area(width: u16) -> Rect {
         Rect::new(0, 0, width, TEST_FOLDER_AREA_HEIGHT)
+    }
+
+    fn thread_topic(id: i32, title: &str) -> ThreadTopic {
+        ThreadTopic {
+            id,
+            title: title.to_string(),
+            top_message_id: id,
+            unread_count: 0,
+            is_closed: false,
+            is_pinned: false,
+        }
     }
 
     fn input_area(width: u16) -> Rect {
@@ -1799,6 +2132,7 @@ mod tests {
         Message {
             id,
             chat_id: 10,
+            thread_topic_id: None,
             sender_name: "Alice".to_string(),
             content: format!("message {}", id),
             timestamp: Utc::now(),
@@ -1817,6 +2151,7 @@ mod tests {
         Message {
             id,
             chat_id,
+            thread_topic_id: None,
             sender_name: if is_own { OWN_SENDER_NAME } else { "Alice" }.to_string(),
             content: content.to_string(),
             timestamp: Utc::now(),
@@ -1946,6 +2281,42 @@ mod tests {
     }
 
     #[test]
+    fn visible_thread_topics_follow_selected_topic_window() {
+        let mut state = AppState::new();
+        state.thread_topics_area = folder_area(TEST_NARROW_FOLDER_AREA_WIDTH);
+        state.thread_topics = vec![
+            thread_topic(101, "One"),
+            thread_topic(102, "Two"),
+            thread_topic(103, "Three"),
+        ];
+
+        state.select_thread_topic_at(2);
+        let (visible, has_left, has_right) = state.get_visible_thread_topics();
+
+        assert_eq!(state.thread_topic_scroll_offset, 2);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].title, "Three");
+        assert!(has_left);
+        assert!(!has_right);
+    }
+
+    #[test]
+    fn thread_topic_index_at_visible_column_uses_scrolled_window() {
+        let mut state = AppState::new();
+        state.thread_topics_area = folder_area(TEST_WIDE_FOLDER_AREA_WIDTH);
+        state.thread_topics = vec![
+            thread_topic(101, "One"),
+            thread_topic(102, "好"),
+            thread_topic(103, "Three"),
+        ];
+        state.thread_topic_scroll_offset = 1;
+
+        assert_eq!(state.thread_topic_index_at_visible_column(0), None);
+        assert_eq!(state.thread_topic_index_at_visible_column(1), None);
+        assert_eq!(state.thread_topic_index_at_visible_column(2), Some(1));
+    }
+
+    #[test]
     fn incoming_message_in_active_chat_does_not_increment_unread() {
         let mut state = AppState::new();
         state.folders = vec![all_folder(99), folder(2, "Personal", 99)];
@@ -2015,6 +2386,134 @@ mod tests {
         )));
 
         assert_eq!(state.typing_users.get(&1), Some(&vec!["Bob".to_string()]));
+    }
+
+    #[test]
+    fn topic_typing_status_is_scoped_to_selected_topic() {
+        let mut state = AppState::new();
+        state.chats = vec![chat_with_unread(1, "Forum", 0, None)];
+        state.apply_loaded_selected_chat_thread_topics(vec![ThreadTopic {
+            id: 101,
+            title: "General".to_string(),
+            top_message_id: 1001,
+            unread_count: 0,
+            is_closed: false,
+            is_pinned: false,
+        }]);
+
+        state.apply_update(Update::TypingStatus {
+            chat_id: 1,
+            topic_id: Some(101),
+            user_name: "Alice".to_string(),
+            is_typing: true,
+        });
+        state.apply_update(Update::TypingStatus {
+            chat_id: 1,
+            topic_id: None,
+            user_name: "Bob".to_string(),
+            is_typing: true,
+        });
+
+        assert_eq!(
+            state.selected_typing_users(),
+            Some(&vec!["Alice".to_string()])
+        );
+        assert_eq!(state.typing_users.get(&1), Some(&vec!["Bob".to_string()]));
+    }
+
+    #[test]
+    fn incoming_message_for_other_thread_does_not_append_to_selected_thread_view() {
+        let mut state = AppState::new();
+        state.chats = vec![chat(1, "Forum")];
+        state.apply_loaded_selected_chat_thread_topics(vec![
+            thread_topic(101, "General"),
+            thread_topic(102, "Deployments"),
+        ]);
+        let mut selected_topic_message = update_message(20, 1, "selected topic", false);
+        selected_topic_message.thread_topic_id = Some(101);
+        state.apply_loaded_selected_chat_messages(vec![selected_topic_message]);
+
+        let mut other_topic_message = update_message(12, 1, "other topic", false);
+        other_topic_message.thread_topic_id = Some(102);
+        state.apply_update(Update::NewMessage(other_topic_message));
+
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].content, "selected topic");
+        assert_eq!(state.chats[0].last_message.as_deref(), Some("other topic"));
+        assert_eq!(state.thread_topics[1].unread_count, 1);
+    }
+
+    #[test]
+    fn incoming_message_for_selected_thread_appends_to_selected_thread_view() {
+        let mut state = AppState::new();
+        state.chats = vec![chat(1, "Forum")];
+        state.apply_loaded_selected_chat_thread_topics(vec![thread_topic(101, "General")]);
+        state.thread_topics[0].unread_count = 3;
+
+        let mut topic_message = update_message(12, 1, "selected topic update", false);
+        topic_message.thread_topic_id = Some(101);
+        state.apply_update(Update::NewMessage(topic_message));
+
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].content, "selected topic update");
+        assert_eq!(state.thread_topics[0].unread_count, 0);
+    }
+
+    #[test]
+    fn loading_selected_thread_messages_clears_selected_topic_unread_count() {
+        let mut state = AppState::new();
+        state.chats = vec![chat(1, "Forum")];
+        state.apply_loaded_selected_chat_thread_topics(vec![thread_topic(101, "General")]);
+        state.thread_topics[0].unread_count = 4;
+
+        let mut topic_message = update_message(12, 1, "selected topic history", false);
+        topic_message.thread_topic_id = Some(101);
+        state.apply_loaded_selected_chat_messages(vec![topic_message]);
+
+        assert_eq!(state.thread_topics[0].unread_count, 0);
+    }
+
+    #[test]
+    fn incoming_message_clears_thread_typing_indicator_for_sender() {
+        let mut state = AppState::new();
+        state.chats = vec![chat_with_unread(1, "Forum", 0, None)];
+        state
+            .thread_typing_users
+            .insert((1, 101), vec!["Alice".to_string(), "Bob".to_string()]);
+
+        state.apply_update(Update::NewMessage(update_message(
+            10,
+            1,
+            "topic message",
+            false,
+        )));
+
+        assert_eq!(
+            state.thread_typing_users.get(&(1, 101)),
+            Some(&vec!["Bob".to_string()])
+        );
+    }
+
+    #[test]
+    fn incoming_topic_message_clears_only_matching_thread_typing_indicator_for_sender() {
+        let mut state = AppState::new();
+        state.chats = vec![chat_with_unread(1, "Forum", 0, None)];
+        state
+            .thread_typing_users
+            .insert((1, 101), vec!["Alice".to_string()]);
+        state
+            .thread_typing_users
+            .insert((1, 102), vec!["Alice".to_string()]);
+
+        let mut topic_message = update_message(10, 1, "topic message", false);
+        topic_message.thread_topic_id = Some(102);
+        state.apply_update(Update::NewMessage(topic_message));
+
+        assert_eq!(
+            state.thread_typing_users.get(&(1, 101)),
+            Some(&vec!["Alice".to_string()])
+        );
+        assert!(!state.thread_typing_users.contains_key(&(1, 102)));
     }
 
     #[test]
@@ -2640,7 +3139,31 @@ mod tests {
             state.prepare_message_submit(),
             Some(MessageSubmitAction::Send {
                 chat_id: 10,
+                thread_top_message_id: None,
                 content: "hello".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn prepare_message_submit_includes_selected_thread_topic_for_plain_send() {
+        let mut state = state_with_chats();
+        state.input_buffer = "thread hello".to_string();
+        state.apply_loaded_selected_chat_thread_topics(vec![ThreadTopic {
+            id: 101,
+            title: "General".to_string(),
+            top_message_id: 901,
+            unread_count: 0,
+            is_closed: false,
+            is_pinned: false,
+        }]);
+
+        assert_eq!(
+            state.prepare_message_submit(),
+            Some(MessageSubmitAction::Send {
+                chat_id: 10,
+                thread_top_message_id: Some(101),
+                content: "thread hello".to_string(),
             })
         );
     }
@@ -2668,8 +3191,34 @@ mod tests {
             state.prepare_message_submit(),
             Some(MessageSubmitAction::Reply {
                 chat_id: 10,
+                thread_top_message_id: None,
                 message_id: 43,
                 content: "reply".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn prepare_message_submit_includes_selected_thread_topic_for_reply() {
+        let mut state = state_with_chats();
+        state.input_buffer = "thread reply".to_string();
+        state.apply_loaded_selected_chat_thread_topics(vec![ThreadTopic {
+            id: 101,
+            title: "General".to_string(),
+            top_message_id: 901,
+            unread_count: 0,
+            is_closed: false,
+            is_pinned: false,
+        }]);
+        state.enter_reply_mode(43);
+
+        assert_eq!(
+            state.prepare_message_submit(),
+            Some(MessageSubmitAction::Reply {
+                chat_id: 10,
+                thread_top_message_id: Some(101),
+                message_id: 43,
+                content: "thread reply".to_string(),
             })
         );
     }
@@ -2770,7 +3319,7 @@ mod tests {
         state.input_buffer = "plain send".to_string();
         state.save_current_draft();
 
-        state.apply_send_pending(-1, 10, "plain send".to_string());
+        state.apply_send_pending(-1, 10, None, "plain send".to_string());
 
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].id, -1);
@@ -2790,7 +3339,7 @@ mod tests {
         state.chats[0].unread_count = 2;
         state.folders = vec![all_folder(2)];
         state.set_status("Sending message…");
-        state.apply_send_pending(-1, 10, "plain send".to_string());
+        state.apply_send_pending(-1, 10, None, "plain send".to_string());
 
         let mut sent_message = update_message(42, 10, "plain send", true);
         sent_message.status = MessageStatus::Sent;
@@ -2808,7 +3357,7 @@ mod tests {
     #[test]
     fn apply_send_failure_marks_pending_message_failed_and_sets_error() {
         let mut state = state_with_chats();
-        state.apply_send_pending(-1, 10, "plain send".to_string());
+        state.apply_send_pending(-1, 10, None, "plain send".to_string());
 
         state.apply_send_failure(-1, "network down".to_string());
 
@@ -3067,9 +3616,60 @@ mod tests {
     }
 
     #[test]
+    fn thread_topic_selection_clamps_to_loaded_topics() {
+        let mut state = AppState::new();
+        state.apply_loaded_selected_chat_thread_topics(vec![
+            ThreadTopic {
+                id: 101,
+                title: "General".to_string(),
+                top_message_id: 101,
+                unread_count: 1,
+                is_closed: false,
+                is_pinned: true,
+            },
+            ThreadTopic {
+                id: 102,
+                title: "Deployments".to_string(),
+                top_message_id: 102,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            },
+        ]);
+
+        assert_eq!(state.selected_thread_topic().unwrap().title, "General");
+        state.select_next_thread_topic();
+        assert_eq!(state.selected_thread_topic_index, 1);
+        assert_eq!(state.selected_thread_topic().unwrap().title, "Deployments");
+        state.select_next_thread_topic();
+        assert_eq!(state.selected_thread_topic_index, 0);
+        state.select_prev_thread_topic();
+        assert_eq!(state.selected_thread_topic_index, 1);
+
+        state.selected_thread_topic_index = 99;
+        state.apply_loaded_selected_chat_thread_topics(vec![ThreadTopic {
+            id: 103,
+            title: "Only".to_string(),
+            top_message_id: 103,
+            unread_count: 0,
+            is_closed: false,
+            is_pinned: false,
+        }]);
+        assert_eq!(state.selected_thread_topic_index, 0);
+    }
+
+    #[test]
     fn clear_loaded_chat_messages_resets_messages_selection_and_input() {
         let mut state = AppState::new();
         state.messages = vec![message(10), message(20)];
+        state.thread_topics = vec![ThreadTopic {
+            id: 101,
+            title: "General".to_string(),
+            top_message_id: 101,
+            unread_count: 1,
+            is_closed: false,
+            is_pinned: true,
+        }];
         state.selected_message_index = 1;
         state.message_scroll_offset = 1;
         state.input_buffer = "stale".to_string();
@@ -3077,6 +3677,7 @@ mod tests {
         state.clear_loaded_chat_messages();
 
         assert!(state.messages.is_empty());
+        assert!(state.thread_topics.is_empty());
         assert_eq!(state.selected_message_index, 0);
         assert_eq!(state.message_scroll_offset, 0);
         assert_eq!(state.input_buffer, "");

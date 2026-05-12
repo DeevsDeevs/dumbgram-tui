@@ -1,6 +1,7 @@
 use super::client::{DownloadedMedia, TelegramClient};
 use super::types::{
-    Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, Update, all_folder,
+    Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, ThreadTopic, Update,
+    all_folder,
 };
 use base64::Engine;
 use chrono::Utc;
@@ -138,6 +139,115 @@ impl TelegramClient for MockTelegramClient {
         Ok(chats.into_iter().take(limit).collect())
     }
 
+    async fn get_thread_topics(&self, chat_id: i64, limit: usize) -> Result<Vec<ThreadTopic>> {
+        let topics = match chat_id {
+            3 => vec![
+                ThreadTopic {
+                    id: 101,
+                    title: "General".to_string(),
+                    top_message_id: 1001,
+                    unread_count: 1,
+                    is_closed: false,
+                    is_pinned: true,
+                },
+                ThreadTopic {
+                    id: 102,
+                    title: "Deployments".to_string(),
+                    top_message_id: 1002,
+                    unread_count: 0,
+                    is_closed: false,
+                    is_pinned: false,
+                },
+            ],
+            _ => Vec::new(),
+        };
+        Ok(topics.into_iter().take(limit).collect())
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn get_thread_messages(
+        &self,
+        chat_id: i64,
+        topic_id: i32,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<Message>>> + Send + '_ {
+        async move {
+            let messages = match (chat_id, topic_id) {
+                (3, 101) => vec![
+                    Message {
+                        id: 101,
+                        chat_id,
+                        thread_topic_id: Some(101),
+                        sender_name: "Manager".to_string(),
+                        content: "General topic: weekly coordination".to_string(),
+                        timestamp: Utc::now(),
+                        is_own: false,
+                        is_edited: false,
+                        reply_to_content: None,
+                        media: None,
+                        status: MessageStatus::Delivered,
+                        can_edit: false,
+                        can_delete: false,
+                        error: None,
+                    },
+                    Message {
+                        id: 103,
+                        chat_id,
+                        thread_topic_id: Some(101),
+                        sender_name: "Colleague".to_string(),
+                        content: "I'll post the notes here.".to_string(),
+                        timestamp: Utc::now(),
+                        is_own: false,
+                        is_edited: false,
+                        reply_to_content: Some("General topic: weekly coordination".to_string()),
+                        media: None,
+                        status: MessageStatus::Delivered,
+                        can_edit: false,
+                        can_delete: false,
+                        error: None,
+                    },
+                ],
+                (3, 102) => vec![Message {
+                    id: 102,
+                    chat_id,
+                    thread_topic_id: Some(102),
+                    sender_name: "Developer".to_string(),
+                    content: "Deployments topic: staging is ready".to_string(),
+                    timestamp: Utc::now(),
+                    is_own: false,
+                    is_edited: false,
+                    reply_to_content: None,
+                    media: None,
+                    status: MessageStatus::Delivered,
+                    can_edit: false,
+                    can_delete: false,
+                    error: None,
+                }],
+                _ => Vec::new(),
+            };
+
+            Ok(messages.into_iter().take(limit).collect())
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn get_thread_messages_before(
+        &self,
+        chat_id: i64,
+        topic_id: i32,
+        before_message_id: i32,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<Message>>> + Send + '_ {
+        async move {
+            let mut messages = self
+                .get_thread_messages(chat_id, topic_id, usize::MAX)
+                .await?;
+            messages.retain(|message| message.id < before_message_id);
+            let start = messages.len().saturating_sub(limit);
+            Ok(messages.split_off(start))
+        }
+    }
+
     #[allow(clippy::manual_async_fn)]
     fn get_messages(
         &self,
@@ -150,6 +260,7 @@ impl TelegramClient for MockTelegramClient {
                     Message {
                         id: 1,
                         chat_id,
+                        thread_topic_id: None,
                         sender_name: "Alice".to_string(),
                         content: "Hey! How are you?".to_string(),
                         timestamp: Utc::now(),
@@ -165,6 +276,7 @@ impl TelegramClient for MockTelegramClient {
                     Message {
                         id: 2,
                         chat_id,
+                        thread_topic_id: None,
                         sender_name: OWN_SENDER_NAME.to_string(),
                         content: "I'm doing great! How about you?".to_string(),
                         timestamp: Utc::now(),
@@ -180,6 +292,7 @@ impl TelegramClient for MockTelegramClient {
                     Message {
                         id: 3,
                         chat_id,
+                        thread_topic_id: None,
                         sender_name: "Alice".to_string(),
                         content: "Pretty good! Want to grab coffee later?".to_string(),
                         timestamp: Utc::now(),
@@ -197,6 +310,7 @@ impl TelegramClient for MockTelegramClient {
                     Message {
                         id: 1,
                         chat_id,
+                        thread_topic_id: None,
                         sender_name: "Bob".to_string(),
                         content: "Did you see the game last night?".to_string(),
                         timestamp: Utc::now(),
@@ -212,6 +326,7 @@ impl TelegramClient for MockTelegramClient {
                     Message {
                         id: 2,
                         chat_id,
+                        thread_topic_id: None,
                         sender_name: OWN_SENDER_NAME.to_string(),
                         content: "Yeah! It was incredible!".to_string(),
                         timestamp: Utc::now(),
@@ -229,6 +344,7 @@ impl TelegramClient for MockTelegramClient {
                     Message {
                         id: 1,
                         chat_id,
+                        thread_topic_id: None,
                         sender_name: "Manager".to_string(),
                         content: "Team meeting at 3 PM today".to_string(),
                         timestamp: Utc::now(),
@@ -244,6 +360,7 @@ impl TelegramClient for MockTelegramClient {
                     Message {
                         id: 2,
                         chat_id,
+                        thread_topic_id: None,
                         sender_name: OWN_SENDER_NAME.to_string(),
                         content: "Got it, I'll be there".to_string(),
                         timestamp: Utc::now(),
@@ -259,6 +376,7 @@ impl TelegramClient for MockTelegramClient {
                     Message {
                         id: 3,
                         chat_id,
+                        thread_topic_id: None,
                         sender_name: "Colleague".to_string(),
                         content: "Should I prepare the slides?".to_string(),
                         timestamp: Utc::now(),
@@ -276,6 +394,7 @@ impl TelegramClient for MockTelegramClient {
                     Message {
                         id: 1,
                         chat_id,
+                        thread_topic_id: None,
                         sender_name: "Developer".to_string(),
                         content: "Deploy is ready for staging".to_string(),
                         timestamp: Utc::now(),
@@ -291,6 +410,7 @@ impl TelegramClient for MockTelegramClient {
                     Message {
                         id: 2,
                         chat_id,
+                        thread_topic_id: None,
                         sender_name: OWN_SENDER_NAME.to_string(),
                         content: "Great! Let's review it first".to_string(),
                         timestamp: Utc::now(),
@@ -306,6 +426,7 @@ impl TelegramClient for MockTelegramClient {
                     Message {
                         id: 3,
                         chat_id,
+                        thread_topic_id: None,
                         sender_name: "QA".to_string(),
                         content: "I can test it this afternoon".to_string(),
                         timestamp: Utc::now(),
@@ -349,12 +470,40 @@ impl TelegramClient for MockTelegramClient {
             Ok(Message {
                 id: 999,
                 chat_id,
+                thread_topic_id: None,
                 sender_name: OWN_SENDER_NAME.to_string(),
                 content,
                 timestamp: Utc::now(),
                 is_own: true,
                 is_edited: false,
                 reply_to_content: None,
+                media: None,
+                status: MessageStatus::Sent,
+                can_edit: true,
+                can_delete: true,
+                error: None,
+            })
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn send_message_to_thread(
+        &self,
+        chat_id: i64,
+        topic_id: i32,
+        content: String,
+    ) -> impl std::future::Future<Output = Result<Message>> + Send + '_ {
+        async move {
+            Ok(Message {
+                id: 1000 + topic_id,
+                chat_id,
+                thread_topic_id: Some(topic_id),
+                sender_name: OWN_SENDER_NAME.to_string(),
+                content,
+                timestamp: Utc::now(),
+                is_own: true,
+                is_edited: false,
+                reply_to_content: Some(format!("topic {topic_id}")),
                 media: None,
                 status: MessageStatus::Sent,
                 can_edit: true,
@@ -385,12 +534,41 @@ impl TelegramClient for MockTelegramClient {
             Ok(Message {
                 id: 1000,
                 chat_id,
+                thread_topic_id: None,
                 sender_name: OWN_SENDER_NAME.to_string(),
                 content,
                 timestamp: Utc::now(),
                 is_own: true,
                 is_edited: false,
                 reply_to_content: Some("Replied message".to_string()),
+                media: None,
+                status: MessageStatus::Sent,
+                can_edit: true,
+                can_delete: true,
+                error: None,
+            })
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn reply_to_message_in_thread(
+        &self,
+        chat_id: i64,
+        topic_id: i32,
+        reply_to: i32,
+        content: String,
+    ) -> impl std::future::Future<Output = Result<Message>> + Send + '_ {
+        async move {
+            Ok(Message {
+                id: 2000 + topic_id,
+                chat_id,
+                thread_topic_id: Some(topic_id),
+                sender_name: OWN_SENDER_NAME.to_string(),
+                content,
+                timestamp: Utc::now(),
+                is_own: true,
+                is_edited: false,
+                reply_to_content: Some(format!("topic {topic_id} reply {reply_to}")),
                 media: None,
                 status: MessageStatus::Sent,
                 can_edit: true,
@@ -428,6 +606,7 @@ impl TelegramClient for MockTelegramClient {
                         0 => Update::NewMessage(Message {
                             id: 2000 + counter,
                             chat_id: 1,
+                            thread_topic_id: None,
                             sender_name: "Alice".to_string(),
                             content: format!("Mock update message #{}", counter),
                             timestamp: Utc::now(),
@@ -450,6 +629,7 @@ impl TelegramClient for MockTelegramClient {
                         },
                         _ => Update::TypingStatus {
                             chat_id: 1,
+                            topic_id: None,
                             user_name: "Alice".to_string(),
                             is_typing: true,
                         },
@@ -468,8 +648,121 @@ impl TelegramClient for MockTelegramClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{MOCK_IMAGE_PNG_BASE64, mock_photo_media};
+    use super::{MOCK_IMAGE_PNG_BASE64, MockTelegramClient, mock_photo_media};
+    use crate::telegram::TelegramClient;
     use base64::Engine;
+
+    #[tokio::test]
+    async fn mock_thread_topics_are_available_for_threaded_group() {
+        let client = MockTelegramClient::new();
+
+        let topics = client.get_thread_topics(3, 10).await.unwrap();
+
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics[0].title, "General");
+        assert_eq!(topics[0].top_message_id, 1001);
+    }
+
+    #[tokio::test]
+    async fn mock_thread_messages_are_available_by_topic_id() {
+        let client = MockTelegramClient::new();
+
+        let messages = client.get_thread_messages(3, 101, 10).await.unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].id, 101);
+        assert!(messages[0].content.contains("General topic"));
+        assert_eq!(
+            messages[1].reply_to_content.as_deref(),
+            Some("General topic: weekly coordination")
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_older_thread_messages_page_within_topic() {
+        let client = MockTelegramClient::new();
+
+        let messages = client
+            .get_thread_messages_before(3, 101, 103, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, 101);
+        assert!(messages[0].content.contains("General topic"));
+    }
+
+    #[tokio::test]
+    async fn mock_thread_messages_respect_limit_and_unknown_threads() {
+        let client = MockTelegramClient::new();
+
+        assert_eq!(
+            client.get_thread_messages(3, 101, 1).await.unwrap().len(),
+            1
+        );
+        assert!(
+            client
+                .get_thread_messages(3, 1001, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            client
+                .get_thread_messages(3, 999, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            client
+                .get_thread_messages(1, 101, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_reply_to_message_in_thread_marks_topic_context() {
+        let client = MockTelegramClient::new();
+
+        let message = client
+            .reply_to_message_in_thread(3, 102, 7, "ack".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(message.chat_id, 3);
+        assert_eq!(message.id, 2102);
+        assert_eq!(message.content, "ack");
+        assert_eq!(
+            message.reply_to_content.as_deref(),
+            Some("topic 102 reply 7")
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_send_message_to_thread_marks_topic_context() {
+        let client = MockTelegramClient::new();
+
+        let message = client
+            .send_message_to_thread(3, 102, "ship it".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(message.chat_id, 3);
+        assert_eq!(message.id, 1102);
+        assert_eq!(message.content, "ship it");
+        assert_eq!(message.reply_to_content.as_deref(), Some("topic 102"));
+    }
+
+    #[tokio::test]
+    async fn mock_thread_topics_respect_limit_and_non_threaded_chats() {
+        let client = MockTelegramClient::new();
+
+        assert_eq!(client.get_thread_topics(3, 1).await.unwrap().len(), 1);
+        assert!(client.get_thread_topics(1, 10).await.unwrap().is_empty());
+    }
 
     #[test]
     fn mock_photo_media_has_local_preview_file_for_kitty_smoke() {

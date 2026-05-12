@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKeyOutcome {
     Handled,
+    OpenSelectedThreadTopic,
     OpenSelectedLink,
     CopySelectedText,
     DownloadSelectedMedia,
@@ -29,8 +30,29 @@ pub fn handle_message_key(state: &mut AppState, key: KeyEvent) -> MessageKeyOutc
             }
         }
         KeyCode::Up => state.select_prev_message(),
-        KeyCode::Left => state.focused_panel = FocusedPanel::Chats,
-        KeyCode::Right => {}
+        KeyCode::Left if state.thread_topics.is_empty() => {
+            state.focused_panel = FocusedPanel::Chats
+        }
+        KeyCode::Left => {
+            state.select_prev_thread_topic();
+            return MessageKeyOutcome::OpenSelectedThreadTopic;
+        }
+        KeyCode::Right if state.thread_topics.is_empty() => {}
+        KeyCode::Right => {
+            state.select_next_thread_topic();
+            return MessageKeyOutcome::OpenSelectedThreadTopic;
+        }
+        KeyCode::Enter if !state.thread_topics.is_empty() => {
+            return MessageKeyOutcome::OpenSelectedThreadTopic;
+        }
+        KeyCode::Char('[') => {
+            state.select_prev_thread_topic();
+            return MessageKeyOutcome::OpenSelectedThreadTopic;
+        }
+        KeyCode::Char(']') => {
+            state.select_next_thread_topic();
+            return MessageKeyOutcome::OpenSelectedThreadTopic;
+        }
         KeyCode::Char('e') => state.request_edit_selected_message(),
         KeyCode::Char('r') => state.request_reply_to_selected_message(),
         KeyCode::Char('d') => state.request_delete_selected_message(),
@@ -48,7 +70,7 @@ pub fn handle_message_key(state: &mut AppState, key: KeyEvent) -> MessageKeyOutc
 mod tests {
     use super::{MessageKeyOutcome, handle_message_key};
     use crate::state::{AppState, FocusedPanel};
-    use crate::telegram::types::{Message, MessageStatus};
+    use crate::telegram::types::{Message, MessageStatus, ThreadTopic};
     use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -60,6 +82,7 @@ mod tests {
         Message {
             id,
             chat_id: 7,
+            thread_topic_id: None,
             sender_name: "me".to_string(),
             content: format!("message {id}"),
             timestamp: Utc::now(),
@@ -123,6 +146,59 @@ mod tests {
         assert!(state.delete_confirmation.is_some_and(|confirmation| {
             confirmation.chat_id == 7 && confirmation.message_id == 42
         }));
+    }
+
+    #[test]
+    fn message_keys_select_thread_topics() {
+        let mut state = AppState::new();
+        state.focused_panel = FocusedPanel::Messages;
+        state.thread_topics = vec![
+            ThreadTopic {
+                id: 101,
+                title: "General".to_string(),
+                top_message_id: 101,
+                unread_count: 1,
+                is_closed: false,
+                is_pinned: true,
+            },
+            ThreadTopic {
+                id: 102,
+                title: "Deployments".to_string(),
+                top_message_id: 102,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            },
+        ];
+
+        assert_eq!(
+            handle_message_key(&mut state, key(KeyCode::Right)),
+            MessageKeyOutcome::OpenSelectedThreadTopic
+        );
+        assert_eq!(state.selected_thread_topic_index, 1);
+
+        assert_eq!(
+            handle_message_key(&mut state, key(KeyCode::Left)),
+            MessageKeyOutcome::OpenSelectedThreadTopic
+        );
+        assert_eq!(state.selected_thread_topic_index, 0);
+
+        assert_eq!(
+            handle_message_key(&mut state, key(KeyCode::Enter)),
+            MessageKeyOutcome::OpenSelectedThreadTopic
+        );
+        assert_eq!(state.selected_thread_topic_index, 0);
+    }
+
+    #[test]
+    fn message_keys_ignore_enter_when_no_thread_topics_are_loaded() {
+        let mut state = AppState::new();
+        state.focused_panel = FocusedPanel::Messages;
+
+        assert_eq!(
+            handle_message_key(&mut state, key(KeyCode::Enter)),
+            MessageKeyOutcome::Ignored
+        );
     }
 
     #[test]

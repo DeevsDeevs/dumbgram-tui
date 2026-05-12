@@ -53,6 +53,7 @@ pub enum Update {
     },
     TypingStatus {
         chat_id: i64,
+        topic_id: Option<i32>,
         user_name: String,
         is_typing: bool,
     },
@@ -144,10 +145,21 @@ pub struct Chat {
     pub folder_id: Option<i32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadTopic {
+    pub id: i32,
+    pub title: String,
+    pub top_message_id: i32,
+    pub unread_count: usize,
+    pub is_closed: bool,
+    pub is_pinned: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub id: i32,
     pub chat_id: i64,
+    pub thread_topic_id: Option<i32>,
     pub sender_name: String,
     pub content: String,
     pub timestamp: DateTime<Utc>,
@@ -177,8 +189,9 @@ pub fn is_all_folder(folder: &Folder) -> bool {
 mod tests {
     use super::{
         ALL_FOLDER_ID, ALL_FOLDER_NAME, Folder, LAST_MESSAGE_PREVIEW_WIDTH, MessageMedia,
-        OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, all_folder,
-        is_all_folder, message_display_content, message_display_preview, message_preview,
+        OWN_SENDER_NAME, ThreadTopic, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME,
+        all_folder, is_all_folder, message_display_content, message_display_preview,
+        message_preview,
     };
     use crate::text::display_width;
 
@@ -196,6 +209,23 @@ mod tests {
     fn sender_labels_are_shared_display_text() {
         assert_eq!(OWN_SENDER_NAME, "You");
         assert_eq!(UNKNOWN_SENDER_NAME, "Unknown");
+    }
+
+    #[test]
+    fn thread_topic_carries_navigation_metadata() {
+        let topic = ThreadTopic {
+            id: 42,
+            title: "Support".to_string(),
+            top_message_id: 100,
+            unread_count: 3,
+            is_closed: false,
+            is_pinned: true,
+        };
+
+        assert_eq!(topic.id, 42);
+        assert_eq!(topic.top_message_id, 100);
+        assert_eq!(topic.unread_count, 3);
+        assert!(topic.is_pinned);
     }
 
     #[test]

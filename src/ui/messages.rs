@@ -2,8 +2,10 @@ use super::{SELECTED_ROW_SYMBOL, list_text_width, selected_list_index};
 use crate::{
     app::App,
     config::Theme,
-    state::FocusedPanel,
-    telegram::types::{MessageStatus, message_display_content},
+    state::{
+        FOLDER_LEFT_SCROLL_INDICATOR, FOLDER_RIGHT_SCROLL_INDICATOR, FOLDER_SEPARATOR, FocusedPanel,
+    },
+    telegram::types::{MessageStatus, ThreadTopic, message_display_content},
     text::{display_width, truncate_with_ellipsis, wrap_display_lines_limited},
 };
 use ratatui::{
@@ -27,6 +29,69 @@ pub(crate) const DELETE_CONFIRMATION_TITLE: &str = " Confirm ";
 pub(crate) const DELETE_CONFIRMATION_POPUP_WIDTH_PERCENT: u16 = 60;
 pub(crate) const DELETE_CONFIRMATION_POPUP_HEIGHT_PERCENT: u16 = 20;
 pub(crate) const MESSAGE_TITLE_BORDER_RESERVED_COLUMNS: u16 = 2;
+pub(crate) const THREAD_TOPICS_PANEL_TITLE: &str = " Topics ";
+
+pub fn render_thread_topics(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    app: &App,
+    theme: &Theme,
+) {
+    let (visible_topics, has_left, has_right) = app.state.get_visible_thread_topics();
+    let mut spans = Vec::new();
+
+    if has_left {
+        spans.push(Span::styled(
+            FOLDER_LEFT_SCROLL_INDICATOR,
+            Style::default().fg(theme.selected_item),
+        ));
+    }
+
+    for (idx, topic) in visible_topics.iter().enumerate() {
+        let global_idx = app.state.thread_topic_scroll_offset + idx;
+
+        if idx > 0 {
+            spans.push(Span::raw(FOLDER_SEPARATOR));
+        }
+
+        let style = if global_idx == app.state.selected_thread_topic_index {
+            Style::default()
+                .fg(theme.selected_item)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.foreground)
+        };
+        spans.push(Span::styled(thread_topic_tab_label(topic), style));
+    }
+
+    if has_right {
+        spans.push(Span::styled(
+            FOLDER_RIGHT_SCROLL_INDICATOR,
+            Style::default().fg(theme.selected_item),
+        ));
+    }
+
+    let paragraph = Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(if app.state.focused_panel == FocusedPanel::Messages {
+                Style::default().fg(theme.border_focused)
+            } else {
+                Style::default().fg(theme.border)
+            })
+            .title(THREAD_TOPICS_PANEL_TITLE),
+    );
+
+    frame.render_widget(paragraph, area);
+}
+
+fn thread_topic_tab_label(topic: &ThreadTopic) -> String {
+    if topic.unread_count > 0 {
+        format!(" {} ({}) ", topic.title, topic.unread_count)
+    } else {
+        format!(" {} ", topic.title)
+    }
+}
 
 pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
     let text_width = list_text_width(area.width);
@@ -49,8 +114,15 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
         .map(|c| c.name.as_str())
         .unwrap_or(MESSAGE_PANEL_LABEL);
     let position_label = selected_message_position(app);
+    let topic_label = selected_thread_topic_label(app);
     let typing_label = selected_chat_typing_label(app);
-    let title = message_panel_title(chat_name, &position_label, &typing_label, area.width);
+    let title = message_panel_title(
+        chat_name,
+        &position_label,
+        &topic_label,
+        &typing_label,
+        area.width,
+    );
 
     let list = List::new(items)
         .block(
@@ -321,10 +393,36 @@ pub(crate) fn message_position_label(selected_index: usize, message_count: usize
 
 fn selected_chat_typing_label(app: &App) -> String {
     app.state
-        .selected_chat_id()
-        .and_then(|chat_id| app.state.typing_users.get(&chat_id))
+        .selected_typing_users()
         .map(|users| typing_label(users))
         .unwrap_or_default()
+}
+
+fn selected_thread_topic_label(app: &App) -> String {
+    app.state
+        .selected_thread_topic()
+        .map(|topic| {
+            thread_topic_label(
+                &topic.title,
+                app.state.selected_thread_topic_index,
+                app.state.thread_topics.len(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn thread_topic_label(title: &str, selected_index: usize, topic_count: usize) -> String {
+    if topic_count == 0 {
+        String::new()
+    } else {
+        format!(
+            "{}#{} {}/{}",
+            MESSAGE_METADATA_SEPARATOR,
+            truncate_with_ellipsis(title, 18),
+            selected_index.min(topic_count - 1) + 1,
+            topic_count
+        )
+    }
 }
 
 pub(crate) fn typing_label(users: &[String]) -> String {
@@ -342,6 +440,7 @@ pub(crate) fn typing_label(users: &[String]) -> String {
 fn message_panel_title(
     chat_name: &str,
     position_label: &str,
+    topic_label: &str,
     typing_label: &str,
     area_width: u16,
 ) -> String {
@@ -350,7 +449,7 @@ fn message_panel_title(
         return String::new();
     }
 
-    let suffix = format!(" {}{}", position_label, typing_label);
+    let suffix = format!(" {}{}{}", position_label, topic_label, typing_label);
     let chat_name_width = max_title_width
         .saturating_sub(display_width(&suffix) + 2)
         .max(1);
@@ -393,18 +492,45 @@ mod tests {
         DELETE_CONFIRMATION_POPUP_HEIGHT_PERCENT, DELETE_CONFIRMATION_POPUP_WIDTH_PERCENT,
         DELETE_CONFIRMATION_TEXT, DELETE_CONFIRMATION_TITLE, MESSAGE_EMPTY_NO_CHAT_LABEL,
         MESSAGE_EMPTY_NO_MESSAGES_LABEL, MESSAGE_TITLE_BORDER_RESERVED_COLUMNS, REPLY_LINE_PREFIX,
-        REPLY_MARKER, REPLY_MARKER_SEPARATOR, display_width, message_content_spans,
-        message_empty_placeholder, message_lines, message_metadata, message_panel_title,
-        message_position_label, message_status_label, message_title_width, reply_content_width,
-        typing_label,
+        REPLY_MARKER, REPLY_MARKER_SEPARATOR, THREAD_TOPICS_PANEL_TITLE, display_width,
+        message_content_spans, message_empty_placeholder, message_lines, message_metadata,
+        message_panel_title, message_position_label, message_status_label, message_title_width,
+        reply_content_width, thread_topic_label, thread_topic_tab_label, typing_label,
     };
-    use crate::telegram::types::MessageStatus;
+    use crate::telegram::types::{MessageStatus, ThreadTopic};
 
     #[test]
     fn message_position_label_shows_clamped_position() {
         assert_eq!(message_position_label(0, 0), "0/0");
         assert_eq!(message_position_label(0, 3), "1/3");
         assert_eq!(message_position_label(99, 3), "3/3");
+    }
+
+    #[test]
+    fn thread_topic_tab_label_matches_folder_tab_style() {
+        assert_eq!(THREAD_TOPICS_PANEL_TITLE, " Topics ");
+        assert_eq!(
+            thread_topic_tab_label(&ThreadTopic {
+                id: 101,
+                title: "General".to_string(),
+                top_message_id: 101,
+                unread_count: 2,
+                is_closed: false,
+                is_pinned: true,
+            }),
+            " General (2) "
+        );
+        assert_eq!(
+            thread_topic_tab_label(&ThreadTopic {
+                id: 102,
+                title: "Deployments".to_string(),
+                top_message_id: 102,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            }),
+            " Deployments "
+        );
     }
 
     #[test]
@@ -542,6 +668,7 @@ mod tests {
             "A very long chat name that would otherwise crowd the title",
             "3/12",
             "",
+            "",
             24,
         );
 
@@ -552,10 +679,25 @@ mod tests {
 
     #[test]
     fn message_title_uses_display_width_for_wide_chat_name() {
-        let title = message_panel_title("好好好 chat", "3/12", " · 好 typing", 18);
+        let title = message_panel_title("好好好 chat", "3/12", "", " · 好 typing", 18);
 
         assert!(title.contains("3/12"));
         assert!(display_width(&title) <= 16);
+    }
+
+    #[test]
+    fn thread_topic_label_shows_selected_topic_position() {
+        let label = thread_topic_label("Deployments", 1, 3);
+
+        assert_eq!(label, " · #Deployments 2/3");
+    }
+
+    #[test]
+    fn thread_topic_label_truncates_long_topic_names() {
+        let label = thread_topic_label("A very long topic name that will not fit", 0, 2);
+
+        assert!(label.contains('…'));
+        assert!(label.ends_with(" 1/2"));
     }
 
     #[test]
