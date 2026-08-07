@@ -25,21 +25,26 @@ use app::App;
 use color_eyre::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEventKind,
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use futures_core::Stream;
 use ratatui::{
     Terminal,
     backend::{CrosstermBackend, TestBackend},
 };
+use std::future::{pending, poll_fn};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{fs, io};
 use telegram::types::{Message, ThreadTopic, Update};
 use telegram::{GrammersClient, MockTelegramClient, TelegramClient};
+use tokio::time::Instant as TokioInstant;
 
 const LOADING_TELEGRAM_STATUS: &str = "Loading Telegram data…";
 const LOADING_OLDER_MESSAGES_STATUS: &str = "Loading older messages…";
@@ -97,6 +102,7 @@ const PROMPT_EMPTY_ERROR: &str = "input cannot be empty";
 const SMOKE_OK_PREFIX: &str = "Smoke OK";
 const SMOKE_RENDER_WIDTH: u16 = 120;
 const SMOKE_RENDER_HEIGHT: u16 = 30;
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunMode {
@@ -1376,15 +1382,14 @@ async fn run_with_client<C: TelegramClient + Clone + Send + Sync + 'static>(
     let mut terminal = setup_terminal()?;
 
     app.state.set_status(LOADING_TELEGRAM_STATUS);
-    terminal.draw(|frame| ui::render_layout(frame, &mut app, theme))?;
+    let result = run_app(&mut terminal, &mut app, theme, &mut client).await;
 
-    let result = async {
-        app.state.set_status(LOADING_TELEGRAM_STATUS);
-        run_app(&mut terminal, &mut app, theme, &mut client).await
-    }
-    .await;
-
+    diagnostics::event("terminal_restore_start", "event_stream_stopped=true");
     let restore_result = restore_terminal(&mut terminal);
+    diagnostics::event(
+        "terminal_restore_finish",
+        format!("success={}", restore_result.is_ok()),
+    );
     match (result, restore_result) {
         (Err(error), _) => Err(error),
         (Ok(()), Err(error)) => Err(error),
@@ -1522,155 +1527,599 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
     theme: &config::Theme,
     client: &mut C,
 ) -> Result<()> {
-    diagnostics::event("run_loop_start", "event_loop=true");
-    let (subscribe_updates_tx, mut subscribe_updates_rx) = tokio::sync::mpsc::unbounded_channel();
+    diagnostics::event("run_loop_start", "event_driven=true");
+    let (mut loop_state, senders) = EventLoopState::new();
     let subscribe_updates_loader =
-        SubscribeUpdatesLoader::new(client.clone(), subscribe_updates_tx);
+        SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
     subscribe_updates_loader.spawn_subscribe_updates();
-    let mut update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Update>> = None;
-    let (initial_state_load_tx, mut initial_state_load_rx) = tokio::sync::mpsc::unbounded_channel();
-    let initial_state_loader = InitialStateLoader::new(client.clone(), initial_state_load_tx);
+    let initial_state_loader = InitialStateLoader::new(client.clone(), senders.initial_state);
     initial_state_loader.spawn_initial_state();
-    let mut initial_state_pending = true;
-    let mut deferred_updates = Vec::new();
-    let (chat_message_load_tx, mut chat_message_load_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut chat_message_loader = ChatMessageLoader::new(client.clone(), chat_message_load_tx);
-    let (older_message_load_tx, mut older_message_load_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut older_message_loader = OlderMessageLoader::new(client.clone(), older_message_load_tx);
-    let (folder_chat_load_tx, mut folder_chat_load_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut folder_chat_loader = FolderChatLoader::new(client.clone(), folder_chat_load_tx);
+    let mut chat_message_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+    let mut older_message_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+    let mut folder_chat_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
     let mark_read_loader = MarkChatReadLoader::new(client.clone());
-    let (send_message_tx, mut send_message_rx) = tokio::sync::mpsc::unbounded_channel();
-    let send_message_loader = SendMessageLoader::new(client.clone(), send_message_tx);
-    let (delete_message_tx, mut delete_message_rx) = tokio::sync::mpsc::unbounded_channel();
-    let delete_message_loader = DeleteMessageLoader::new(client.clone(), delete_message_tx);
-    let (edit_message_tx, mut edit_message_rx) = tokio::sync::mpsc::unbounded_channel();
-    let edit_message_loader = EditMessageLoader::new(client.clone(), edit_message_tx);
-    let (reply_message_tx, mut reply_message_rx) = tokio::sync::mpsc::unbounded_channel();
-    let reply_message_loader = ReplyMessageLoader::new(client.clone(), reply_message_tx);
-    let (download_media_tx, mut download_media_rx) = tokio::sync::mpsc::unbounded_channel();
-    let download_media_loader = DownloadMediaLoader::new(client.clone(), download_media_tx);
-    let (media_preview_tx, mut media_preview_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut media_preview_loader = MediaPreviewLoader::new(client.clone(), media_preview_tx);
+    let send_message_loader = SendMessageLoader::new(client.clone(), senders.send_message);
+    let delete_message_loader = DeleteMessageLoader::new(client.clone(), senders.delete_message);
+    let edit_message_loader = EditMessageLoader::new(client.clone(), senders.edit_message);
+    let reply_message_loader = ReplyMessageLoader::new(client.clone(), senders.reply_message);
+    let download_media_loader = DownloadMediaLoader::new(client.clone(), senders.download_media);
+    let mut media_preview_loader = MediaPreviewLoader::new(client.clone(), senders.media_preview);
+    let mut events = EventStream::new();
+
+    let result = run_event_loop(
+        terminal,
+        app,
+        theme,
+        client,
+        &mut events,
+        &mut loop_state,
+        &mut chat_message_loader,
+        &mut older_message_loader,
+        &mut folder_chat_loader,
+        &mark_read_loader,
+        &send_message_loader,
+        &delete_message_loader,
+        &edit_message_loader,
+        &reply_message_loader,
+        &download_media_loader,
+        &mut media_preview_loader,
+    )
+    .await;
+
+    drop(events);
+    diagnostics::event("terminal_event_stream_stopped", "before_restore=true");
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    theme: &config::Theme,
+    client: &mut C,
+    events: &mut EventStream,
+    loop_state: &mut EventLoopState,
+    chat_message_loader: &mut ChatMessageLoader<C>,
+    older_message_loader: &mut OlderMessageLoader<C>,
+    folder_chat_loader: &mut FolderChatLoader<C>,
+    mark_read_loader: &MarkChatReadLoader<C>,
+    send_message_loader: &SendMessageLoader<C>,
+    delete_message_loader: &DeleteMessageLoader<C>,
+    edit_message_loader: &EditMessageLoader<C>,
+    reply_message_loader: &ReplyMessageLoader<C>,
+    download_media_loader: &DownloadMediaLoader<C>,
+    media_preview_loader: &mut MediaPreviewLoader<C>,
+) -> Result<()> {
+    let mut frames = FrameScheduler::new(true);
+    draw_due_frame(terminal, app, theme, &mut frames)?;
     loop {
-        while let Ok(subscribe_result) = subscribe_updates_rx.try_recv() {
-            apply_subscribe_updates_result(app, subscribe_result, &mut update_rx);
+        let step = prepare_loop_step(
+            loop_state,
+            app,
+            chat_message_loader,
+            older_message_loader,
+            folder_chat_loader,
+            mark_read_loader,
+            media_preview_loader,
+        );
+        if step.dirty {
+            frames.mark_dirty(TokioInstant::now());
         }
-        while let Ok(load_result) = initial_state_load_rx.try_recv() {
-            apply_initial_state_load_result(app, load_result, &mark_read_loader);
-            initial_state_pending = false;
-            for update in deferred_updates.drain(..) {
-                apply_update_with_read_ack(app, update, &mark_read_loader);
-            }
-        }
-        if let Some(rx) = update_rx.as_mut() {
-            while let Ok(update) = rx.try_recv() {
-                if initial_state_pending {
-                    deferred_updates.push(update);
-                } else {
-                    apply_update_with_read_ack(app, update, &mark_read_loader);
-                }
-            }
-        }
-        while let Ok(load_result) = chat_message_load_rx.try_recv() {
-            apply_chat_message_load_result(
+        if let Some(event) = step.terminal_event
+            && dispatch_terminal_event(
+                terminal,
                 app,
-                chat_message_loader.latest_request_id(),
-                load_result,
-                &mark_read_loader,
-            );
-        }
-        while let Ok(load_result) = older_message_load_rx.try_recv() {
-            apply_older_message_load_result(
-                app,
-                older_message_loader.latest_request_id(),
-                load_result,
-            );
-        }
-        while let Ok(load_result) = folder_chat_load_rx.try_recv() {
-            apply_folder_chat_load_result(
-                app,
-                folder_chat_loader.latest_request_id(),
-                load_result,
-                &mark_read_loader,
-            );
-        }
-        while let Ok(send_result) = send_message_rx.try_recv() {
-            apply_send_message_result(app, send_result);
-        }
-        while let Ok(delete_result) = delete_message_rx.try_recv() {
-            apply_delete_message_result(app, delete_result);
-        }
-        while let Ok(edit_result) = edit_message_rx.try_recv() {
-            apply_edit_message_result(app, edit_result);
-        }
-        while let Ok(reply_result) = reply_message_rx.try_recv() {
-            apply_reply_message_result(app, reply_result);
-        }
-        while let Ok(download_result) = download_media_rx.try_recv() {
-            apply_download_media_result(app, download_result);
-        }
-        while let Ok(preview_result) = media_preview_rx.try_recv() {
-            apply_media_preview_result(
-                app,
-                media_preview_loader.latest_request_id(),
-                preview_result,
-            );
+                client,
+                event,
+                chat_message_loader,
+                older_message_loader,
+                folder_chat_loader,
+                send_message_loader,
+                delete_message_loader,
+                edit_message_loader,
+                reply_message_loader,
+                download_media_loader,
+            )
+            .await?
+        {
+            frames.mark_dirty(TokioInstant::now());
         }
 
-        app.state.check_notification_timeout();
         media_preview_loader.request(app.state.selected_media_preview_request());
-
-        let draw_started = Instant::now();
-        terminal.draw(|f| ui::render_layout(f, app, theme))?;
-        terminal_images::render_selected_image(terminal.backend_mut(), app)?;
-        log_draw_duration("main_loop", draw_started);
-
-        if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    let mut progress = UiProgress::Live { terminal, theme };
-                    handle_key_event_with_progress(
-                        app,
-                        key,
-                        client,
-                        &mut progress,
-                        HandlerLoaders {
-                            chat_message: Some(&mut chat_message_loader),
-                            older_message: Some(&mut older_message_loader),
-                            folder_chat: Some(&mut folder_chat_loader),
-                            send_message: Some(&send_message_loader),
-                            delete_message: Some(&delete_message_loader),
-                            edit_message: Some(&edit_message_loader),
-                            reply_message: Some(&reply_message_loader),
-                            download_media: Some(&download_media_loader),
-                        },
-                    )
-                    .await?;
-                }
-                Event::Mouse(mouse_event) => {
-                    let mut progress = UiProgress::Live { terminal, theme };
-                    handle_mouse_event_with_progress(
-                        app,
-                        mouse_event,
-                        client,
-                        &mut progress,
-                        Some(&mut chat_message_loader),
-                        Some(&mut folder_chat_loader),
-                    )
-                    .await?;
-                }
-                _ => {}
-            }
-        }
 
         if app.should_quit {
             diagnostics::event("run_loop_quit", "should_quit=true");
-            break;
+            return Ok(());
+        }
+
+        draw_due_frame(terminal, app, theme, &mut frames)?;
+
+        match wait_for_loop_wake(
+            events,
+            &loop_state.wake,
+            &mut loop_state.update_rx,
+            frames.frame_deadline(),
+            app.state.notification_deadline(),
+        )
+        .await?
+        {
+            LoopWake::Notify | LoopWake::Deadline => {}
+            LoopWake::Terminal(event) => loop_state.staged_terminal_event = Some(event),
+            LoopWake::Update(update) => loop_state.staged_update = Some(update),
+            LoopWake::UpdateStreamClosed => loop_state.update_rx = None,
+        }
+    }
+}
+
+struct PreparedLoopStep {
+    dirty: bool,
+    terminal_event: Option<Event>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_loop_step<C: TelegramClient + Clone + Send + Sync + 'static>(
+    loop_state: &mut EventLoopState,
+    app: &mut App,
+    chat_message_loader: &ChatMessageLoader<C>,
+    older_message_loader: &OlderMessageLoader<C>,
+    folder_chat_loader: &FolderChatLoader<C>,
+    mark_read_loader: &MarkChatReadLoader<C>,
+    media_preview_loader: &MediaPreviewLoader<C>,
+) -> PreparedLoopStep {
+    let results_dirty = drain_ready_results(
+        loop_state,
+        app,
+        chat_message_loader,
+        older_message_loader,
+        folder_chat_loader,
+        mark_read_loader,
+        media_preview_loader,
+    );
+    PreparedLoopStep {
+        dirty: app.state.check_notification_timeout() || results_dirty,
+        terminal_event: loop_state.staged_terminal_event.take(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_terminal_event<C: TelegramClient + Clone + Send + Sync + 'static>(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    client: &mut C,
+    event: Event,
+    chat_message_loader: &mut ChatMessageLoader<C>,
+    older_message_loader: &mut OlderMessageLoader<C>,
+    folder_chat_loader: &mut FolderChatLoader<C>,
+    send_message_loader: &SendMessageLoader<C>,
+    delete_message_loader: &DeleteMessageLoader<C>,
+    edit_message_loader: &EditMessageLoader<C>,
+    reply_message_loader: &ReplyMessageLoader<C>,
+    download_media_loader: &DownloadMediaLoader<C>,
+) -> Result<bool> {
+    match classify_terminal_event(event) {
+        TerminalAction::Key(key) => {
+            let mut progress = UiProgress::Live { terminal };
+            handle_key_event_with_progress(
+                app,
+                key,
+                client,
+                &mut progress,
+                HandlerLoaders {
+                    chat_message: Some(chat_message_loader),
+                    older_message: Some(older_message_loader),
+                    folder_chat: Some(folder_chat_loader),
+                    send_message: Some(send_message_loader),
+                    delete_message: Some(delete_message_loader),
+                    edit_message: Some(edit_message_loader),
+                    reply_message: Some(reply_message_loader),
+                    download_media: Some(download_media_loader),
+                },
+            )
+            .await?;
+            Ok(true)
+        }
+        TerminalAction::Mouse(mouse_event) => {
+            let mut progress = UiProgress::Live { terminal };
+            handle_mouse_event_with_progress(
+                app,
+                mouse_event,
+                client,
+                &mut progress,
+                Some(chat_message_loader),
+                Some(folder_chat_loader),
+            )
+            .await?;
+            Ok(true)
+        }
+        TerminalAction::Resize => Ok(true),
+        TerminalAction::Ignore => Ok(false),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalAction {
+    Key(KeyEvent),
+    Mouse(crossterm::event::MouseEvent),
+    Resize,
+    Ignore,
+}
+
+fn classify_terminal_event(event: Event) -> TerminalAction {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => TerminalAction::Key(key),
+        Event::Mouse(mouse) => TerminalAction::Mouse(mouse),
+        Event::Resize(_, _) => TerminalAction::Resize,
+        Event::Key(_) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {
+            TerminalAction::Ignore
+        }
+    }
+}
+
+enum LoopWake {
+    Notify,
+    Terminal(Event),
+    Update(Update),
+    UpdateStreamClosed,
+    Deadline,
+}
+
+async fn wait_for_loop_wake(
+    events: &mut EventStream,
+    wake: &tokio::sync::Notify,
+    update_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<Update>>,
+    frame_deadline: Option<TokioInstant>,
+    notification_deadline: Option<TokioInstant>,
+) -> Result<LoopWake> {
+    tokio::select! {
+        _ = wake.notified() => Ok(LoopWake::Notify),
+        event = next_terminal_event(events) => match event {
+            Some(Ok(event)) => Ok(LoopWake::Terminal(event)),
+            Some(Err(error)) => Err(error.into()),
+            None => Err(color_eyre::eyre::eyre!("terminal event stream ended")),
+        },
+        update = receive_update(update_rx) => Ok(match update {
+            Some(update) => LoopWake::Update(update),
+            None => LoopWake::UpdateStreamClosed,
+        }),
+        _ = sleep_until_optional(frame_deadline) => Ok(LoopWake::Deadline),
+        _ = sleep_until_optional(notification_deadline) => Ok(LoopWake::Deadline),
+    }
+}
+
+async fn next_terminal_event(
+    events: &mut EventStream,
+) -> Option<std::result::Result<Event, io::Error>> {
+    poll_fn(|context| Pin::new(&mut *events).poll_next(context)).await
+}
+
+async fn receive_update(
+    update_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<Update>>,
+) -> Option<Update> {
+    match update_rx {
+        Some(rx) => rx.recv().await,
+        None => pending().await,
+    }
+}
+
+async fn sleep_until_optional(deadline: Option<TokioInstant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => pending().await,
+    }
+}
+
+fn draw_due_frame(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    theme: &config::Theme,
+    frames: &mut FrameScheduler,
+) -> Result<bool> {
+    let Some(scheduling_delay) = frames.take_due_frame(TokioInstant::now()) else {
+        return Ok(false);
+    };
+
+    let draw_started = Instant::now();
+    terminal.draw(|frame| ui::render_layout(frame, app, theme))?;
+    terminal_images::render_selected_image(terminal.backend_mut(), app)?;
+    let draw_duration = draw_started.elapsed();
+    diagnostics::event(
+        "frame_draw",
+        format!(
+            "schedule_ms={} draw_ms={}",
+            scheduling_delay.as_millis(),
+            draw_duration.as_millis()
+        ),
+    );
+    log_draw_duration("main_loop", draw_started);
+    Ok(true)
+}
+
+struct FrameScheduler {
+    dirty: bool,
+    dirty_since: Option<TokioInstant>,
+    last_draw_at: Option<TokioInstant>,
+}
+
+impl FrameScheduler {
+    fn new(dirty: bool) -> Self {
+        Self {
+            dirty,
+            dirty_since: dirty.then(TokioInstant::now),
+            last_draw_at: None,
         }
     }
 
-    Ok(())
+    fn mark_dirty(&mut self, now: TokioInstant) {
+        if !self.dirty {
+            self.dirty_since = Some(now);
+        }
+        self.dirty = true;
+    }
+
+    fn frame_deadline(&self) -> Option<TokioInstant> {
+        self.dirty.then(|| {
+            self.last_draw_at
+                .map_or_else(TokioInstant::now, |last| last + MIN_FRAME_INTERVAL)
+        })
+    }
+
+    fn take_due_frame(&mut self, now: TokioInstant) -> Option<Duration> {
+        if !self.dirty
+            || self
+                .last_draw_at
+                .is_some_and(|last| now < last + MIN_FRAME_INTERVAL)
+        {
+            return None;
+        }
+
+        self.dirty = false;
+        self.last_draw_at = Some(now);
+        Some(
+            self.dirty_since
+                .take()
+                .map_or(Duration::ZERO, |dirty_since| {
+                    now.saturating_duration_since(dirty_since)
+                }),
+        )
+    }
+}
+
+fn ui_channel<T>(
+    wake: &Arc<tokio::sync::Notify>,
+) -> (UiSender<T>, tokio::sync::mpsc::UnboundedReceiver<T>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (
+        UiSender {
+            tx,
+            wake: Arc::clone(wake),
+        },
+        rx,
+    )
+}
+
+struct UiSender<T> {
+    tx: tokio::sync::mpsc::UnboundedSender<T>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl<T> Clone for UiSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            wake: Arc::clone(&self.wake),
+        }
+    }
+}
+
+impl<T> UiSender<T> {
+    fn send(&self, value: T) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<T>> {
+        self.tx.send(value)?;
+        self.wake.notify_one();
+        Ok(())
+    }
+}
+
+impl<T> From<tokio::sync::mpsc::UnboundedSender<T>> for UiSender<T> {
+    fn from(tx: tokio::sync::mpsc::UnboundedSender<T>) -> Self {
+        Self {
+            tx,
+            wake: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+struct EventLoopSenders {
+    subscribe_updates: UiSender<SubscribeUpdatesResult>,
+    initial_state: UiSender<InitialStateLoadResult>,
+    chat_message: UiSender<ChatMessageLoadResult>,
+    older_message: UiSender<OlderMessageLoadResult>,
+    folder_chat: UiSender<FolderChatLoadResult>,
+    send_message: UiSender<SendMessageResult>,
+    delete_message: UiSender<DeleteMessageResult>,
+    edit_message: UiSender<EditMessageResult>,
+    reply_message: UiSender<ReplyMessageResult>,
+    download_media: UiSender<DownloadMediaResult>,
+    media_preview: UiSender<MediaPreviewResult>,
+}
+
+struct EventLoopState {
+    wake: Arc<tokio::sync::Notify>,
+    subscribe_updates_rx: tokio::sync::mpsc::UnboundedReceiver<SubscribeUpdatesResult>,
+    initial_state_rx: tokio::sync::mpsc::UnboundedReceiver<InitialStateLoadResult>,
+    chat_message_rx: tokio::sync::mpsc::UnboundedReceiver<ChatMessageLoadResult>,
+    older_message_rx: tokio::sync::mpsc::UnboundedReceiver<OlderMessageLoadResult>,
+    folder_chat_rx: tokio::sync::mpsc::UnboundedReceiver<FolderChatLoadResult>,
+    send_message_rx: tokio::sync::mpsc::UnboundedReceiver<SendMessageResult>,
+    delete_message_rx: tokio::sync::mpsc::UnboundedReceiver<DeleteMessageResult>,
+    edit_message_rx: tokio::sync::mpsc::UnboundedReceiver<EditMessageResult>,
+    reply_message_rx: tokio::sync::mpsc::UnboundedReceiver<ReplyMessageResult>,
+    download_media_rx: tokio::sync::mpsc::UnboundedReceiver<DownloadMediaResult>,
+    media_preview_rx: tokio::sync::mpsc::UnboundedReceiver<MediaPreviewResult>,
+    update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Update>>,
+    initial_state_pending: bool,
+    deferred_updates: Vec<Update>,
+    staged_update: Option<Update>,
+    staged_terminal_event: Option<Event>,
+    #[cfg(test)]
+    drain_trace: Vec<String>,
+}
+
+impl EventLoopState {
+    fn new() -> (Self, EventLoopSenders) {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let (subscribe_updates, subscribe_updates_rx) = ui_channel(&wake);
+        let (initial_state, initial_state_rx) = ui_channel(&wake);
+        let (chat_message, chat_message_rx) = ui_channel(&wake);
+        let (older_message, older_message_rx) = ui_channel(&wake);
+        let (folder_chat, folder_chat_rx) = ui_channel(&wake);
+        let (send_message, send_message_rx) = ui_channel(&wake);
+        let (delete_message, delete_message_rx) = ui_channel(&wake);
+        let (edit_message, edit_message_rx) = ui_channel(&wake);
+        let (reply_message, reply_message_rx) = ui_channel(&wake);
+        let (download_media, download_media_rx) = ui_channel(&wake);
+        let (media_preview, media_preview_rx) = ui_channel(&wake);
+
+        (
+            Self {
+                wake,
+                subscribe_updates_rx,
+                initial_state_rx,
+                chat_message_rx,
+                older_message_rx,
+                folder_chat_rx,
+                send_message_rx,
+                delete_message_rx,
+                edit_message_rx,
+                reply_message_rx,
+                download_media_rx,
+                media_preview_rx,
+                update_rx: None,
+                initial_state_pending: true,
+                deferred_updates: Vec::new(),
+                staged_update: None,
+                staged_terminal_event: None,
+                #[cfg(test)]
+                drain_trace: Vec::new(),
+            },
+            EventLoopSenders {
+                subscribe_updates,
+                initial_state,
+                chat_message,
+                older_message,
+                folder_chat,
+                send_message,
+                delete_message,
+                edit_message,
+                reply_message,
+                download_media,
+                media_preview,
+            },
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_ready_results<C: TelegramClient + Clone + Send + Sync + 'static>(
+    loop_state: &mut EventLoopState,
+    app: &mut App,
+    chat_message_loader: &ChatMessageLoader<C>,
+    older_message_loader: &OlderMessageLoader<C>,
+    folder_chat_loader: &FolderChatLoader<C>,
+    mark_read_loader: &MarkChatReadLoader<C>,
+    media_preview_loader: &MediaPreviewLoader<C>,
+) -> bool {
+    let mut dirty = false;
+    while let Ok(result) = loop_state.subscribe_updates_rx.try_recv() {
+        #[cfg(test)]
+        loop_state.drain_trace.push("subscription".to_string());
+        dirty |= apply_subscribe_updates_result(app, result, &mut loop_state.update_rx);
+    }
+    while let Ok(result) = loop_state.initial_state_rx.try_recv() {
+        #[cfg(test)]
+        loop_state.drain_trace.push("initial".to_string());
+        apply_initial_state_load_result(app, result, mark_read_loader);
+        loop_state.initial_state_pending = false;
+        dirty = true;
+        for update in loop_state.deferred_updates.drain(..) {
+            #[cfg(test)]
+            loop_state.drain_trace.push(update_trace_label(&update));
+            apply_update_with_read_ack(app, update, mark_read_loader);
+        }
+    }
+    if let Some(update) = loop_state.staged_update.take() {
+        if loop_state.initial_state_pending {
+            loop_state.deferred_updates.push(update);
+        } else {
+            #[cfg(test)]
+            loop_state.drain_trace.push(update_trace_label(&update));
+            apply_update_with_read_ack(app, update, mark_read_loader);
+            dirty = true;
+        }
+    }
+    if let Some(rx) = loop_state.update_rx.as_mut() {
+        while let Ok(update) = rx.try_recv() {
+            if loop_state.initial_state_pending {
+                loop_state.deferred_updates.push(update);
+            } else {
+                #[cfg(test)]
+                loop_state.drain_trace.push(update_trace_label(&update));
+                apply_update_with_read_ack(app, update, mark_read_loader);
+                dirty = true;
+            }
+        }
+    }
+    while let Ok(result) = loop_state.chat_message_rx.try_recv() {
+        dirty |= apply_chat_message_load_result(
+            app,
+            chat_message_loader.latest_request_id(),
+            result,
+            mark_read_loader,
+        );
+    }
+    while let Ok(result) = loop_state.older_message_rx.try_recv() {
+        dirty |=
+            apply_older_message_load_result(app, older_message_loader.latest_request_id(), result);
+    }
+    while let Ok(result) = loop_state.folder_chat_rx.try_recv() {
+        dirty |= apply_folder_chat_load_result(
+            app,
+            folder_chat_loader.latest_request_id(),
+            result,
+            mark_read_loader,
+        );
+    }
+    while let Ok(result) = loop_state.send_message_rx.try_recv() {
+        apply_send_message_result(app, result);
+        dirty = true;
+    }
+    while let Ok(result) = loop_state.delete_message_rx.try_recv() {
+        apply_delete_message_result(app, result);
+        dirty = true;
+    }
+    while let Ok(result) = loop_state.edit_message_rx.try_recv() {
+        apply_edit_message_result(app, result);
+        dirty = true;
+    }
+    while let Ok(result) = loop_state.reply_message_rx.try_recv() {
+        apply_reply_message_result(app, result);
+        dirty = true;
+    }
+    while let Ok(result) = loop_state.download_media_rx.try_recv() {
+        apply_download_media_result(app, result);
+        dirty = true;
+    }
+    while let Ok(result) = loop_state.media_preview_rx.try_recv() {
+        dirty |= apply_media_preview_result(app, media_preview_loader.latest_request_id(), result);
+    }
+    dirty
+}
+
+#[cfg(test)]
+fn update_trace_label(update: &Update) -> String {
+    match update {
+        Update::Error(error) => format!("update:{error}"),
+        _ => "update".to_string(),
+    }
 }
 
 struct SubscribeUpdatesResult {
@@ -1774,15 +2223,18 @@ impl<C> HandlerLoaders<'_, C> {
 
 struct SubscribeUpdatesLoader<C> {
     client: C,
-    tx: tokio::sync::mpsc::UnboundedSender<SubscribeUpdatesResult>,
+    tx: UiSender<SubscribeUpdatesResult>,
 }
 
 impl<C> SubscribeUpdatesLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
-    fn new(client: C, tx: tokio::sync::mpsc::UnboundedSender<SubscribeUpdatesResult>) -> Self {
-        Self { client, tx }
+    fn new(client: C, tx: impl Into<UiSender<SubscribeUpdatesResult>>) -> Self {
+        Self {
+            client,
+            tx: tx.into(),
+        }
     }
 
     fn spawn_subscribe_updates(&self) {
@@ -1801,15 +2253,18 @@ where
 
 struct InitialStateLoader<C> {
     client: C,
-    tx: tokio::sync::mpsc::UnboundedSender<InitialStateLoadResult>,
+    tx: UiSender<InitialStateLoadResult>,
 }
 
 impl<C> InitialStateLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
-    fn new(client: C, tx: tokio::sync::mpsc::UnboundedSender<InitialStateLoadResult>) -> Self {
-        Self { client, tx }
+    fn new(client: C, tx: impl Into<UiSender<InitialStateLoadResult>>) -> Self {
+        Self {
+            client,
+            tx: tx.into(),
+        }
     }
 
     fn spawn_initial_state(&self) {
@@ -1828,7 +2283,7 @@ where
 
 struct ChatMessageLoader<C> {
     client: C,
-    tx: tokio::sync::mpsc::UnboundedSender<ChatMessageLoadResult>,
+    tx: UiSender<ChatMessageLoadResult>,
     latest_request_id: u64,
     current_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -1886,10 +2341,10 @@ impl<C> ChatMessageLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
-    fn new(client: C, tx: tokio::sync::mpsc::UnboundedSender<ChatMessageLoadResult>) -> Self {
+    fn new(client: C, tx: impl Into<UiSender<ChatMessageLoadResult>>) -> Self {
         Self {
             client,
-            tx,
+            tx: tx.into(),
             latest_request_id: 0,
             current_handle: None,
         }
@@ -1970,7 +2425,7 @@ where
 
 struct OlderMessageLoader<C> {
     client: C,
-    tx: tokio::sync::mpsc::UnboundedSender<OlderMessageLoadResult>,
+    tx: UiSender<OlderMessageLoadResult>,
     latest_request_id: u64,
     current_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -1979,10 +2434,10 @@ impl<C> OlderMessageLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
-    fn new(client: C, tx: tokio::sync::mpsc::UnboundedSender<OlderMessageLoadResult>) -> Self {
+    fn new(client: C, tx: impl Into<UiSender<OlderMessageLoadResult>>) -> Self {
         Self {
             client,
-            tx,
+            tx: tx.into(),
             latest_request_id: 0,
             current_handle: None,
         }
@@ -2041,39 +2496,39 @@ where
 
 struct FolderChatLoader<C> {
     client: C,
-    tx: tokio::sync::mpsc::UnboundedSender<FolderChatLoadResult>,
+    tx: UiSender<FolderChatLoadResult>,
     latest_request_id: u64,
     current_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 struct SendMessageLoader<C> {
     client: C,
-    tx: tokio::sync::mpsc::UnboundedSender<SendMessageResult>,
+    tx: UiSender<SendMessageResult>,
 }
 
 struct DeleteMessageLoader<C> {
     client: C,
-    tx: tokio::sync::mpsc::UnboundedSender<DeleteMessageResult>,
+    tx: UiSender<DeleteMessageResult>,
 }
 
 struct EditMessageLoader<C> {
     client: C,
-    tx: tokio::sync::mpsc::UnboundedSender<EditMessageResult>,
+    tx: UiSender<EditMessageResult>,
 }
 
 struct ReplyMessageLoader<C> {
     client: C,
-    tx: tokio::sync::mpsc::UnboundedSender<ReplyMessageResult>,
+    tx: UiSender<ReplyMessageResult>,
 }
 
 struct DownloadMediaLoader<C> {
     client: C,
-    tx: tokio::sync::mpsc::UnboundedSender<DownloadMediaResult>,
+    tx: UiSender<DownloadMediaResult>,
 }
 
 struct MediaPreviewLoader<C> {
     client: C,
-    tx: tokio::sync::mpsc::UnboundedSender<MediaPreviewResult>,
+    tx: UiSender<MediaPreviewResult>,
     latest_request_id: u64,
     // ponytail: failed/empty previews retry only after selection changes; add timed retry if transient failures matter.
     last_requested: Option<(i64, i32)>,
@@ -2084,8 +2539,11 @@ impl<C> SendMessageLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
-    fn new(client: C, tx: tokio::sync::mpsc::UnboundedSender<SendMessageResult>) -> Self {
-        Self { client, tx }
+    fn new(client: C, tx: impl Into<UiSender<SendMessageResult>>) -> Self {
+        Self {
+            client,
+            tx: tx.into(),
+        }
     }
 
     fn spawn_send_message(&self, pending: actions::PendingSend) {
@@ -2116,8 +2574,11 @@ impl<C> DeleteMessageLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
-    fn new(client: C, tx: tokio::sync::mpsc::UnboundedSender<DeleteMessageResult>) -> Self {
-        Self { client, tx }
+    fn new(client: C, tx: impl Into<UiSender<DeleteMessageResult>>) -> Self {
+        Self {
+            client,
+            tx: tx.into(),
+        }
     }
 
     fn spawn_delete_message(&self, confirmation: state::DeleteConfirmation) {
@@ -2144,8 +2605,11 @@ impl<C> EditMessageLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
-    fn new(client: C, tx: tokio::sync::mpsc::UnboundedSender<EditMessageResult>) -> Self {
-        Self { client, tx }
+    fn new(client: C, tx: impl Into<UiSender<EditMessageResult>>) -> Self {
+        Self {
+            client,
+            tx: tx.into(),
+        }
     }
 
     fn spawn_edit_message(&self, chat_id: i64, message_id: i32, content: String) {
@@ -2172,8 +2636,11 @@ impl<C> ReplyMessageLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
-    fn new(client: C, tx: tokio::sync::mpsc::UnboundedSender<ReplyMessageResult>) -> Self {
-        Self { client, tx }
+    fn new(client: C, tx: impl Into<UiSender<ReplyMessageResult>>) -> Self {
+        Self {
+            client,
+            tx: tx.into(),
+        }
     }
 
     fn spawn_reply_message(
@@ -2211,10 +2678,10 @@ impl<C> MediaPreviewLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
-    fn new(client: C, tx: tokio::sync::mpsc::UnboundedSender<MediaPreviewResult>) -> Self {
+    fn new(client: C, tx: impl Into<UiSender<MediaPreviewResult>>) -> Self {
         Self {
             client,
-            tx,
+            tx: tx.into(),
             latest_request_id: 0,
             last_requested: None,
             current_handle: None,
@@ -2266,8 +2733,11 @@ impl<C> DownloadMediaLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
-    fn new(client: C, tx: tokio::sync::mpsc::UnboundedSender<DownloadMediaResult>) -> Self {
-        Self { client, tx }
+    fn new(client: C, tx: impl Into<UiSender<DownloadMediaResult>>) -> Self {
+        Self {
+            client,
+            tx: tx.into(),
+        }
     }
 
     fn spawn_download_media(
@@ -2307,10 +2777,10 @@ impl<C> FolderChatLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
-    fn new(client: C, tx: tokio::sync::mpsc::UnboundedSender<FolderChatLoadResult>) -> Self {
+    fn new(client: C, tx: impl Into<UiSender<FolderChatLoadResult>>) -> Self {
         Self {
             client,
-            tx,
+            tx: tx.into(),
             latest_request_id: 0,
             current_handle: None,
         }
@@ -2352,15 +2822,17 @@ fn apply_subscribe_updates_result(
     app: &mut App,
     load: SubscribeUpdatesResult,
     update_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<Update>>,
-) {
+) -> bool {
     match load.result {
         Ok(rx) => {
             diagnostics::event("subscribe_updates_result", "updates=true");
             *update_rx = Some(rx);
+            false
         }
         Err(error) => {
             diagnostics::event("subscribe_updates_result", "updates=false");
             app.state.set_error(error);
+            true
         }
     }
 }
@@ -2489,7 +2961,8 @@ fn apply_chat_message_load_result<C>(
     latest_request_id: u64,
     load: ChatMessageLoadResult,
     mark_read_loader: &MarkChatReadLoader<C>,
-) where
+) -> bool
+where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
     if load.request_id != latest_request_id {
@@ -2500,7 +2973,7 @@ fn apply_chat_message_load_result<C>(
                 load.request_id, latest_request_id, load.chat_id
             ),
         );
-        return;
+        return false;
     }
 
     if app.state.selected_chat_id() != Some(load.chat_id) {
@@ -2513,7 +2986,7 @@ fn apply_chat_message_load_result<C>(
                 app.state.selected_chat_id()
             ),
         );
-        return;
+        return false;
     }
 
     let selected_topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
@@ -2525,7 +2998,7 @@ fn apply_chat_message_load_result<C>(
                 load.request_id, load.chat_id, load.topic_id, selected_topic_id
             ),
         );
-        return;
+        return false;
     }
 
     let chat_id = load.chat_id;
@@ -2558,6 +3031,7 @@ fn apply_chat_message_load_result<C>(
             app.state.set_error(error);
         }
     }
+    true
 }
 
 fn apply_folder_chat_load_result<C>(
@@ -2565,7 +3039,8 @@ fn apply_folder_chat_load_result<C>(
     latest_request_id: u64,
     load: FolderChatLoadResult,
     mark_read_loader: &MarkChatReadLoader<C>,
-) where
+) -> bool
+where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
     if load.request_id != latest_request_id {
@@ -2576,7 +3051,7 @@ fn apply_folder_chat_load_result<C>(
                 load.request_id, latest_request_id, load.folder_index, load.folder_id
             ),
         );
-        return;
+        return false;
     }
 
     if app.state.selected_folder_index != load.folder_index
@@ -2593,7 +3068,7 @@ fn apply_folder_chat_load_result<C>(
                 app.state.selected_folder_filter_id()
             ),
         );
-        return;
+        return false;
     }
 
     let read_ack_chat_id = folder_chat_load_read_ack_chat_id(&load);
@@ -2604,13 +3079,14 @@ fn apply_folder_chat_load_result<C>(
         mark_read_loader.spawn_mark_chat_read(chat_id);
     }
     app.state.clear_status();
+    true
 }
 
 fn apply_older_message_load_result(
     app: &mut App,
     latest_request_id: u64,
     load: OlderMessageLoadResult,
-) {
+) -> bool {
     if load.request_id != latest_request_id {
         diagnostics::event(
             "older_messages_load_ignored",
@@ -2619,7 +3095,7 @@ fn apply_older_message_load_result(
                 load.request_id, latest_request_id, load.chat_id, load.before_message_id
             ),
         );
-        return;
+        return false;
     }
 
     if app.state.selected_chat_id() != Some(load.chat_id) {
@@ -2632,7 +3108,7 @@ fn apply_older_message_load_result(
                 app.state.selected_chat_id()
             ),
         );
-        return;
+        return false;
     }
 
     let selected_topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
@@ -2644,7 +3120,7 @@ fn apply_older_message_load_result(
                 load.request_id, load.chat_id, load.topic_id, selected_topic_id
             ),
         );
-        return;
+        return false;
     }
 
     if app.state.messages.first().map(|message| message.id) != Some(load.before_message_id) {
@@ -2655,7 +3131,7 @@ fn apply_older_message_load_result(
                 load.request_id, load.chat_id, load.before_message_id
             ),
         );
-        return;
+        return false;
     }
 
     let added = actions::apply_older_chat_messages_result(&mut app.state, load.result);
@@ -2663,6 +3139,7 @@ fn apply_older_message_load_result(
         app.state.clear_status();
         apply_older_message_navigation(&mut app.state, load.navigation);
     }
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2674,7 +3151,6 @@ enum OlderMessageNavigation {
 enum UiProgress<'a> {
     Live {
         terminal: &'a mut Terminal<CrosstermBackend<io::Stdout>>,
-        theme: &'a config::Theme,
     },
     Silent,
 }
@@ -2699,14 +3175,6 @@ impl UiProgress<'_> {
         );
         if show_status_banner {
             app.state.set_status(status);
-        }
-        match self {
-            Self::Live { terminal, theme } => {
-                let draw_started = Instant::now();
-                terminal.draw(|frame| ui::render_layout(frame, app, theme))?;
-                log_draw_duration("progress", draw_started);
-            }
-            Self::Silent => {}
         }
         Ok(())
     }
@@ -2809,7 +3277,11 @@ async fn download_selected_message_media<C: TelegramClient>(
     Ok(())
 }
 
-fn apply_media_preview_result(app: &mut App, latest_request_id: u64, preview: MediaPreviewResult) {
+fn apply_media_preview_result(
+    app: &mut App,
+    latest_request_id: u64,
+    preview: MediaPreviewResult,
+) -> bool {
     if preview.request_id != latest_request_id
         || app.state.selected_media_preview_request() != Some((preview.chat_id, preview.message_id))
     {
@@ -2820,15 +3292,15 @@ fn apply_media_preview_result(app: &mut App, latest_request_id: u64, preview: Me
                 preview.request_id, latest_request_id, preview.chat_id, preview.message_id
             ),
         );
-        return;
+        return false;
     }
 
     match preview.result {
         Ok(Some(path)) => {
-            if app
-                .state
-                .apply_selected_media_preview(preview.chat_id, preview.message_id, path)
-            {
+            let applied =
+                app.state
+                    .apply_selected_media_preview(preview.chat_id, preview.message_id, path);
+            if applied {
                 diagnostics::event(
                     "media_preview_apply",
                     format!(
@@ -2837,21 +3309,28 @@ fn apply_media_preview_result(app: &mut App, latest_request_id: u64, preview: Me
                     ),
                 );
             }
+            applied
         }
-        Ok(None) => diagnostics::event(
-            "media_preview_unavailable",
-            format!(
-                "request_id={} chat_id={} message_id={}",
-                preview.request_id, preview.chat_id, preview.message_id
-            ),
-        ),
-        Err(_) => diagnostics::event(
-            "media_preview_download_error",
-            format!(
-                "request_id={} chat_id={} message_id={} error=true",
-                preview.request_id, preview.chat_id, preview.message_id
-            ),
-        ),
+        Ok(None) => {
+            diagnostics::event(
+                "media_preview_unavailable",
+                format!(
+                    "request_id={} chat_id={} message_id={}",
+                    preview.request_id, preview.chat_id, preview.message_id
+                ),
+            );
+            false
+        }
+        Err(_) => {
+            diagnostics::event(
+                "media_preview_download_error",
+                format!(
+                    "request_id={} chat_id={} message_id={} error=true",
+                    preview.request_id, preview.chat_id, preview.message_id
+                ),
+            );
+            false
+        }
     }
 }
 
@@ -3452,31 +3931,34 @@ mod tests {
         CHECK_CONFIG_SESSION_EXISTS_STATUS, CHECK_CONFIG_SESSION_WILL_CREATE_STATUS,
         CLI_USAGE_EXIT_CODE, CONFIG_LOAD_HELP, CONFIG_PATH_ARGUMENT_REQUIRED, ChatMessageLoad,
         ChatMessageLoadResult, ChatMessageLoader, DeleteMessageLoader, DeleteMessageResult,
-        EditMessageLoader, EditMessageResult, FolderChatLoadResult, FolderChatLoader,
-        InitialStateLoadResult, InitialStateLoader, LOADING_CHAT_MESSAGES_STATUS,
-        LOADING_TELEGRAM_STATUS, LOG_PATH_ARGUMENT_REQUIRED, LOGIN_2FA_ENABLED_STATUS,
-        LOGIN_2FA_HINT_PREFIX, LOGIN_2FA_PROMPT, LOGIN_2FA_SIGNED_IN_PREFIX, LOGIN_CODE_PROMPT,
-        LOGIN_CODE_SENT_PREFIX, LOGIN_FAILED_PREFIX, LOGIN_HEADER, LOGIN_PHONE_PROMPT,
-        LOGIN_REQUESTING_CODE_STATUS, LOGIN_SESSION_SAVED_STATUS, LOGIN_SIGNED_IN_PREFIX,
-        LOGIN_SIGNING_IN_STATUS, LOGIN_START_PROMPT, MarkChatReadLoader, MediaPreviewLoader,
+        EditMessageLoader, EditMessageResult, EventLoopState, FolderChatLoadResult,
+        FolderChatLoader, FrameScheduler, HandlerLoaders, InitialStateLoadResult,
+        InitialStateLoader, LOADING_CHAT_MESSAGES_STATUS, LOADING_TELEGRAM_STATUS,
+        LOG_PATH_ARGUMENT_REQUIRED, LOGIN_2FA_ENABLED_STATUS, LOGIN_2FA_HINT_PREFIX,
+        LOGIN_2FA_PROMPT, LOGIN_2FA_SIGNED_IN_PREFIX, LOGIN_CODE_PROMPT, LOGIN_CODE_SENT_PREFIX,
+        LOGIN_FAILED_PREFIX, LOGIN_HEADER, LOGIN_PHONE_PROMPT, LOGIN_REQUESTING_CODE_STATUS,
+        LOGIN_SESSION_SAVED_STATUS, LOGIN_SIGNED_IN_PREFIX, LOGIN_SIGNING_IN_STATUS,
+        LOGIN_START_PROMPT, MIN_FRAME_INTERVAL, MarkChatReadLoader, MediaPreviewLoader,
         MediaPreviewResult, OlderMessageLoadResult, OlderMessageLoader, OlderMessageNavigation,
         PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR, ReplyMessageLoader, ReplyMessageResult, RunMode,
         SAVING_EDIT_STATUS, SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE,
         SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_OK_PREFIX, SendMessageLoader,
-        SendMessageResult, SubscribeUpdatesLoader, SubscribeUpdatesResult, UiProgress,
-        abort_running_task, apply_chat_message_load_result, apply_delete_message_result,
-        apply_edit_message_result, apply_folder_chat_load_result, apply_initial_state_load_result,
-        apply_media_preview_result, apply_older_message_load_result, apply_reply_message_result,
-        apply_send_message_result, apply_subscribe_updates_result, apply_update_with_read_ack,
-        check_auth_ok_message, check_auth_unauthorized_message, check_config_message,
-        check_config_session_status, default_config_path_string, ensure_session_parent_dir,
-        handle_input_focused, handle_mouse_event, load_checked_config,
-        load_checked_config_with_session_parent, login_2fa_hint_message,
-        login_2fa_signed_in_message, login_code_sent_message, login_failed_message,
-        login_signed_in_message, message_submit_action_status, older_message_key_navigation,
-        open_chat_at_with_optional_async_loader, parse_args_from,
-        preserve_prompt_input_line_spaces, require_prompt_line, require_prompt_response,
-        save_app_preferences_if_changed, smoke_ok_message, trim_prompt_input_line, validate_config,
+        SendMessageResult, SubscribeUpdatesLoader, SubscribeUpdatesResult, TerminalAction,
+        UiProgress, abort_running_task, apply_chat_message_load_result,
+        apply_delete_message_result, apply_edit_message_result, apply_folder_chat_load_result,
+        apply_initial_state_load_result, apply_media_preview_result,
+        apply_older_message_load_result, apply_reply_message_result, apply_send_message_result,
+        apply_subscribe_updates_result, apply_update_with_read_ack, check_auth_ok_message,
+        check_auth_unauthorized_message, check_config_message, check_config_session_status,
+        classify_terminal_event, default_config_path_string, drain_ready_results,
+        ensure_session_parent_dir, handle_input_focused, handle_key_event_with_progress,
+        handle_mouse_event, load_checked_config, load_checked_config_with_session_parent,
+        login_2fa_hint_message, login_2fa_signed_in_message, login_code_sent_message,
+        login_failed_message, login_signed_in_message, message_submit_action_status,
+        older_message_key_navigation, open_chat_at_with_optional_async_loader, parse_args_from,
+        prepare_loop_step, preserve_prompt_input_line_spaces, require_prompt_line,
+        require_prompt_response, save_app_preferences_if_changed, sleep_until_optional,
+        smoke_ok_message, trim_prompt_input_line, validate_config,
     };
     use crate::app::App;
     use crate::config::telegram::{Config, TelegramConfig};
@@ -3490,7 +3972,8 @@ mod tests {
     use chrono::Utc;
     use color_eyre::Result;
     use crossterm::event::{
-        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     };
     use ratatui::layout::Rect;
     use std::{
@@ -3565,6 +4048,279 @@ mod tests {
             can_delete: false,
             error: None,
         }
+    }
+
+    #[test]
+    fn terminal_event_classification_preserves_input_semantics() {
+        let press =
+            KeyEvent::new_with_kind(KeyCode::Char('j'), KeyModifiers::NONE, KeyEventKind::Press);
+        assert_eq!(
+            classify_terminal_event(Event::Key(press)),
+            TerminalAction::Key(press)
+        );
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert_eq!(
+                classify_terminal_event(Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char('j'),
+                    KeyModifiers::NONE,
+                    kind,
+                ))),
+                TerminalAction::Ignore
+            );
+        }
+        assert_eq!(
+            classify_terminal_event(Event::Resize(100, 40)),
+            TerminalAction::Resize
+        );
+        assert_eq!(
+            classify_terminal_event(Event::Paste("ignored".to_string())),
+            TerminalAction::Ignore
+        );
+        assert_eq!(
+            classify_terminal_event(Event::FocusGained),
+            TerminalAction::Ignore
+        );
+        assert_eq!(
+            classify_terminal_event(Event::FocusLost),
+            TerminalAction::Ignore
+        );
+        assert!(matches!(
+            classify_terminal_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 1,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            })),
+            TerminalAction::Mouse(_)
+        ));
+    }
+
+    #[test]
+    fn frame_scheduler_skips_idle_and_coalesces_result_input_bursts_at_frame_cap() {
+        let now = tokio::time::Instant::now();
+        let mut frames = FrameScheduler::new(false);
+        assert!(frames.frame_deadline().is_none());
+        assert!(frames.take_due_frame(now).is_none());
+
+        frames.mark_dirty(now);
+        frames.mark_dirty(now);
+        assert_eq!(frames.take_due_frame(now), Some(Duration::ZERO));
+        assert!(frames.take_due_frame(now).is_none());
+
+        frames.mark_dirty(now);
+        assert!(
+            frames
+                .take_due_frame(now + MIN_FRAME_INTERVAL - Duration::from_millis(1))
+                .is_none()
+        );
+        assert_eq!(
+            frames.take_due_frame(now + MIN_FRAME_INTERVAL),
+            Some(MIN_FRAME_INTERVAL)
+        );
+        assert!(frames.frame_deadline().is_none());
+    }
+
+    #[tokio::test]
+    async fn absent_notification_deadline_creates_no_wake_timer() {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), sleep_until_optional(None))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ui_sender_wake_permit_is_not_lost_before_wait() {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let (sender, mut rx) = super::ui_channel(&wake);
+
+        sender.send(42).expect("receiver should be open");
+        tokio::time::timeout(Duration::from_millis(20), wake.notified())
+            .await
+            .expect("send-before-wait should retain a wake permit");
+        assert_eq!(rx.try_recv(), Ok(42));
+    }
+
+    #[tokio::test]
+    async fn canonical_drain_orders_initial_replay_before_new_update() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        let (update_tx, update_rx) = mpsc::unbounded_channel();
+        update_tx
+            .send(Update::Error("queued".to_string()))
+            .expect("update receiver should be open");
+        senders
+            .subscribe_updates
+            .send(SubscribeUpdatesResult {
+                result: Ok(update_rx),
+            })
+            .expect("subscription receiver should be open");
+        senders
+            .initial_state
+            .send(InitialStateLoadResult {
+                result: Err("initial".to_string()),
+            })
+            .expect("initial receiver should be open");
+        loop_state.deferred_updates = vec![
+            Update::Error("deferred-1".to_string()),
+            Update::Error("deferred-2".to_string()),
+        ];
+        loop_state.staged_update = Some(Update::Error("staged".to_string()));
+
+        let client = MockTelegramClient::new();
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+        let mut app = App::new();
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        assert_eq!(
+            loop_state.drain_trace,
+            [
+                "subscription",
+                "initial",
+                "update:deferred-1",
+                "update:deferred-2",
+                "update:staged",
+                "update:queued",
+            ]
+        );
+        assert_eq!(app.state.error_message.as_deref(), Some("queued"));
+    }
+
+    #[test]
+    fn loop_step_applies_ready_results_before_releasing_staged_input() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        senders
+            .initial_state
+            .send(InitialStateLoadResult {
+                result: Err("result applied first".to_string()),
+            })
+            .expect("initial receiver should be open");
+        let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        loop_state.staged_terminal_event = Some(Event::Key(key));
+
+        let client = MockTelegramClient::new();
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+        let mut app = App::new();
+
+        let step = prepare_loop_step(
+            &mut loop_state,
+            &mut app,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        );
+
+        assert!(step.dirty);
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some("result applied first")
+        );
+        assert_eq!(step.terminal_event, Some(Event::Key(key)));
+        assert!(loop_state.staged_terminal_event.is_none());
+    }
+
+    #[tokio::test]
+    async fn selection_input_demands_exactly_one_lazy_preview() {
+        let mut app = App::new();
+        app.state.chats = vec![chat(10)];
+        app.state.messages = vec![message(1), message(2)];
+        app.state.messages[1].media = Some(MessageMedia::photo());
+        app.state.focused_panel = FocusedPanel::Messages;
+        let mut client = MockTelegramClient::new();
+        let mut progress = UiProgress::Silent;
+
+        handle_key_event_with_progress(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut client,
+            &mut progress,
+            HandlerLoaders::none(),
+        )
+        .await
+        .expect("selection input should succeed");
+        assert_eq!(app.state.selected_message_index, 1);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut preview_loader = MediaPreviewLoader::new(client, tx);
+        preview_loader.request(app.state.selected_media_preview_request());
+        preview_loader.request(app.state.selected_media_preview_request());
+        tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("preview should respond")
+            .expect("preview receiver should stay open");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), rx.recv())
+                .await
+                .is_err(),
+            "one selection change must create exactly one preview request"
+        );
+    }
+
+    #[test]
+    fn production_frame_and_shutdown_ownership_are_explicit() {
+        let source = include_str!("main.rs");
+        assert_eq!(source.matches(concat!("terminal", ".draw(")).count(), 2);
+        assert_eq!(source.matches(concat!("progress", ".show(")).count(), 9);
+        let progress_show = source
+            .split("fn show(&mut self")
+            .nth(1)
+            .and_then(|tail| tail.split("fn is_loading_progress_status").next())
+            .expect("progress show body should remain findable");
+        assert!(!progress_show.contains(".draw("));
+
+        let run_with_client = source
+            .split("async fn run_with_client")
+            .nth(1)
+            .and_then(|tail| tail.split("fn trim_prompt_input_line").next())
+            .expect("run_with_client body should remain findable");
+        assert!(
+            run_with_client.find("run_app(").expect("run_app call")
+                < run_with_client
+                    .find("terminal_restore_start")
+                    .expect("restore diagnostic")
+        );
+        let prepare_step = source
+            .split("fn prepare_loop_step")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn dispatch_terminal_event").next())
+            .expect("loop-step body should remain findable");
+        assert!(
+            prepare_step
+                .find("drain_ready_results")
+                .expect("result drain")
+                < prepare_step
+                    .find("staged_terminal_event.take")
+                    .expect("staged input release")
+        );
+
+        let run_app = source
+            .split("async fn run_app")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn run_event_loop").next())
+            .expect("run_app body should remain findable");
+        assert!(
+            run_app.find("drop(events)").expect("event stream drop")
+                < run_app
+                    .find("terminal_event_stream_stopped")
+                    .expect("stream-stop diagnostic")
+        );
     }
 
     #[derive(Clone)]

@@ -881,88 +881,6 @@ pub fn begin_open_folder_at(
 }
 
 #[cfg(test)]
-pub async fn open_folder_at<C: TelegramClient>(
-    state: &mut AppState,
-    client: &mut C,
-    folder_index: usize,
-) -> Result<()> {
-    if let Some((_, folder_id)) = begin_open_folder_at(state, folder_index) {
-        let result = fetch_folder_chats_and_selected_messages(client, folder_id).await;
-        apply_folder_chat_load_result(state, result);
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-pub async fn open_next_folder<C: TelegramClient>(
-    state: &mut AppState,
-    client: &mut C,
-) -> Result<()> {
-    let old_index = state.selected_folder_index;
-    state.select_next_folder();
-    state.ensure_selected_folder_visible();
-    if old_index != state.selected_folder_index && !state.folders.is_empty() {
-        reload_selected_folder_chats(state, client).await?;
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-pub async fn open_previous_folder<C: TelegramClient>(
-    state: &mut AppState,
-    client: &mut C,
-) -> Result<()> {
-    let old_index = state.selected_folder_index;
-    state.select_prev_folder();
-    state.ensure_selected_folder_visible();
-    if old_index != state.selected_folder_index && !state.folders.is_empty() {
-        reload_selected_folder_chats(state, client).await?;
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-pub async fn open_chat_at<C: TelegramClient>(
-    state: &mut AppState,
-    client: &mut C,
-    chat_index: usize,
-) -> Result<()> {
-    if chat_index >= state.chats.len() {
-        return Ok(());
-    }
-
-    if begin_open_chat_at(state, chat_index).is_some() {
-        load_selected_chat_messages(state, client).await?;
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-pub async fn open_next_chat<C: TelegramClient>(state: &mut AppState, client: &mut C) -> Result<()> {
-    if state.selected_chat_index + 1 >= state.chats.len() {
-        return Ok(());
-    }
-
-    open_chat_at(state, client, state.selected_chat_index + 1).await
-}
-
-#[cfg(test)]
-pub async fn open_previous_chat<C: TelegramClient>(
-    state: &mut AppState,
-    client: &mut C,
-) -> Result<()> {
-    if state.selected_chat_index == 0 || state.chats.is_empty() {
-        return Ok(());
-    }
-
-    open_chat_at(state, client, state.selected_chat_index - 1).await
-}
-
-#[cfg(test)]
 pub async fn submit_message<C: TelegramClient>(state: &mut AppState, client: &mut C) -> Result<()> {
     let Some(action) = state.prepare_message_submit() else {
         return Ok(());
@@ -1134,8 +1052,7 @@ mod tests {
         download_message_media_result, fetch_folder_chats_and_selected_messages,
         fetch_initial_state, fetch_latest_chat_messages, finish_send_message, load_initial_state,
         load_older_messages_failed_error, load_older_selected_chat_messages,
-        load_selected_chat_messages, load_selected_thread_topic_messages, open_chat_at,
-        open_folder_at, open_next_chat, open_next_folder, open_previous_chat, open_previous_folder,
+        load_selected_chat_messages, load_selected_thread_topic_messages,
         reload_selected_folder_chats, send_typing_action_best_effort, submit_message,
     };
     use crate::state::{
@@ -2496,41 +2413,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn open_folder_at_loads_target_folder_when_selection_changes() {
-        let mut state = AppState::new();
-        let mut client = MockTelegramClient::new();
-        action_should_succeed(load_initial_state(&mut state, &mut client).await);
-        state.input_buffer = "alice draft".to_string();
-
-        action_should_succeed(open_folder_at(&mut state, &mut client, 1).await);
-
-        assert_eq!(state.selected_folder_index, 1);
-        assert_eq!(state.chats.len(), 2);
-        assert!(state.chats.iter().all(|chat| chat.folder_id == Some(2)));
-        assert_eq!(state.selected_chat_index, 0);
-        assert_eq!(state.messages.len(), 3);
-        assert_eq!(
-            state.chat_drafts.get(&1).map(String::as_str),
-            Some("alice draft")
-        );
-    }
-
-    #[tokio::test]
-    async fn open_folder_at_loads_thread_topics_for_selected_threaded_group() {
-        let mut state = AppState::new();
-        let mut client = MockTelegramClient::new();
-        action_should_succeed(load_initial_state(&mut state, &mut client).await);
-
-        action_should_succeed(open_folder_at(&mut state, &mut client, 2).await);
-
-        assert_eq!(state.selected_folder_index, 2);
-        assert_eq!(state.chats[0].id, 3);
-        assert_eq!(state.messages[0].chat_id, 3);
-        assert_eq!(state.thread_topics.len(), 2);
-        assert_eq!(state.thread_topics[0].title, "General");
-    }
-
     #[test]
     fn begin_open_folder_at_restores_cached_chats_while_refreshing() {
         let mut state = AppState::new();
@@ -2575,118 +2457,6 @@ mod tests {
         assert_eq!(state.chats[0].id, 10);
         assert!(state.messages.is_empty());
         assert_eq!(state.selected_chat_index, 0);
-    }
-
-    #[tokio::test]
-    async fn open_folder_at_does_not_reload_when_selection_is_unchanged() {
-        let mut state = AppState::new();
-        state.folders = vec![all_folder(0)];
-        state.chats = vec![Chat {
-            id: 99,
-            name: "Local Only".to_string(),
-            last_message: None,
-            unread_count: 0,
-            is_group: false,
-            folder_id: None,
-        }];
-        state.messages = vec![message(99, 99, "keep local messages")];
-        let mut client = MockTelegramClient::new();
-
-        action_should_succeed(open_folder_at(&mut state, &mut client, 0).await);
-
-        assert_eq!(state.chats.len(), 1);
-        assert_eq!(state.chats[0].id, 99);
-        assert_eq!(state.messages.len(), 1);
-        assert_eq!(state.messages[0].id, 99);
-    }
-
-    #[tokio::test]
-    async fn open_next_and_previous_folder_wrap_and_load_chats() {
-        let mut state = AppState::new();
-        let mut client = MockTelegramClient::new();
-        action_should_succeed(load_initial_state(&mut state, &mut client).await);
-
-        action_should_succeed(open_previous_folder(&mut state, &mut client).await);
-
-        assert_eq!(state.selected_folder_index, 2);
-        assert_eq!(state.chats.len(), 2);
-        assert!(state.chats.iter().all(|chat| chat.folder_id == Some(3)));
-
-        action_should_succeed(open_next_folder(&mut state, &mut client).await);
-
-        assert_eq!(state.selected_folder_index, 0);
-        assert_eq!(state.chats.len(), 4);
-    }
-
-    #[tokio::test]
-    async fn open_chat_at_saves_current_draft_and_loads_target_chat() {
-        let mut state = AppState::new();
-        state.chats = vec![
-            Chat {
-                id: 1,
-                name: "Alice".to_string(),
-                last_message: None,
-                unread_count: 0,
-                is_group: false,
-                folder_id: None,
-            },
-            Chat {
-                id: 2,
-                name: "Bob".to_string(),
-                last_message: None,
-                unread_count: 4,
-                is_group: false,
-                folder_id: None,
-            },
-        ];
-        state.input_buffer = "alice draft".to_string();
-        let mut client = MockTelegramClient::new();
-
-        action_should_succeed(open_chat_at(&mut state, &mut client, 1).await);
-
-        assert_eq!(state.selected_chat_index, 1);
-        assert_eq!(state.messages.len(), 2);
-        assert_eq!(state.messages[0].chat_id, 2);
-        assert_eq!(state.chats[1].unread_count, 0);
-        assert_eq!(
-            state.chat_drafts.get(&1).map(String::as_str),
-            Some("alice draft")
-        );
-        assert_eq!(state.input_buffer, "");
-    }
-
-    #[tokio::test]
-    async fn open_next_and_previous_chat_stop_at_list_boundaries() {
-        let mut state = AppState::new();
-        state.chats = vec![
-            Chat {
-                id: 1,
-                name: "Alice".to_string(),
-                last_message: None,
-                unread_count: 0,
-                is_group: false,
-                folder_id: None,
-            },
-            Chat {
-                id: 2,
-                name: "Bob".to_string(),
-                last_message: None,
-                unread_count: 0,
-                is_group: false,
-                folder_id: None,
-            },
-        ];
-        state.messages = vec![message(10, 1, "keep")];
-        let mut client = MockTelegramClient::new();
-
-        action_should_succeed(open_previous_chat(&mut state, &mut client).await);
-        assert_eq!(state.selected_chat_index, 0);
-        assert_eq!(state.messages[0].content, "keep");
-
-        state.selected_chat_index = 1;
-        action_should_succeed(open_next_chat(&mut state, &mut client).await);
-        assert_eq!(state.selected_chat_index, 1);
-        assert_eq!(state.messages[0].content, "keep");
     }
 
     #[tokio::test]

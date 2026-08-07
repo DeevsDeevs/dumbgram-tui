@@ -5,7 +5,7 @@ use crate::telegram::types::{
     message_display_preview,
 };
 use crate::text::{display_width, wrap_display_lines_limited};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use ratatui::layout::Rect;
 use std::{
     collections::{HashMap, HashSet},
@@ -36,7 +36,9 @@ pub(crate) const DEFAULT_SPLIT_RATIO: f32 = 0.3;
 pub(crate) const SPLIT_RATIO_STEP: f32 = 0.05;
 pub(crate) const MIN_SPLIT_RATIO: f32 = 0.1;
 pub(crate) const MAX_SPLIT_RATIO: f32 = 0.9;
-pub(crate) const NOTIFICATION_TIMEOUT_SECONDS: i64 = 5;
+pub(crate) const NOTIFICATION_TIMEOUT_SECONDS: u64 = 5;
+pub(crate) const NOTIFICATION_LIFETIME: Duration =
+    Duration::from_secs(NOTIFICATION_TIMEOUT_SECONDS + 1);
 pub(crate) const PANEL_BORDER_RESERVED_COLUMNS: u16 = 2;
 pub(crate) const PANEL_BORDER_RESERVED_ROWS: u16 = 2;
 pub(crate) const CHAT_LIST_ITEM_HEIGHT: u16 = 2;
@@ -269,9 +271,9 @@ pub struct AppState {
     pub editing_message_id: Option<i32>,
     pub replying_to_message_id: Option<i32>,
     pub error_message: Option<String>,
-    pub error_timestamp: Option<DateTime<Utc>>,
+    pub error_timestamp: Option<tokio::time::Instant>,
     pub status_message: Option<String>,
-    pub status_timestamp: Option<DateTime<Utc>>,
+    pub status_timestamp: Option<tokio::time::Instant>,
     pub last_downloaded_media: Option<DownloadedMediaReference>,
     pub delete_confirmation: Option<DeleteConfirmation>,
     pub typing_users: HashMap<i64, Vec<String>>,
@@ -1492,24 +1494,6 @@ impl AppState {
             });
     }
 
-    #[cfg(test)]
-    pub fn select_next_folder(&mut self) {
-        if !self.folders.is_empty() {
-            self.selected_folder_index = (self.selected_folder_index + 1) % self.folders.len();
-        }
-    }
-
-    #[cfg(test)]
-    pub fn select_prev_folder(&mut self) {
-        if !self.folders.is_empty() {
-            self.selected_folder_index = if self.selected_folder_index == 0 {
-                self.folders.len() - 1
-            } else {
-                self.selected_folder_index - 1
-            };
-        }
-    }
-
     pub fn chat_visible_capacity(&self) -> usize {
         (self
             .chats_area
@@ -2084,7 +2068,7 @@ impl AppState {
 
     pub fn set_error(&mut self, error: String) {
         self.error_message = Some(error);
-        self.error_timestamp = Some(Utc::now());
+        self.error_timestamp = Some(tokio::time::Instant::now());
         self.clear_status();
     }
 
@@ -2096,7 +2080,7 @@ impl AppState {
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.clear_error();
         self.status_message = Some(status.into());
-        self.status_timestamp = Some(Utc::now());
+        self.status_timestamp = Some(tokio::time::Instant::now());
     }
 
     pub fn clear_status(&mut self) {
@@ -2104,20 +2088,31 @@ impl AppState {
         self.status_timestamp = None;
     }
 
-    pub fn check_notification_timeout(&mut self) {
-        if let Some(timestamp) = self.error_timestamp
-            && Utc::now().signed_duration_since(timestamp).num_seconds()
-                > NOTIFICATION_TIMEOUT_SECONDS
-        {
+    pub fn notification_deadline(&self) -> Option<tokio::time::Instant> {
+        match (self.error_timestamp, self.status_timestamp) {
+            (Some(error), Some(status)) => Some(error.min(status)),
+            (error, status) => error.or(status),
+        }
+        .map(|timestamp| timestamp + NOTIFICATION_LIFETIME)
+    }
+
+    pub fn check_notification_timeout(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        let clear_error = self
+            .error_timestamp
+            .is_some_and(|timestamp| now >= timestamp + NOTIFICATION_LIFETIME);
+        let clear_status = self
+            .status_timestamp
+            .is_some_and(|timestamp| now >= timestamp + NOTIFICATION_LIFETIME);
+
+        if clear_error {
             self.clear_error();
         }
-
-        if let Some(timestamp) = self.status_timestamp
-            && Utc::now().signed_duration_since(timestamp).num_seconds()
-                > NOTIFICATION_TIMEOUT_SECONDS
-        {
+        if clear_status {
             self.clear_status();
         }
+
+        clear_error || clear_status
     }
 }
 
@@ -2135,7 +2130,7 @@ mod tests {
         DEFAULT_SPLIT_RATIO, DeleteConfirmation, FAILED_SEND_DISMISSED_STATUS,
         FOLDER_VIEWPORT_RESERVED_COLUMNS, FocusedPanel, MAX_SPLIT_RATIO, MESSAGE_DELETED_STATUS,
         MESSAGE_EDITED_STATUS, MESSAGE_ROW_HEIGHT, MIN_SPLIT_RATIO, MessageSubmitAction,
-        NO_CHAT_SELECTED_ERROR, NOTIFICATION_TIMEOUT_SECONDS, PANEL_BORDER_RESERVED_COLUMNS,
+        NO_CHAT_SELECTED_ERROR, NOTIFICATION_LIFETIME, PANEL_BORDER_RESERVED_COLUMNS,
         PANEL_BORDER_RESERVED_ROWS, REMOTE_EDIT_WHILE_EDITING_STATUS, REPLY_MESSAGE_ROW_HEIGHT,
         REPLY_SENT_STATUS, SPLIT_RATIO_STEP, TYPING_ACTION_COOLDOWN, delete_failed_error,
         delete_update_matches_chat, edit_failed_error, last_index, message_visible_row_height,
@@ -2145,7 +2140,7 @@ mod tests {
         Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, ThreadTopic,
         UNKNOWN_DELETE_UPDATE_CHAT_ID, Update, all_folder,
     };
-    use chrono::{Duration, Utc};
+    use chrono::Utc;
     use ratatui::layout::Rect;
     use std::time::{Duration as StdDuration, Instant};
 
@@ -3561,19 +3556,32 @@ mod tests {
     }
 
     #[test]
-    fn stale_notifications_are_cleared() {
+    fn notification_deadline_uses_earliest_active_notification() {
         let mut state = AppState::new();
+        let now = tokio::time::Instant::now();
+        state.error_timestamp = Some(now + StdDuration::from_secs(1));
+        state.status_timestamp = Some(now);
+
+        assert_eq!(
+            state.notification_deadline(),
+            Some(now + NOTIFICATION_LIFETIME)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notification_clears_at_preserved_effective_boundary() {
+        let mut state = AppState::new();
+        assert!(state.notification_deadline().is_none());
         state.set_status("Status ok");
-        state.set_error("Send failed".to_string());
-        state.status_timestamp =
-            Some(Utc::now() - Duration::seconds(NOTIFICATION_TIMEOUT_SECONDS + 1));
-        state.error_timestamp =
-            Some(Utc::now() - Duration::seconds(NOTIFICATION_TIMEOUT_SECONDS + 1));
 
-        state.check_notification_timeout();
+        tokio::time::advance(NOTIFICATION_LIFETIME - StdDuration::from_millis(1)).await;
+        assert!(!state.check_notification_timeout());
+        assert_eq!(state.status_message.as_deref(), Some("Status ok"));
 
+        tokio::time::advance(StdDuration::from_millis(1)).await;
+        assert!(state.check_notification_timeout());
         assert!(state.status_message.is_none());
-        assert!(state.error_message.is_none());
+        assert!(state.notification_deadline().is_none());
     }
 
     #[test]
