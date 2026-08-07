@@ -85,6 +85,7 @@ pub fn render_chats(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, t
         )
         .highlight_style(
             Style::default()
+                .fg(theme.selection_foreground)
                 .bg(theme.selection)
                 .add_modifier(Modifier::BOLD),
         )

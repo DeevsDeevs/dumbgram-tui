@@ -4,6 +4,7 @@ pub struct Theme {
     pub background: Color,
     pub foreground: Color,
     pub selection: Color,
+    pub selection_foreground: Color,
     pub unread_chat: Color,
     pub selected_item: Color,
     pub own_message: Color,
@@ -14,24 +15,43 @@ pub struct Theme {
 }
 
 impl Theme {
-    pub fn catppuccin_mocha() -> Self {
+    pub fn evergreen() -> Self {
         Self {
-            background: Color::Rgb(30, 30, 46),
-            foreground: Color::Rgb(205, 214, 244),
-            selection: Color::Rgb(88, 91, 112),
-            unread_chat: Color::Rgb(249, 226, 175),
-            selected_item: Color::Rgb(203, 166, 247),
-            own_message: Color::Rgb(137, 180, 250),
-            other_message: Color::Rgb(205, 214, 244),
-            error: Color::Rgb(243, 139, 168),
-            border: Color::Rgb(88, 91, 112),
-            border_focused: Color::Rgb(203, 166, 247),
+            background: Color::Reset,
+            foreground: Color::Reset,
+            selection: Color::Green,
+            selection_foreground: Color::White,
+            unread_chat: Color::Yellow,
+            selected_item: Color::LightGreen,
+            own_message: Color::LightGreen,
+            other_message: Color::Reset,
+            error: Color::Red,
+            border: Color::DarkGray,
+            border_focused: Color::LightGreen,
         }
     }
 }
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::catppuccin_mocha()
+        Self::evergreen()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Theme;
+    use ratatui::style::Color;
+
+    #[test]
+    fn evergreen_is_transparent_default_with_explicit_selection_contrast() {
+        let theme = Theme::default();
+
+        assert_eq!(theme.background, Color::Reset);
+        assert_eq!(theme.foreground, Color::Reset);
+        assert_eq!(theme.other_message, Color::Reset);
+        assert_eq!(theme.selection, Color::Green);
+        assert_eq!(theme.selection_foreground, Color::White);
+        assert_eq!(theme.border_focused, Color::LightGreen);
     }
 }

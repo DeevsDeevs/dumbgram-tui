@@ -143,6 +143,7 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
         )
         .highlight_style(
             Style::default()
+                .fg(theme.selection_foreground)
                 .bg(theme.selection)
                 .add_modifier(Modifier::BOLD),
         )
@@ -163,7 +164,7 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
                     .borders(Borders::ALL)
                     .title(DELETE_CONFIRMATION_TITLE),
             )
-            .style(Style::default().bg(Color::Black).fg(Color::Red));
+            .style(Style::default().bg(theme.background).fg(theme.error));
         frame.render_widget(Clear, popup_area);
         frame.render_widget(confirmation, popup_area);
     }
