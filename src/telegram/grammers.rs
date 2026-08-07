@@ -1,16 +1,17 @@
 use chrono::{DateTime, Utc};
 use color_eyre::Result;
 use grammers_client::{
-    Client, Config, InitParams, InputMessage, grammers_tl_types as tl,
+    Client, Config, FixedReconnect, InitParams, InputMessage, grammers_tl_types as tl,
     types::{ChatMap, Downloadable, photo_sizes::PhotoSize},
 };
 use grammers_session::Session;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
-use super::client::{DownloadedMedia, TelegramClient};
+use super::client::{DownloadedMedia, ReconciliationChatList, TelegramClient};
 use super::types::{
     Chat, Folder, Message, MessageMedia, MessageMediaKind, MessageStatus, OWN_SENDER_NAME,
     ThreadTopic, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update, all_folder,
@@ -21,6 +22,10 @@ use crate::diagnostics;
 const CHAT_NOT_FOUND_IN_CACHE_PREFIX: &str = "Chat not found in cache";
 const CHAT_CACHE_LOCK_FAILED: &str = "Chat cache lock failed";
 const UPDATE_ERROR_PREFIX: &str = "Update error";
+const TELEGRAM_RECONNECT_POLICY: FixedReconnect = FixedReconnect {
+    attempts: 5,
+    delay: Duration::from_secs(2),
+};
 
 type ChatCache = HashMap<i64, grammers_client::types::Chat>;
 type UserNameCache = HashMap<i64, String>;
@@ -132,6 +137,66 @@ impl GrammersClient {
         }
         Ok(())
     }
+
+    async fn load_chats(
+        &self,
+        folder_id: Option<i32>,
+        limit: usize,
+    ) -> Result<ReconciliationChatList> {
+        if limit == 0 {
+            return Ok(ReconciliationChatList {
+                chats: Vec::new(),
+                last_message_ids: HashMap::new(),
+            });
+        }
+
+        let dialog_filter = if let Some(folder_id) = folder_id {
+            self.cached_dialog_filter(folder_id)?
+        } else {
+            None
+        };
+        let mut iter = self.client.iter_dialogs();
+        let mut chats = Vec::new();
+        let mut last_message_ids = HashMap::new();
+
+        while let Some(dialog) = iter.next().await? {
+            if chats.len() >= limit {
+                break;
+            }
+            let dialog_folder_id = dialog_folder_id(&dialog);
+            let matches_selected_folder = match (folder_id, dialog_filter.as_ref()) {
+                (None, _) => true,
+                (Some(_), Some(filter)) => dialog_matches_filter(&dialog, filter),
+                (Some(folder_id), None) => dialog_folder_id == Some(folder_id),
+            };
+            if !matches_selected_folder {
+                continue;
+            }
+
+            let chat = dialog.chat();
+            self.cache_chat(chat.clone())?;
+            self.cache_dialog_read_state(&dialog)?;
+            if let Some(message) = dialog.last_message.as_ref() {
+                last_message_ids.insert(chat.id(), message.id());
+            }
+            chats.push(Chat {
+                id: chat.id(),
+                name: chat.name().to_string(),
+                last_message: dialog
+                    .last_message
+                    .as_ref()
+                    .map(message_preview_from_grammers_message),
+                unread_count: dialog_unread_count(&dialog),
+                is_group: matches!(chat, grammers_client::types::Chat::Group(_)),
+                folder_id: folder_id.or(dialog_folder_id),
+            });
+        }
+
+        Ok(ReconciliationChatList {
+            chats,
+            last_message_ids,
+        })
+    }
 }
 
 fn dumbgram_init_params() -> InitParams {
@@ -142,6 +207,7 @@ fn dumbgram_init_params() -> InitParams {
         // Startup and folder/chat loads already fetch the recent visible history. Replaying
         // offline update backlog makes hours-old messages appear as new live messages.
         catch_up: false,
+        reconnection_policy: &TELEGRAM_RECONNECT_POLICY,
         update_queue_limit: Some(100),
         flood_sleep_threshold: 60,
         ..Default::default()
@@ -1428,50 +1494,15 @@ impl TelegramClient for GrammersClient {
     }
 
     async fn get_chats(&self, folder_id: Option<i32>, limit: usize) -> Result<Vec<Chat>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
+        Ok(self.load_chats(folder_id, limit).await?.chats)
+    }
 
-        let dialog_filter = if let Some(folder_id) = folder_id {
-            self.cached_dialog_filter(folder_id)?
-        } else {
-            None
-        };
-        let mut iter = self.client.iter_dialogs();
-        let mut chats = Vec::new();
-
-        while let Some(dialog) = iter.next().await? {
-            if chats.len() >= limit {
-                break;
-            }
-            let dialog_folder_id = dialog_folder_id(&dialog);
-            let matches_selected_folder = match (folder_id, dialog_filter.as_ref()) {
-                (None, _) => true,
-                (Some(_), Some(filter)) => dialog_matches_filter(&dialog, filter),
-                (Some(folder_id), None) => dialog_folder_id == Some(folder_id),
-            };
-            if !matches_selected_folder {
-                continue;
-            }
-
-            let chat = dialog.chat();
-            self.cache_chat(chat.clone())?;
-            self.cache_dialog_read_state(&dialog)?;
-
-            chats.push(Chat {
-                id: chat.id(),
-                name: chat.name().to_string(),
-                last_message: dialog
-                    .last_message
-                    .as_ref()
-                    .map(message_preview_from_grammers_message),
-                unread_count: dialog_unread_count(&dialog),
-                is_group: matches!(chat, grammers_client::types::Chat::Group(_)),
-                folder_id: folder_id.or(dialog_folder_id),
-            });
-        }
-
-        Ok(chats)
+    async fn get_reconciliation_chats(
+        &self,
+        folder_id: Option<i32>,
+        limit: usize,
+    ) -> Result<ReconciliationChatList> {
+        self.load_chats(folder_id, limit).await
     }
 
     #[allow(clippy::manual_async_fn)]
@@ -1643,6 +1674,7 @@ mod tests {
     use grammers_client::grammers_tl_types as tl;
     use std::{
         collections::HashMap,
+        ops::ControlFlow,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1676,6 +1708,15 @@ mod tests {
         assert!(!params.catch_up);
         assert_eq!(params.update_queue_limit, Some(100));
         assert_eq!(params.app_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn grammers_init_params_retry_transport_reconnects_with_a_bound() {
+        let policy = dumbgram_init_params().reconnection_policy;
+
+        assert!(matches!(policy.should_retry(0), ControlFlow::Continue(_)));
+        assert!(matches!(policy.should_retry(5), ControlFlow::Continue(_)));
+        assert!(matches!(policy.should_retry(6), ControlFlow::Break(())));
     }
 
     #[test]

@@ -1,5 +1,8 @@
 use crate::diagnostics;
-use crate::state::{AppState, DeleteConfirmation, MessageSubmitAction, NO_CHAT_SELECTED_ERROR};
+use crate::state::{
+    AppState, DeleteConfirmation, MessageSubmitAction, NO_CHAT_SELECTED_ERROR,
+    ReconciliationContext, ReconciliationSnapshot,
+};
 use crate::telegram::{
     DownloadedMedia, TelegramClient,
     types::{ALL_FOLDER_ID, Chat, Folder, Message, MessageMediaKind, ThreadTopic},
@@ -29,6 +32,10 @@ const MARK_CHAT_READ_TIMEOUT: Duration = Duration::from_millis(10);
 const SEND_TYPING_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const SEND_TYPING_TIMEOUT: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+pub(crate) const RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub(crate) const RECONCILIATION_TIMEOUT: Duration = Duration::from_millis(25);
 pub(crate) const NO_OLDER_MESSAGES_STATUS: &str = "No older messages";
 pub(crate) const LOAD_MESSAGES_TIMED_OUT_STATUS: &str = "Load messages timed out";
 pub(crate) const LOAD_OLDER_MESSAGES_TIMED_OUT_STATUS: &str = "Load older messages timed out";
@@ -692,6 +699,95 @@ pub async fn fetch_initial_state<C: TelegramClient>(
     })
 }
 
+pub async fn fetch_reconciliation_snapshot<C: TelegramClient + Sync>(
+    client: &C,
+    context: ReconciliationContext,
+) -> std::result::Result<ReconciliationSnapshot, String> {
+    diagnostics::event(
+        "reconciliation_start",
+        format!(
+            "folder_id={:?} chat_id={:?} topic_id={:?}",
+            context.folder_id, context.chat_id, context.topic_id
+        ),
+    );
+    let started = Instant::now();
+    let fetch = async {
+        let folders = client
+            .get_folders()
+            .await
+            .map_err(|error| error.to_string())?;
+        let selected_folder = context
+            .folder_id
+            .and_then(|folder_id| folders.iter().find(|folder| folder.id == folder_id))
+            .or_else(|| folders.first());
+        let selected_folder_id = selected_folder.map(|folder| folder.id);
+        let folder_filter_id =
+            selected_folder.and_then(|folder| (folder.id != ALL_FOLDER_ID).then_some(folder.id));
+        let chat_list = client
+            .get_reconciliation_chats(folder_filter_id, CHAT_LIST_PAGE_SIZE)
+            .await
+            .map_err(|error| error.to_string())?;
+        let chats = chat_list.chats;
+        let selected_chat = context
+            .chat_id
+            .and_then(|chat_id| chats.iter().find(|chat| chat.id == chat_id))
+            .or_else(|| chats.first());
+        let selected_chat_id = selected_chat.map(|chat| chat.id);
+
+        let (thread_topics, selected_topic_id, messages) = match selected_chat_id {
+            Some(chat_id) => {
+                let thread_topics = fetch_chat_thread_topics(client, chat_id).await?;
+                let selected_topic_id = context
+                    .topic_id
+                    .filter(|topic_id| thread_topics.iter().any(|topic| topic.id == *topic_id));
+                let messages = if let Some(topic_id) = selected_topic_id {
+                    fetch_thread_topic_messages(client, chat_id, topic_id).await?
+                } else {
+                    fetch_latest_chat_messages(client, chat_id).await?
+                };
+                (thread_topics, selected_topic_id, messages)
+            }
+            None => (Vec::new(), None, Vec::new()),
+        };
+
+        Ok(ReconciliationSnapshot {
+            folders,
+            selected_folder_id,
+            chats,
+            chat_last_message_ids: chat_list.last_message_ids,
+            selected_chat_id,
+            thread_topics,
+            selected_topic_id,
+            messages,
+        })
+    };
+
+    match tokio::time::timeout(RECONCILIATION_TIMEOUT, fetch).await {
+        Ok(result) => {
+            diagnostics::event(
+                "reconciliation_finish",
+                format!(
+                    "success={} elapsed_ms={}",
+                    result.is_ok(),
+                    started.elapsed().as_millis()
+                ),
+            );
+            result
+        }
+        Err(_) => {
+            diagnostics::event(
+                "reconciliation_timeout",
+                format!(
+                    "elapsed_ms={} timeout_ms={}",
+                    started.elapsed().as_millis(),
+                    RECONCILIATION_TIMEOUT.as_millis()
+                ),
+            );
+            Err("Telegram state refresh timed out".to_string())
+        }
+    }
+}
+
 pub fn apply_initial_state_load_result(
     state: &mut AppState,
     result: std::result::Result<InitialStateLoad, String>,
@@ -1050,14 +1146,15 @@ mod tests {
         LOAD_CHATS_TIMED_OUT_STATUS, NO_OLDER_MESSAGES_STATUS, apply_initial_state_load_result,
         begin_open_chat_at, begin_open_folder_at, begin_send_message, confirm_delete,
         download_message_media_result, fetch_folder_chats_and_selected_messages,
-        fetch_initial_state, fetch_latest_chat_messages, finish_send_message, load_initial_state,
-        load_older_messages_failed_error, load_older_selected_chat_messages,
-        load_selected_chat_messages, load_selected_thread_topic_messages,
-        reload_selected_folder_chats, send_typing_action_best_effort, submit_message,
+        fetch_initial_state, fetch_latest_chat_messages, fetch_reconciliation_snapshot,
+        finish_send_message, load_initial_state, load_older_messages_failed_error,
+        load_older_selected_chat_messages, load_selected_chat_messages,
+        load_selected_thread_topic_messages, reload_selected_folder_chats,
+        send_typing_action_best_effort, submit_message,
     };
     use crate::state::{
         AppState, ConversationLoadStatus, DeleteConfirmation, MESSAGE_DELETED_STATUS,
-        NO_CHAT_SELECTED_ERROR,
+        NO_CHAT_SELECTED_ERROR, ReconciliationContext,
     };
     use crate::telegram::types::{
         Chat, Folder, Message, MessageMediaKind, MessageStatus, OWN_SENDER_NAME, ThreadTopic,
@@ -1746,6 +1843,30 @@ mod tests {
             Some(super::CHAT_LIST_PAGE_SIZE)
         );
         assert_eq!(state.chats.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_snapshot_resolves_stable_loaded_view_ids() {
+        let client = MockTelegramClient::new();
+        let snapshot = fetch_reconciliation_snapshot(
+            &client,
+            ReconciliationContext {
+                folder_id: Some(0),
+                chat_id: Some(2),
+                topic_id: None,
+                message_id: None,
+            },
+        )
+        .await
+        .expect("mock reconciliation should succeed");
+
+        assert_eq!(snapshot.selected_folder_id, Some(0));
+        assert_eq!(snapshot.selected_chat_id, Some(2));
+        assert_eq!(
+            snapshot.chat_last_message_ids.get(&2),
+            snapshot.messages.last().map(|message| &message.id)
+        );
+        assert!(snapshot.messages.iter().all(|message| message.chat_id == 2));
     }
 
     #[tokio::test]

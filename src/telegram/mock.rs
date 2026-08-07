@@ -1,4 +1,4 @@
-use super::client::{DownloadedMedia, TelegramClient};
+use super::client::{DownloadedMedia, ReconciliationChatList, TelegramClient};
 use super::types::{
     Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, ThreadTopic, Update,
     all_folder,
@@ -7,6 +7,7 @@ use base64::Engine;
 use chrono::Utc;
 use color_eyre::Result;
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
         Arc,
@@ -175,6 +176,24 @@ impl TelegramClient for MockTelegramClient {
             all_chats
         };
         Ok(chats.into_iter().take(limit).collect())
+    }
+
+    async fn get_reconciliation_chats(
+        &self,
+        folder_id: Option<i32>,
+        limit: usize,
+    ) -> Result<ReconciliationChatList> {
+        let chats = self.get_chats(folder_id, limit).await?;
+        let mut last_message_ids = HashMap::new();
+        for chat in &chats {
+            if let Some(message) = self.get_messages(chat.id, usize::MAX).await?.last() {
+                last_message_ids.insert(chat.id, message.id);
+            }
+        }
+        Ok(ReconciliationChatList {
+            chats,
+            last_message_ids,
+        })
     }
 
     async fn get_thread_topics(&self, chat_id: i64, limit: usize) -> Result<Vec<ThreadTopic>> {

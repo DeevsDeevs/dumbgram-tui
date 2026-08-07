@@ -9,6 +9,7 @@ A small terminal Telegram client written in Rust with Ratatui/Crossterm and Gram
 - Browse folders, chats, and messages.
 - Send, edit, reply to, and delete supported messages.
 - Receive incoming, edited, deleted, and typing updates.
+- Retry interrupted Telegram transports and reconcile the visible folders, chats, and conversation after update errors, focus returns, and a five-minute safety interval.
 - Run without credentials using the mock backend.
 - Run a mock-only smoke test for automated validation.
 

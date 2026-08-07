@@ -293,6 +293,32 @@ pub struct DownloadedMediaReference {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconciliationContext {
+    pub folder_id: Option<i32>,
+    pub chat_id: Option<i64>,
+    pub topic_id: Option<i32>,
+    pub message_id: Option<i32>,
+}
+
+#[derive(Debug)]
+pub struct ReconciliationSnapshot {
+    pub folders: Vec<Folder>,
+    pub selected_folder_id: Option<i32>,
+    pub chats: Vec<Chat>,
+    pub chat_last_message_ids: HashMap<i64, i32>,
+    pub selected_chat_id: Option<i64>,
+    pub thread_topics: Vec<ThreadTopic>,
+    pub selected_topic_id: Option<i32>,
+    pub messages: Vec<Message>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconciliationApply {
+    Applied { conversation_replaced: bool },
+    Stale,
+}
+
 pub struct AppState {
     pub folders: Vec<Folder>,
     pub chats: Vec<Chat>,
@@ -1140,6 +1166,7 @@ impl AppState {
 
     pub fn apply_loaded_selected_chat_messages(&mut self, messages: Vec<Message>) {
         self.clear_selected_chat_older_history_exhausted();
+        let selected_topic_id = self.selected_thread_topic().map(|topic| topic.id);
         self.messages = messages;
         if self.messages.is_empty() {
             self.conversation_load_status = ConversationLoadStatus::Empty;
@@ -1148,13 +1175,10 @@ impl AppState {
             self.conversation_load_status = ConversationLoadStatus::Loaded;
             self.select_last_message();
         }
-        if let Some(chat) = self.chats.get_mut(self.selected_chat_index) {
-            chat.unread_count = 0;
+        self.clear_selected_conversation_unread(selected_topic_id);
+        if selected_topic_id.is_none() {
+            self.refresh_selected_chat_last_message_from_loaded_messages();
         }
-        if let Some(topic_index) = self.selected_thread_topic_index_for_loaded_topics() {
-            self.thread_topics[topic_index].unread_count = 0;
-        }
-        self.refresh_selected_chat_last_message_from_loaded_messages();
         self.sync_folder_unread_counts_from_loaded_chats();
         self.restore_draft_for_selected_chat();
     }
@@ -1226,10 +1250,6 @@ impl AppState {
 
     pub fn selected_thread_topic(&self) -> Option<&ThreadTopic> {
         self.thread_topics.get(self.selected_thread_topic_index)
-    }
-
-    fn selected_thread_topic_index_for_loaded_topics(&self) -> Option<usize> {
-        (!self.thread_topics.is_empty()).then_some(self.selected_thread_topic_index)
     }
 
     fn reconcile_thread_topic_unread_for_message(&mut self, message: &Message) {
@@ -1606,6 +1626,212 @@ impl AppState {
         }
     }
 
+    pub fn reconciliation_context(&self) -> ReconciliationContext {
+        ReconciliationContext {
+            folder_id: self
+                .folders
+                .get(self.selected_folder_index)
+                .map(|folder| folder.id),
+            chat_id: self.selected_chat_id(),
+            topic_id: self.selected_thread_topic().map(|topic| topic.id),
+            message_id: self.selected_message().map(|message| message.id),
+        }
+    }
+
+    pub fn apply_reconciliation_snapshot(
+        &mut self,
+        context: ReconciliationContext,
+        snapshot: ReconciliationSnapshot,
+    ) -> ReconciliationApply {
+        let current_context = self.reconciliation_context();
+        if (
+            current_context.folder_id,
+            current_context.chat_id,
+            current_context.topic_id,
+        ) != (context.folder_id, context.chat_id, context.topic_id)
+        {
+            return ReconciliationApply::Stale;
+        }
+
+        let focused_panel = self.focused_panel;
+        let selected_message_id = current_context.message_id;
+        let reading_older_history = !self.messages.is_empty() && !self.selected_message_is_last();
+        let local_rows = self
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message.status,
+                    MessageStatus::Sending | MessageStatus::Failed
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let selected_chat_changed = context.chat_id != snapshot.selected_chat_id;
+        if selected_chat_changed {
+            self.leave_selected_chat();
+        }
+
+        self.folders = snapshot.folders;
+        self.selected_folder_index = snapshot
+            .selected_folder_id
+            .and_then(|folder_id| {
+                self.folders
+                    .iter()
+                    .position(|folder| folder.id == folder_id)
+            })
+            .unwrap_or(0)
+            .min(last_index(self.folders.len()));
+        self.ensure_selected_folder_visible();
+
+        self.chats = snapshot.chats;
+        self.selected_chat_index = snapshot
+            .selected_chat_id
+            .and_then(|chat_id| self.chats.iter().position(|chat| chat.id == chat_id))
+            .unwrap_or(0)
+            .min(last_index(self.chats.len()));
+        self.ensure_selected_chat_visible();
+        self.cache_selected_folder_chats();
+
+        let selected_message_in_snapshot = selected_message_id.is_some_and(|message_id| {
+            snapshot.messages.iter().any(|message| {
+                Some(message.chat_id) == snapshot.selected_chat_id && message.id == message_id
+            })
+        });
+        let preserve_conversation = !selected_chat_changed
+            && context.topic_id == snapshot.selected_topic_id
+            && reading_older_history
+            && !selected_message_in_snapshot;
+
+        self.thread_topics = snapshot.thread_topics;
+        self.selected_thread_topic_index = snapshot
+            .selected_topic_id
+            .and_then(|topic_id| {
+                self.thread_topics
+                    .iter()
+                    .position(|topic| topic.id == topic_id)
+            })
+            .unwrap_or(0)
+            .min(last_index(self.thread_topics.len()));
+        self.ensure_selected_thread_topic_visible();
+
+        if !preserve_conversation {
+            self.messages = snapshot.messages;
+            for local in local_rows {
+                if Some(local.chat_id) == snapshot.selected_chat_id
+                    && !self.messages.iter().any(|current| current.id == local.id)
+                {
+                    self.messages.push(local);
+                }
+            }
+            self.selected_message_index = selected_message_id
+                .and_then(|message_id| {
+                    self.messages
+                        .iter()
+                        .position(|message| message.id == message_id)
+                })
+                .unwrap_or_else(|| last_index(self.messages.len()));
+            self.ensure_selected_message_visible();
+            self.conversation_load_status = if self.messages.is_empty() {
+                ConversationLoadStatus::Empty
+            } else {
+                ConversationLoadStatus::Loaded
+            };
+            self.clear_selected_chat_older_history_exhausted();
+        }
+
+        self.typing_users.clear();
+        self.thread_typing_users.clear();
+        self.revalidate_reconciled_targets();
+        if selected_chat_changed {
+            self.clear_input_mode();
+            self.restore_draft_for_selected_chat();
+        }
+        self.focused_panel = if self.chats.is_empty()
+            && matches!(focused_panel, FocusedPanel::Messages | FocusedPanel::Input)
+        {
+            FocusedPanel::Chats
+        } else {
+            focused_panel
+        };
+        self.clear_selected_conversation_unread(snapshot.selected_topic_id);
+
+        ReconciliationApply::Applied {
+            conversation_replaced: !preserve_conversation,
+        }
+    }
+
+    fn clear_selected_conversation_unread(&mut self, selected_topic_id: Option<i32>) {
+        let topic_cleared = selected_topic_id.and_then(|topic_id| {
+            self.thread_topics
+                .iter_mut()
+                .find(|topic| topic.id == topic_id)
+                .map(|topic| {
+                    let unread_count = topic.unread_count;
+                    topic.unread_count = 0;
+                    unread_count
+                })
+        });
+        let Some(selected_chat) = self.chats.get_mut(self.selected_chat_index) else {
+            return;
+        };
+        let cleared = match selected_topic_id {
+            Some(_) => topic_cleared.unwrap_or(0),
+            None => selected_chat.unread_count,
+        };
+        if cleared == 0 {
+            return;
+        }
+        let chat_folder_id = selected_chat.folder_id;
+        selected_chat.unread_count = if selected_topic_id.is_some() {
+            selected_chat.unread_count.saturating_sub(cleared)
+        } else {
+            0
+        };
+        let selected_folder_id = self
+            .folders
+            .get(self.selected_folder_index)
+            .map(|folder| folder.id);
+        for folder in &mut self.folders {
+            if is_all_folder(folder)
+                || selected_folder_id == Some(folder.id)
+                || chat_folder_id == Some(folder.id)
+            {
+                folder.unread_count = folder.unread_count.saturating_sub(cleared);
+            }
+        }
+    }
+
+    fn revalidate_reconciled_targets(&mut self) {
+        let selected_chat_id = self.selected_chat_id();
+        let message_exists = |message_id| {
+            self.messages.iter().any(|message| {
+                Some(message.chat_id) == selected_chat_id && message.id == message_id
+            })
+        };
+        if self
+            .delete_confirmation()
+            .is_some_and(|confirmation| !message_exists(confirmation.message_id))
+        {
+            self.modal = None;
+        }
+        if self
+            .editing_message_id
+            .is_some_and(|id| !message_exists(id))
+            || self
+                .replying_to_message_id
+                .is_some_and(|id| !message_exists(id))
+        {
+            self.cancel_compose_mode();
+        }
+        if let Some(target) = self.context_menu().map(|menu| menu.target)
+            && self.context_actions_for_target(target).is_empty()
+        {
+            self.modal = None;
+        }
+    }
+
     pub fn sync_folder_unread_counts_from_loaded_chats(&mut self) {
         let selected_folder = self
             .folders
@@ -1671,6 +1897,15 @@ impl AppState {
                     self.messages.push(msg.clone());
                 }
 
+                let selected_topic_unread = selected_thread_topic_id
+                    .filter(|topic_id| msg.thread_topic_id == Some(*topic_id))
+                    .and_then(|topic_id| {
+                        self.thread_topics
+                            .iter()
+                            .find(|topic| topic.id == topic_id)
+                            .map(|topic| topic.unread_count)
+                    })
+                    .unwrap_or(0);
                 if current_chat_id == Some(msg.chat_id) {
                     self.reconcile_thread_topic_unread_for_message(&msg);
                 }
@@ -1679,7 +1914,15 @@ impl AppState {
                     chat.last_message =
                         Some(message_display_preview(msg.media.as_ref(), &msg.content));
                     if current_chat_id == Some(msg.chat_id) {
-                        chat.unread_count = 0;
+                        match selected_thread_topic_id {
+                            Some(topic_id) if msg.thread_topic_id == Some(topic_id) => {
+                                chat.unread_count =
+                                    chat.unread_count.saturating_sub(selected_topic_unread);
+                            }
+                            Some(_) if !msg.is_own => chat.unread_count += 1,
+                            Some(_) => {}
+                            None => chat.unread_count = 0,
+                        }
                     } else if !msg.is_own {
                         chat.unread_count += 1;
                     }
@@ -2317,13 +2560,15 @@ impl AppState {
 
     pub fn apply_send_success(&mut self, temp_id: i32, sent_message: Message) {
         let chat_id = sent_message.chat_id;
+        let sent_topic_id = sent_message.thread_topic_id;
         if let Some(idx) = self.messages.iter().position(|m| m.id == temp_id) {
             self.messages[idx] = sent_message;
         }
-        if self.selected_chat_id() == Some(chat_id)
-            && let Some(chat) = self.chats.get_mut(self.selected_chat_index)
-        {
-            chat.unread_count = 0;
+        if self.selected_chat_id() == Some(chat_id) {
+            let selected_topic_id = self.selected_thread_topic().map(|topic| topic.id);
+            if selected_topic_id.is_none() || selected_topic_id == sent_topic_id {
+                self.clear_selected_conversation_unread(selected_topic_id);
+            }
         }
         self.refresh_selected_chat_last_message_from_loaded_messages();
         self.sync_folder_unread_counts_from_loaded_chats();
@@ -2468,9 +2713,10 @@ mod tests {
         MIN_SPLIT_RATIO, MessageSubmitAction, NO_CHAT_SELECTED_ERROR, NOTIFICATION_LIFETIME,
         PANEL_BORDER_RESERVED_COLUMNS, PANEL_BORDER_RESERVED_ROWS,
         REMOTE_EDIT_WHILE_EDITING_STATUS, REPLY_MESSAGE_ROW_HEIGHT, REPLY_SENT_STATUS,
-        SPLIT_RATIO_STEP, TYPING_ACTION_COOLDOWN, delete_failed_error, delete_update_matches_chat,
-        edit_failed_error, last_index, message_visible_row_height,
-        message_visible_row_height_for_width, reply_failed_error, send_failed_error,
+        ReconciliationApply, ReconciliationSnapshot, SPLIT_RATIO_STEP, TYPING_ACTION_COOLDOWN,
+        delete_failed_error, delete_update_matches_chat, edit_failed_error, last_index,
+        message_visible_row_height, message_visible_row_height_for_width, reply_failed_error,
+        send_failed_error,
     };
     use crate::telegram::types::{
         Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, ThreadTopic,
@@ -2864,6 +3110,7 @@ mod tests {
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].content, "selected topic");
         assert_eq!(state.chats[0].last_message.as_deref(), Some("other topic"));
+        assert_eq!(state.chats[0].unread_count, 1);
         assert_eq!(state.thread_topics[1].unread_count, 1);
     }
 
@@ -2872,6 +3119,7 @@ mod tests {
         let mut state = AppState::new();
         state.chats = vec![chat(1, "Forum")];
         state.apply_loaded_selected_chat_thread_topics(vec![thread_topic(101, "General")]);
+        state.chats[0].unread_count = 3;
         state.thread_topics[0].unread_count = 3;
 
         let mut topic_message = update_message(12, 1, "selected topic update", false);
@@ -2880,21 +3128,35 @@ mod tests {
 
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].content, "selected topic update");
+        assert_eq!(state.chats[0].unread_count, 0);
         assert_eq!(state.thread_topics[0].unread_count, 0);
     }
 
     #[test]
-    fn loading_selected_thread_messages_clears_selected_topic_unread_count() {
+    fn loading_selected_thread_messages_clears_only_selected_topic_unread() {
         let mut state = AppState::new();
-        state.chats = vec![chat(1, "Forum")];
-        state.apply_loaded_selected_chat_thread_topics(vec![thread_topic(101, "General")]);
+        state.folders = vec![all_folder(7)];
+        state.chats = vec![chat_with_unread(1, "Forum", 7, None)];
+        state.chats[0].last_message = Some("server-wide preview".to_string());
+        state.apply_loaded_selected_chat_thread_topics(vec![
+            thread_topic(101, "General"),
+            thread_topic(102, "Deployments"),
+        ]);
         state.thread_topics[0].unread_count = 4;
+        state.thread_topics[1].unread_count = 3;
 
         let mut topic_message = update_message(12, 1, "selected topic history", false);
         topic_message.thread_topic_id = Some(101);
         state.apply_loaded_selected_chat_messages(vec![topic_message]);
 
+        assert_eq!(state.chats[0].unread_count, 3);
+        assert_eq!(state.folders[0].unread_count, 3);
+        assert_eq!(
+            state.chats[0].last_message.as_deref(),
+            Some("server-wide preview")
+        );
         assert_eq!(state.thread_topics[0].unread_count, 0);
+        assert_eq!(state.thread_topics[1].unread_count, 3);
     }
 
     #[test]
@@ -3776,6 +4038,30 @@ mod tests {
         assert_eq!(state.chats[0].unread_count, 0);
         assert_eq!(state.folders[0].unread_count, 0);
         assert!(state.status_message.is_none());
+    }
+
+    #[test]
+    fn topic_send_success_preserves_other_topic_unread() {
+        let mut state = state_with_chats();
+        state.chats[0].unread_count = 5;
+        state.folders = vec![all_folder(5)];
+        state.thread_topics = vec![
+            thread_topic(101, "General"),
+            thread_topic(102, "Deployments"),
+        ];
+        state.thread_topics[0].unread_count = 2;
+        state.thread_topics[1].unread_count = 3;
+        state.apply_send_pending(-1, 10, Some(101), "topic send".to_string());
+
+        let mut sent_message = update_message(42, 10, "topic send", true);
+        sent_message.thread_topic_id = Some(101);
+        sent_message.status = MessageStatus::Sent;
+        state.apply_send_success(-1, sent_message);
+
+        assert_eq!(state.chats[0].unread_count, 3);
+        assert_eq!(state.folders[0].unread_count, 3);
+        assert_eq!(state.thread_topics[0].unread_count, 0);
+        assert_eq!(state.thread_topics[1].unread_count, 3);
     }
 
     #[test]
@@ -4759,5 +5045,216 @@ mod tests {
         assert_eq!(state.focused_panel, FocusedPanel::Input);
         state.focus_next_panel();
         assert_eq!(state.focused_panel, FocusedPanel::Folders);
+    }
+
+    #[test]
+    fn reconciliation_refreshes_metadata_without_yanking_older_history() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(0), folder(2, "Work", 4)];
+        state.selected_folder_index = 1;
+        state.chats = vec![chat(10, "Alice"), chat(20, "Work")];
+        state.selected_chat_index = 1;
+        state.thread_topics = vec![thread_topic(100, "General")];
+        state.messages = vec![message(1), message(2), message(3)];
+        for message in &mut state.messages {
+            message.chat_id = 20;
+            message.thread_topic_id = Some(100);
+        }
+        state.selected_message_index = 1;
+        state.focused_panel = FocusedPanel::Messages;
+        state.input_buffer = "preserved draft".to_string();
+        state.chat_search_query = Some("work".to_string());
+        let context = state.reconciliation_context();
+        state.selected_message_index = 0;
+
+        let mut refreshed_chat = chat_with_unread(20, "Work renamed", 3, Some(2));
+        refreshed_chat.last_message = Some("new server preview".to_string());
+        let mut latest = message(9);
+        latest.chat_id = 20;
+        latest.thread_topic_id = Some(100);
+        let applied = state.apply_reconciliation_snapshot(
+            context,
+            ReconciliationSnapshot {
+                folders: vec![all_folder(3), folder(2, "Work", 3)],
+                selected_folder_id: Some(2),
+                chats: vec![refreshed_chat],
+                chat_last_message_ids: Default::default(),
+                selected_chat_id: Some(20),
+                thread_topics: vec![thread_topic(100, "General renamed")],
+                selected_topic_id: Some(100),
+                messages: vec![latest],
+            },
+        );
+
+        assert_eq!(
+            applied,
+            ReconciliationApply::Applied {
+                conversation_replaced: false
+            }
+        );
+        assert_eq!(state.chats[0].name, "Work renamed");
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(state.selected_message().map(|message| message.id), Some(1));
+        assert_eq!(state.focused_panel, FocusedPanel::Messages);
+        assert_eq!(state.input_buffer, "preserved draft");
+        assert_eq!(state.chat_search_query.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn reconciliation_cancels_stale_compose_and_modal_targets_without_losing_draft() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(0)];
+        state.chats = vec![chat(10, "Alice")];
+        state.messages = vec![message(1)];
+        state.messages[0].is_own = true;
+        state.messages[0].can_edit = true;
+        state.input_buffer = "plain draft".to_string();
+        state.save_current_draft();
+        state.request_edit_selected_message();
+        state.set_delete_confirmation(DeleteConfirmation {
+            chat_id: 10,
+            message_id: 1,
+        });
+        let context = state.reconciliation_context();
+        let mut replacement = message(9);
+        replacement.chat_id = 10;
+
+        assert_eq!(
+            state.apply_reconciliation_snapshot(
+                context,
+                ReconciliationSnapshot {
+                    folders: vec![all_folder(0)],
+                    selected_folder_id: Some(0),
+                    chats: vec![chat(10, "Alice")],
+                    chat_last_message_ids: Default::default(),
+                    selected_chat_id: Some(10),
+                    thread_topics: Vec::new(),
+                    selected_topic_id: None,
+                    messages: vec![replacement],
+                },
+            ),
+            ReconciliationApply::Applied {
+                conversation_replaced: true
+            }
+        );
+        assert_eq!(state.input_buffer, "plain draft");
+        assert!(state.editing_message_id.is_none());
+        assert!(state.delete_confirmation().is_none());
+        assert_eq!(state.focused_panel, FocusedPanel::Input);
+    }
+
+    #[test]
+    fn reconciliation_falls_back_by_stable_id_and_restores_the_new_chat_draft() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(0)];
+        state.chats = vec![chat(10, "Alice"), chat(20, "Removed")];
+        state.selected_chat_index = 1;
+        state.input_buffer = "removed chat draft".to_string();
+        state.focused_panel = FocusedPanel::Input;
+        state.chat_drafts.insert(10, "alice draft".to_string());
+        let context = state.reconciliation_context();
+        let mut replacement = message(9);
+        replacement.chat_id = 10;
+
+        assert_eq!(
+            state.apply_reconciliation_snapshot(
+                context,
+                ReconciliationSnapshot {
+                    folders: vec![all_folder(0)],
+                    selected_folder_id: Some(0),
+                    chats: vec![chat(10, "Alice")],
+                    chat_last_message_ids: Default::default(),
+                    selected_chat_id: Some(10),
+                    thread_topics: Vec::new(),
+                    selected_topic_id: None,
+                    messages: vec![replacement],
+                },
+            ),
+            ReconciliationApply::Applied {
+                conversation_replaced: true
+            }
+        );
+        assert_eq!(state.selected_chat_id(), Some(10));
+        assert_eq!(state.input_buffer, "alice draft");
+        assert_eq!(
+            state.chat_drafts.get(&20).map(String::as_str),
+            Some("removed chat draft")
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Input);
+    }
+
+    #[test]
+    fn reconciliation_preserves_local_send_until_completion_and_rejects_stale_context() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(0)];
+        state.chats = vec![chat(10, "Alice"), chat(20, "Bob")];
+        state.messages = vec![message(1)];
+        state.apply_send_pending(-1, 10, None, "pending".to_string());
+        state.focused_panel = FocusedPanel::Input;
+        let context = state.reconciliation_context();
+        let mut refreshed = message(2);
+        refreshed.chat_id = 10;
+
+        assert_eq!(
+            state.apply_reconciliation_snapshot(
+                context,
+                ReconciliationSnapshot {
+                    folders: vec![all_folder(0)],
+                    selected_folder_id: Some(0),
+                    chats: vec![chat(10, "Alice"), chat(20, "Bob")],
+                    chat_last_message_ids: Default::default(),
+                    selected_chat_id: Some(10),
+                    thread_topics: Vec::new(),
+                    selected_topic_id: None,
+                    messages: vec![refreshed],
+                },
+            ),
+            ReconciliationApply::Applied {
+                conversation_replaced: true
+            }
+        );
+        assert_eq!(state.selected_message().map(|message| message.id), Some(-1));
+        assert_eq!(state.focused_panel, FocusedPanel::Input);
+
+        let mut sent = message(3);
+        sent.chat_id = 10;
+        sent.is_own = true;
+        state.apply_send_success(-1, sent);
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|message| message.id == 3)
+                .count(),
+            1
+        );
+        assert!(!state.messages.iter().any(|message| message.id == -1));
+
+        let stale = state.reconciliation_context();
+        state.selected_chat_index = 1;
+        assert_eq!(
+            state.apply_reconciliation_snapshot(
+                stale,
+                ReconciliationSnapshot {
+                    folders: vec![all_folder(0)],
+                    selected_folder_id: Some(0),
+                    chats: vec![chat(10, "Alice")],
+                    chat_last_message_ids: Default::default(),
+                    selected_chat_id: Some(10),
+                    thread_topics: Vec::new(),
+                    selected_topic_id: None,
+                    messages: Vec::new(),
+                },
+            ),
+            ReconciliationApply::Stale
+        );
+        assert_eq!(state.selected_chat_id(), Some(20));
     }
 }

@@ -1,12 +1,17 @@
 use super::types::{Chat, Folder, Message, ThreadTopic, Update};
 use color_eyre::{Result, eyre::eyre};
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadedMedia {
     pub path: PathBuf,
     pub bytes: u64,
+}
+
+pub struct ReconciliationChatList {
+    pub chats: Vec<Chat>,
+    pub last_message_ids: HashMap<i64, i32>,
 }
 
 pub trait TelegramClient {
@@ -25,6 +30,21 @@ pub trait TelegramClient {
         chat_id: i64,
         limit: usize,
     ) -> impl std::future::Future<Output = Result<Vec<Message>>> + Send + '_;
+    fn get_reconciliation_chats(
+        &self,
+        folder_id: Option<i32>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<ReconciliationChatList>> + Send + '_
+    where
+        Self: Sync,
+    {
+        async move {
+            Ok(ReconciliationChatList {
+                chats: self.get_chats(folder_id, limit).await?,
+                last_message_ids: HashMap::new(),
+            })
+        }
+    }
     #[allow(clippy::manual_async_fn)]
     fn get_messages_before(
         &self,

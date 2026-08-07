@@ -36,6 +36,7 @@ use ratatui::{
     Terminal,
     backend::{CrosstermBackend, TestBackend},
 };
+use std::collections::HashMap;
 use std::future::{pending, poll_fn};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -50,6 +51,13 @@ const LOADING_TELEGRAM_STATUS: &str = "Loading Telegram data…";
 const LOADING_OLDER_MESSAGES_STATUS: &str = "Loading older messages…";
 const LOADING_CHAT_MESSAGES_STATUS: &str = "Loading chat messages…";
 const LOADING_FOLDER_CHATS_STATUS: &str = "Loading folder chats…";
+const TELEGRAM_STATE_REFRESHED_STATUS: &str = "Telegram state refreshed";
+const TELEGRAM_UPDATES_DISCONNECTED_ERROR: &str =
+    "Telegram updates disconnected; retrying subscription";
+const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const RECONCILIATION_RETRY_DELAY: Duration = Duration::from_secs(10);
+const RECONCILIATION_FOCUS_STALE_AFTER: Duration = Duration::from_secs(30);
+const UPDATE_SUBSCRIPTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const LINK_OPENED_STATUS: &str = "Link opened";
 const MESSAGE_TEXT_COPIED_STATUS: &str = "Message text copied";
 const CHAT_NAME_COPIED_STATUS: &str = "Chat name copied";
@@ -1683,7 +1691,7 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
 ) -> Result<()> {
     diagnostics::event("run_loop_start", "event_driven=true");
     let (mut loop_state, senders) = EventLoopState::new();
-    let subscribe_updates_loader =
+    let mut subscribe_updates_loader =
         SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
     subscribe_updates_loader.spawn_subscribe_updates();
     let initial_state_loader = InitialStateLoader::new(client.clone(), senders.initial_state);
@@ -1698,6 +1706,8 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
     let reply_message_loader = ReplyMessageLoader::new(client.clone(), senders.reply_message);
     let download_media_loader = DownloadMediaLoader::new(client.clone(), senders.download_media);
     let mut media_preview_loader = MediaPreviewLoader::new(client.clone(), senders.media_preview);
+    let mut reconciliation_loader =
+        ReconciliationLoader::new(client.clone(), senders.reconciliation);
     let mut events = EventStream::new();
 
     let result = run_event_loop(
@@ -1707,6 +1717,8 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
         client,
         &mut events,
         &mut loop_state,
+        &mut subscribe_updates_loader,
+        &mut reconciliation_loader,
         &mut chat_message_loader,
         &mut older_message_loader,
         &mut folder_chat_loader,
@@ -1733,6 +1745,8 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
     client: &mut C,
     events: &mut EventStream,
     loop_state: &mut EventLoopState,
+    subscribe_updates_loader: &mut SubscribeUpdatesLoader<C>,
+    reconciliation_loader: &mut ReconciliationLoader<C>,
     chat_message_loader: &mut ChatMessageLoader<C>,
     older_message_loader: &mut OlderMessageLoader<C>,
     folder_chat_loader: &mut FolderChatLoader<C>,
@@ -1747,9 +1761,32 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
     let mut frames = FrameScheduler::new(true);
     draw_due_frame(terminal, app, theme, &mut frames)?;
     loop {
+        let now = TokioInstant::now();
+        if loop_state
+            .next_subscription_at
+            .is_some_and(|deadline| deadline <= now)
+            && !loop_state.subscription_pending
+        {
+            loop_state.next_subscription_at = None;
+            loop_state.subscription_pending = true;
+            subscribe_updates_loader.spawn_subscribe_updates();
+        }
+        if loop_state
+            .next_reconciliation_at
+            .is_some_and(|deadline| deadline <= now)
+            && !loop_state.reconciliation_pending
+            && !loop_state.initial_state_pending
+        {
+            loop_state.next_reconciliation_at = None;
+            loop_state.reconciliation_pending = true;
+            reconciliation_loader.spawn_reconciliation(app.state.reconciliation_context());
+        }
+
         let step = prepare_loop_step(
             loop_state,
             app,
+            subscribe_updates_loader,
+            reconciliation_loader,
             chat_message_loader,
             older_message_loader,
             folder_chat_loader,
@@ -1765,6 +1802,7 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
                 app,
                 client,
                 event,
+                loop_state,
                 chat_message_loader,
                 older_message_loader,
                 folder_chat_loader,
@@ -1789,19 +1827,30 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
 
         draw_due_frame(terminal, app, theme, &mut frames)?;
 
+        let service_deadline = loop_state.service_deadline();
         match wait_for_loop_wake(
             events,
             &loop_state.wake,
             &mut loop_state.update_rx,
             frames.frame_deadline(),
             app.state.notification_deadline(),
+            service_deadline,
         )
         .await?
         {
             LoopWake::Notify | LoopWake::Deadline => {}
             LoopWake::Terminal(event) => loop_state.staged_terminal_event = Some(event),
             LoopWake::Update(update) => loop_state.staged_update = Some(update),
-            LoopWake::UpdateStreamClosed => loop_state.update_rx = None,
+            LoopWake::UpdateStreamClosed => {
+                loop_state.update_rx = None;
+                loop_state.subscription_pending = false;
+                loop_state.announce_reconciliation_success = true;
+                loop_state.schedule_subscription_retry();
+                loop_state.schedule_reconciliation_now();
+                app.state
+                    .set_error(TELEGRAM_UPDATES_DISCONNECTED_ERROR.to_string());
+                frames.mark_dirty(TokioInstant::now());
+            }
         }
     }
 }
@@ -1815,6 +1864,8 @@ struct PreparedLoopStep {
 fn prepare_loop_step<C: TelegramClient + Clone + Send + Sync + 'static>(
     loop_state: &mut EventLoopState,
     app: &mut App,
+    subscribe_updates_loader: &SubscribeUpdatesLoader<C>,
+    reconciliation_loader: &ReconciliationLoader<C>,
     chat_message_loader: &ChatMessageLoader<C>,
     older_message_loader: &OlderMessageLoader<C>,
     folder_chat_loader: &FolderChatLoader<C>,
@@ -1824,6 +1875,8 @@ fn prepare_loop_step<C: TelegramClient + Clone + Send + Sync + 'static>(
     let results_dirty = drain_ready_results(
         loop_state,
         app,
+        subscribe_updates_loader,
+        reconciliation_loader,
         chat_message_loader,
         older_message_loader,
         folder_chat_loader,
@@ -1842,6 +1895,7 @@ async fn dispatch_terminal_event<C: TelegramClient + Clone + Send + Sync + 'stat
     app: &mut App,
     client: &mut C,
     event: Event,
+    loop_state: &mut EventLoopState,
     chat_message_loader: &mut ChatMessageLoader<C>,
     older_message_loader: &mut OlderMessageLoader<C>,
     folder_chat_loader: &mut FolderChatLoader<C>,
@@ -1911,6 +1965,10 @@ async fn dispatch_terminal_event<C: TelegramClient + Clone + Send + Sync + 'stat
             }
             Ok(true)
         }
+        TerminalAction::FocusGained => {
+            loop_state.schedule_focus_reconciliation();
+            Ok(false)
+        }
         TerminalAction::Ignore => Ok(false),
     }
 }
@@ -1921,6 +1979,7 @@ enum TerminalAction {
     Mouse(crossterm::event::MouseEvent),
     Resize,
     FocusLost,
+    FocusGained,
     Ignore,
 }
 
@@ -1930,7 +1989,8 @@ fn classify_terminal_event(event: Event) -> TerminalAction {
         Event::Mouse(mouse) => TerminalAction::Mouse(mouse),
         Event::Resize(_, _) => TerminalAction::Resize,
         Event::FocusLost => TerminalAction::FocusLost,
-        Event::Key(_) | Event::FocusGained | Event::Paste(_) => TerminalAction::Ignore,
+        Event::FocusGained => TerminalAction::FocusGained,
+        Event::Key(_) | Event::Paste(_) => TerminalAction::Ignore,
     }
 }
 
@@ -1948,6 +2008,7 @@ async fn wait_for_loop_wake(
     update_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<Update>>,
     frame_deadline: Option<TokioInstant>,
     notification_deadline: Option<TokioInstant>,
+    service_deadline: Option<TokioInstant>,
 ) -> Result<LoopWake> {
     tokio::select! {
         _ = wake.notified() => Ok(LoopWake::Notify),
@@ -1962,6 +2023,7 @@ async fn wait_for_loop_wake(
         }),
         _ = sleep_until_optional(frame_deadline) => Ok(LoopWake::Deadline),
         _ = sleep_until_optional(notification_deadline) => Ok(LoopWake::Deadline),
+        _ = sleep_until_optional(service_deadline) => Ok(LoopWake::Deadline),
     }
 }
 
@@ -2119,6 +2181,7 @@ struct EventLoopSenders {
     reply_message: UiSender<ReplyMessageResult>,
     download_media: UiSender<DownloadMediaResult>,
     media_preview: UiSender<MediaPreviewResult>,
+    reconciliation: UiSender<ReconciliationResult>,
 }
 
 struct EventLoopState {
@@ -2134,8 +2197,17 @@ struct EventLoopState {
     reply_message_rx: tokio::sync::mpsc::UnboundedReceiver<ReplyMessageResult>,
     download_media_rx: tokio::sync::mpsc::UnboundedReceiver<DownloadMediaResult>,
     media_preview_rx: tokio::sync::mpsc::UnboundedReceiver<MediaPreviewResult>,
+    reconciliation_rx: tokio::sync::mpsc::UnboundedReceiver<ReconciliationResult>,
     update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Update>>,
     initial_state_pending: bool,
+    reconciliation_pending: bool,
+    subscription_pending: bool,
+    next_reconciliation_at: Option<TokioInstant>,
+    last_reconciliation_success_at: Option<TokioInstant>,
+    next_subscription_at: Option<TokioInstant>,
+    announce_reconciliation_success: bool,
+    reconciliation_requested_while_pending: bool,
+    reconciliation_high_water_ids: HashMap<i64, i32>,
     deferred_updates: Vec<Update>,
     staged_update: Option<Update>,
     staged_terminal_event: Option<Event>,
@@ -2157,6 +2229,7 @@ impl EventLoopState {
         let (reply_message, reply_message_rx) = ui_channel(&wake);
         let (download_media, download_media_rx) = ui_channel(&wake);
         let (media_preview, media_preview_rx) = ui_channel(&wake);
+        let (reconciliation, reconciliation_rx) = ui_channel(&wake);
 
         (
             Self {
@@ -2172,8 +2245,17 @@ impl EventLoopState {
                 reply_message_rx,
                 download_media_rx,
                 media_preview_rx,
+                reconciliation_rx,
                 update_rx: None,
                 initial_state_pending: true,
+                reconciliation_pending: false,
+                subscription_pending: true,
+                next_reconciliation_at: None,
+                last_reconciliation_success_at: None,
+                next_subscription_at: None,
+                announce_reconciliation_success: false,
+                reconciliation_requested_while_pending: false,
+                reconciliation_high_water_ids: HashMap::new(),
                 deferred_updates: Vec::new(),
                 staged_update: None,
                 staged_terminal_event: None,
@@ -2192,8 +2274,63 @@ impl EventLoopState {
                 reply_message,
                 download_media,
                 media_preview,
+                reconciliation,
             },
         )
+    }
+
+    fn schedule_reconciliation_at(&mut self, deadline: TokioInstant) {
+        if self.reconciliation_pending || self.initial_state_pending {
+            self.reconciliation_requested_while_pending = true;
+            return;
+        }
+        self.next_reconciliation_at = Some(
+            self.next_reconciliation_at
+                .map_or(deadline, |current| current.min(deadline)),
+        );
+    }
+
+    fn finish_reconciliation_gate(&mut self, default_deadline: TokioInstant) -> bool {
+        let follow_up_requested = self.reconciliation_requested_while_pending;
+        self.reconciliation_requested_while_pending = false;
+        self.next_reconciliation_at = Some(if follow_up_requested {
+            TokioInstant::now()
+        } else {
+            default_deadline
+        });
+        follow_up_requested
+    }
+
+    fn schedule_reconciliation_now(&mut self) {
+        self.schedule_reconciliation_at(TokioInstant::now());
+    }
+
+    fn schedule_subscription_retry(&mut self) {
+        if self.subscription_pending {
+            return;
+        }
+        let deadline = TokioInstant::now() + UPDATE_SUBSCRIPTION_RETRY_DELAY;
+        self.next_subscription_at = Some(
+            self.next_subscription_at
+                .map_or(deadline, |current| current.min(deadline)),
+        );
+    }
+
+    fn schedule_focus_reconciliation(&mut self) {
+        let now = TokioInstant::now();
+        if self.last_reconciliation_success_at.is_none_or(|last| {
+            now.saturating_duration_since(last) >= RECONCILIATION_FOCUS_STALE_AFTER
+        }) {
+            self.announce_reconciliation_success = true;
+            self.schedule_reconciliation_at(now);
+        }
+    }
+
+    fn service_deadline(&self) -> Option<TokioInstant> {
+        [self.next_reconciliation_at, self.next_subscription_at]
+            .into_iter()
+            .flatten()
+            .min()
     }
 }
 
@@ -2201,6 +2338,8 @@ impl EventLoopState {
 fn drain_ready_results<C: TelegramClient + Clone + Send + Sync + 'static>(
     loop_state: &mut EventLoopState,
     app: &mut App,
+    subscribe_updates_loader: &SubscribeUpdatesLoader<C>,
+    reconciliation_loader: &ReconciliationLoader<C>,
     chat_message_loader: &ChatMessageLoader<C>,
     older_message_loader: &OlderMessageLoader<C>,
     folder_chat_loader: &FolderChatLoader<C>,
@@ -2211,41 +2350,52 @@ fn drain_ready_results<C: TelegramClient + Clone + Send + Sync + 'static>(
     while let Ok(result) = loop_state.subscribe_updates_rx.try_recv() {
         #[cfg(test)]
         loop_state.drain_trace.push("subscription".to_string());
-        dirty |= apply_subscribe_updates_result(app, result, &mut loop_state.update_rx);
+        dirty |= apply_subscribe_updates_result(
+            app,
+            result,
+            subscribe_updates_loader.latest_request_id(),
+            loop_state,
+        );
     }
     while let Ok(result) = loop_state.initial_state_rx.try_recv() {
         #[cfg(test)]
         loop_state.drain_trace.push("initial".to_string());
+        let succeeded = result.result.is_ok();
         apply_initial_state_load_result(app, result, mark_read_loader);
         loop_state.initial_state_pending = false;
+        let now = TokioInstant::now();
+        if succeeded {
+            loop_state.last_reconciliation_success_at = Some(now);
+            loop_state.finish_reconciliation_gate(now + RECONCILIATION_INTERVAL);
+        } else {
+            loop_state.announce_reconciliation_success = true;
+            loop_state.finish_reconciliation_gate(now + RECONCILIATION_RETRY_DELAY);
+        }
         dirty = true;
-        for update in loop_state.deferred_updates.drain(..) {
-            #[cfg(test)]
-            loop_state.drain_trace.push(update_trace_label(&update));
-            apply_update_with_read_ack(app, update, mark_read_loader);
+        replay_deferred_updates(loop_state, app, mark_read_loader);
+    }
+    while let Ok(result) = loop_state.reconciliation_rx.try_recv() {
+        dirty |= apply_reconciliation_result(
+            app,
+            result,
+            reconciliation_loader.latest_request_id(),
+            loop_state,
+            mark_read_loader,
+        );
+        if !loop_state.initial_state_pending && !loop_state.reconciliation_pending {
+            replay_deferred_updates(loop_state, app, mark_read_loader);
         }
     }
     if let Some(update) = loop_state.staged_update.take() {
-        if loop_state.initial_state_pending {
-            loop_state.deferred_updates.push(update);
-        } else {
-            #[cfg(test)]
-            loop_state.drain_trace.push(update_trace_label(&update));
-            apply_update_with_read_ack(app, update, mark_read_loader);
-            dirty = true;
-        }
+        dirty |= handle_received_update(loop_state, app, update, mark_read_loader);
     }
-    if let Some(rx) = loop_state.update_rx.as_mut() {
-        while let Ok(update) = rx.try_recv() {
-            if loop_state.initial_state_pending {
-                loop_state.deferred_updates.push(update);
-            } else {
-                #[cfg(test)]
-                loop_state.drain_trace.push(update_trace_label(&update));
-                apply_update_with_read_ack(app, update, mark_read_loader);
-                dirty = true;
-            }
-        }
+    let queued_updates = loop_state
+        .update_rx
+        .as_mut()
+        .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for update in queued_updates {
+        dirty |= handle_received_update(loop_state, app, update, mark_read_loader);
     }
     while let Ok(result) = loop_state.chat_message_rx.try_recv() {
         dirty |= apply_chat_message_load_result(
@@ -2293,6 +2443,174 @@ fn drain_ready_results<C: TelegramClient + Clone + Send + Sync + 'static>(
     dirty
 }
 
+fn update_represented_by_reconciliation(
+    loop_state: &EventLoopState,
+    app: &App,
+    update: &Update,
+) -> bool {
+    let Update::NewMessage(message) = update else {
+        return false;
+    };
+    let belongs_to_selected_conversation = app.state.selected_chat_id() == Some(message.chat_id)
+        && app
+            .state
+            .selected_thread_topic()
+            .map(|topic| topic.id)
+            .is_none_or(|topic_id| message.thread_topic_id == Some(topic_id));
+    !belongs_to_selected_conversation
+        && loop_state
+            .reconciliation_high_water_ids
+            .get(&message.chat_id)
+            .is_some_and(|last_id| message.id <= *last_id)
+}
+
+fn handle_received_update<C>(
+    loop_state: &mut EventLoopState,
+    app: &mut App,
+    update: Update,
+    mark_read_loader: &MarkChatReadLoader<C>,
+) -> bool
+where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    if matches!(update, Update::Error(_)) {
+        loop_state.announce_reconciliation_success = true;
+        loop_state.schedule_reconciliation_now();
+        #[cfg(test)]
+        loop_state.drain_trace.push(update_trace_label(&update));
+        apply_update_with_read_ack(app, update, mark_read_loader);
+        return true;
+    }
+    if loop_state.initial_state_pending || loop_state.reconciliation_pending {
+        loop_state.deferred_updates.push(update);
+        return false;
+    }
+    if update_represented_by_reconciliation(loop_state, app, &update) {
+        diagnostics::event("reconciliation_update_deduplicated", "count=1");
+        return false;
+    }
+    #[cfg(test)]
+    loop_state.drain_trace.push(update_trace_label(&update));
+    apply_update_with_read_ack(app, update, mark_read_loader);
+    true
+}
+
+fn replay_deferred_updates<C>(
+    loop_state: &mut EventLoopState,
+    app: &mut App,
+    mark_read_loader: &MarkChatReadLoader<C>,
+) where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    let deferred_updates = std::mem::take(&mut loop_state.deferred_updates);
+    for update in deferred_updates {
+        handle_received_update(loop_state, app, update, mark_read_loader);
+    }
+}
+
+fn apply_reconciliation_result<C>(
+    app: &mut App,
+    result: ReconciliationResult,
+    latest_request_id: u64,
+    loop_state: &mut EventLoopState,
+    mark_read_loader: &MarkChatReadLoader<C>,
+) -> bool
+where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    if result.request_id != latest_request_id {
+        diagnostics::event(
+            "reconciliation_result_ignored",
+            format!(
+                "request_id={} latest_request_id={latest_request_id}",
+                result.request_id
+            ),
+        );
+        return false;
+    }
+
+    loop_state.reconciliation_pending = false;
+    let now = TokioInstant::now();
+    match result.result {
+        Ok(snapshot) => {
+            let high_water_ids = snapshot.chat_last_message_ids.clone();
+            let selected_read_ack = snapshot.selected_chat_id.and_then(|chat_id| {
+                if let Some(topic_id) = snapshot.selected_topic_id {
+                    let has_unread = snapshot
+                        .thread_topics
+                        .iter()
+                        .find(|topic| topic.id == topic_id)
+                        .is_some_and(|topic| topic.unread_count > 0);
+                    let max_message_id = snapshot.messages.iter().map(|message| message.id).max();
+                    (has_unread)
+                        .then_some(max_message_id)
+                        .flatten()
+                        .map(|max_message_id| ReconciliationReadAck::Thread {
+                            chat_id,
+                            topic_id,
+                            max_message_id,
+                        })
+                } else {
+                    snapshot
+                        .chats
+                        .iter()
+                        .find(|chat| chat.id == chat_id)
+                        .is_some_and(|chat| chat.unread_count > 0 && !snapshot.messages.is_empty())
+                        .then_some(ReconciliationReadAck::Chat { chat_id })
+                }
+            });
+            match app
+                .state
+                .apply_reconciliation_snapshot(result.context, snapshot)
+            {
+                state::ReconciliationApply::Applied { .. } => {
+                    loop_state.reconciliation_high_water_ids = high_water_ids;
+                    loop_state.last_reconciliation_success_at = Some(now);
+                    let follow_up_requested =
+                        loop_state.finish_reconciliation_gate(now + RECONCILIATION_INTERVAL);
+                    if loop_state.announce_reconciliation_success && !follow_up_requested {
+                        app.state.set_status(TELEGRAM_STATE_REFRESHED_STATUS);
+                        loop_state.announce_reconciliation_success = false;
+                    }
+                    match selected_read_ack {
+                        Some(ReconciliationReadAck::Chat { chat_id })
+                            if app.state.selected_chat_id() == Some(chat_id) =>
+                        {
+                            mark_read_loader.spawn_mark_chat_read(chat_id);
+                        }
+                        Some(ReconciliationReadAck::Thread {
+                            chat_id,
+                            topic_id,
+                            max_message_id,
+                        }) if app.state.selected_chat_id() == Some(chat_id)
+                            && app.state.selected_thread_topic().map(|topic| topic.id)
+                                == Some(topic_id) =>
+                        {
+                            mark_read_loader.spawn_mark_thread_read(
+                                chat_id,
+                                topic_id,
+                                max_message_id,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                state::ReconciliationApply::Stale => {
+                    diagnostics::event("reconciliation_result_ignored", "reason=stale_context");
+                    loop_state.finish_reconciliation_gate(now);
+                }
+            }
+        }
+        Err(error) => {
+            diagnostics::event("reconciliation_result_error", format!("error={error}"));
+            app.state.set_error(error);
+            loop_state.announce_reconciliation_success = true;
+            loop_state.finish_reconciliation_gate(now + RECONCILIATION_RETRY_DELAY);
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 fn update_trace_label(update: &Update) -> String {
     match update {
@@ -2301,12 +2619,30 @@ fn update_trace_label(update: &Update) -> String {
     }
 }
 
+enum ReconciliationReadAck {
+    Chat {
+        chat_id: i64,
+    },
+    Thread {
+        chat_id: i64,
+        topic_id: i32,
+        max_message_id: i32,
+    },
+}
+
 struct SubscribeUpdatesResult {
+    request_id: u64,
     result: std::result::Result<tokio::sync::mpsc::UnboundedReceiver<Update>, String>,
 }
 
 struct InitialStateLoadResult {
     result: std::result::Result<actions::InitialStateLoad, String>,
+}
+
+struct ReconciliationResult {
+    request_id: u64,
+    context: state::ReconciliationContext,
+    result: std::result::Result<state::ReconciliationSnapshot, String>,
 }
 
 struct ChatMessageLoad {
@@ -2405,6 +2741,7 @@ impl<C> HandlerLoaders<'_, C> {
 struct SubscribeUpdatesLoader<C> {
     client: C,
     tx: UiSender<SubscribeUpdatesResult>,
+    latest_request_id: u64,
 }
 
 impl<C> SubscribeUpdatesLoader<C>
@@ -2415,10 +2752,17 @@ where
         Self {
             client,
             tx: tx.into(),
+            latest_request_id: 0,
         }
     }
 
-    fn spawn_subscribe_updates(&self) {
+    fn latest_request_id(&self) -> u64 {
+        self.latest_request_id
+    }
+
+    fn spawn_subscribe_updates(&mut self) {
+        self.latest_request_id = self.latest_request_id.saturating_add(1);
+        let request_id = self.latest_request_id;
         let mut client = self.client.clone();
         let tx = self.tx.clone();
         diagnostics::event("subscribe_updates_spawn", "updates=true");
@@ -2427,7 +2771,7 @@ where
                 .subscribe_updates()
                 .await
                 .map_err(|error| error.to_string());
-            let _ = tx.send(SubscribeUpdatesResult { result });
+            let _ = tx.send(SubscribeUpdatesResult { request_id, result });
         });
     }
 }
@@ -2459,6 +2803,58 @@ where
             let result = actions::fetch_initial_state(&client).await;
             let _ = tx.send(InitialStateLoadResult { result });
         });
+    }
+}
+
+struct ReconciliationLoader<C> {
+    client: C,
+    tx: UiSender<ReconciliationResult>,
+    latest_request_id: u64,
+    current_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl<C> ReconciliationLoader<C>
+where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    fn new(client: C, tx: UiSender<ReconciliationResult>) -> Self {
+        Self {
+            client,
+            tx,
+            latest_request_id: 0,
+            current_handle: None,
+        }
+    }
+
+    fn latest_request_id(&self) -> u64 {
+        self.latest_request_id
+    }
+
+    fn spawn_reconciliation(&mut self, context: state::ReconciliationContext) {
+        abort_running_task(
+            &mut self.current_handle,
+            "reconciliation_abort",
+            self.latest_request_id,
+        );
+        self.latest_request_id = self.latest_request_id.saturating_add(1);
+        let request_id = self.latest_request_id;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        diagnostics::event(
+            "reconciliation_spawn",
+            format!(
+                "request_id={request_id} folder_id={:?} chat_id={:?} topic_id={:?}",
+                context.folder_id, context.chat_id, context.topic_id
+            ),
+        );
+        self.current_handle = Some(tokio::spawn(async move {
+            let result = actions::fetch_reconciliation_snapshot(&client, context).await;
+            let _ = tx.send(ReconciliationResult {
+                request_id,
+                context,
+                result,
+            });
+        }));
     }
 }
 
@@ -3002,17 +3398,34 @@ where
 fn apply_subscribe_updates_result(
     app: &mut App,
     load: SubscribeUpdatesResult,
-    update_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<Update>>,
+    latest_request_id: u64,
+    loop_state: &mut EventLoopState,
 ) -> bool {
+    if load.request_id != latest_request_id {
+        diagnostics::event(
+            "subscribe_updates_result_ignored",
+            format!(
+                "request_id={} latest_request_id={latest_request_id}",
+                load.request_id
+            ),
+        );
+        return false;
+    }
+
+    loop_state.subscription_pending = false;
     match load.result {
         Ok(rx) => {
             diagnostics::event("subscribe_updates_result", "updates=true");
-            *update_rx = Some(rx);
+            loop_state.update_rx = Some(rx);
+            loop_state.next_subscription_at = None;
             false
         }
         Err(error) => {
             diagnostics::event("subscribe_updates_result", "updates=false");
             app.state.set_error(error);
+            loop_state.announce_reconciliation_success = true;
+            loop_state.schedule_reconciliation_now();
+            loop_state.schedule_subscription_retry();
             true
         }
     }
@@ -4264,20 +4677,22 @@ mod tests {
         LOGIN_SESSION_SAVED_STATUS, LOGIN_SIGNED_IN_PREFIX, LOGIN_SIGNING_IN_STATUS,
         LOGIN_START_PROMPT, MIN_FRAME_INTERVAL, MarkChatReadLoader, MediaPreviewLoader,
         MediaPreviewResult, OlderMessageLoadResult, OlderMessageLoader, OlderMessageNavigation,
-        PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR, ReplyMessageLoader, ReplyMessageResult, RunMode,
-        SAVING_EDIT_STATUS, SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE,
-        SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_OK_PREFIX, SendMessageLoader,
-        SendMessageResult, SubscribeUpdatesLoader, SubscribeUpdatesResult, TerminalAction,
-        UiProgress, abort_running_task, apply_chat_message_load_result,
-        apply_delete_message_result, apply_edit_message_result, apply_folder_chat_load_result,
-        apply_initial_state_load_result, apply_media_preview_result,
-        apply_older_message_load_result, apply_reply_message_result, apply_send_message_result,
-        apply_subscribe_updates_result, apply_update_with_read_ack, check_auth_ok_message,
-        check_auth_unauthorized_message, check_config_message, check_config_session_status,
-        classify_terminal_event, default_config_path_string, drain_ready_results,
-        ensure_session_parent_dir, handle_input_focused, handle_key_event,
-        handle_key_event_with_progress, handle_mouse_event, load_checked_config,
-        load_checked_config_with_session_parent, login_2fa_hint_message,
+        PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR, RECONCILIATION_FOCUS_STALE_AFTER,
+        RECONCILIATION_INTERVAL, ReconciliationLoader, ReconciliationResult, ReplyMessageLoader,
+        ReplyMessageResult, RunMode, SAVING_EDIT_STATUS, SENDING_MESSAGE_STATUS,
+        SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE, SMOKE_CHECK_AUTH_CONFLICT,
+        SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_OK_PREFIX, SendMessageLoader, SendMessageResult,
+        SubscribeUpdatesLoader, SubscribeUpdatesResult, TerminalAction, TokioInstant,
+        UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress, abort_running_task,
+        apply_chat_message_load_result, apply_delete_message_result, apply_edit_message_result,
+        apply_folder_chat_load_result, apply_initial_state_load_result, apply_media_preview_result,
+        apply_older_message_load_result, apply_reconciliation_result, apply_reply_message_result,
+        apply_send_message_result, apply_subscribe_updates_result, apply_update_with_read_ack,
+        check_auth_ok_message, check_auth_unauthorized_message, check_config_message,
+        check_config_session_status, classify_terminal_event, default_config_path_string,
+        drain_ready_results, ensure_session_parent_dir, handle_input_focused, handle_key_event,
+        handle_key_event_with_progress, handle_mouse_event, handle_received_update,
+        load_checked_config, load_checked_config_with_session_parent, login_2fa_hint_message,
         login_2fa_signed_in_message, login_code_sent_message, login_failed_message,
         login_signed_in_message, message_submit_action_status, older_message_key_navigation,
         open_chat_at_with_optional_async_loader, parse_args_from, prepare_loop_step,
@@ -4289,6 +4704,7 @@ mod tests {
     use crate::config::telegram::{Config, TelegramConfig};
     use crate::state::{
         ContextMenuTarget, ConversationLoadStatus, DeleteConfirmation, FocusedPanel,
+        ReconciliationSnapshot,
     };
     use crate::telegram::{
         MockTelegramClient, TelegramClient,
@@ -4304,6 +4720,7 @@ mod tests {
     };
     use ratatui::layout::Rect;
     use std::{
+        collections::HashMap,
         path::Path,
         sync::{
             Arc, Mutex,
@@ -4377,6 +4794,17 @@ mod tests {
         }
     }
 
+    fn thread_topic(id: i32, unread_count: usize) -> ThreadTopic {
+        ThreadTopic {
+            id,
+            title: format!("Topic {id}"),
+            top_message_id: id,
+            unread_count,
+            is_closed: false,
+            is_pinned: false,
+        }
+    }
+
     #[test]
     fn terminal_event_classification_preserves_input_semantics() {
         let press =
@@ -4405,7 +4833,7 @@ mod tests {
         );
         assert_eq!(
             classify_terminal_event(Event::FocusGained),
-            TerminalAction::Ignore
+            TerminalAction::FocusGained
         );
         assert_eq!(
             classify_terminal_event(Event::FocusLost),
@@ -4447,6 +4875,45 @@ mod tests {
         assert!(frames.frame_deadline().is_none());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn reconciliation_and_subscription_scheduling_are_single_flight() {
+        let (mut loop_state, _) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        loop_state.subscription_pending = false;
+        loop_state.last_reconciliation_success_at = Some(TokioInstant::now());
+
+        loop_state.schedule_focus_reconciliation();
+        assert!(loop_state.next_reconciliation_at.is_none());
+        tokio::time::advance(RECONCILIATION_FOCUS_STALE_AFTER + Duration::from_millis(1)).await;
+        loop_state.schedule_focus_reconciliation();
+        let focus_deadline = loop_state
+            .next_reconciliation_at
+            .expect("stale focus should schedule reconciliation");
+        loop_state.schedule_focus_reconciliation();
+        assert_eq!(loop_state.next_reconciliation_at, Some(focus_deadline));
+        assert!(loop_state.announce_reconciliation_success);
+
+        loop_state.reconciliation_pending = true;
+        loop_state.next_reconciliation_at = None;
+        loop_state.schedule_reconciliation_now();
+        assert!(loop_state.reconciliation_requested_while_pending);
+        let now = TokioInstant::now();
+        loop_state.finish_reconciliation_gate(now + RECONCILIATION_INTERVAL);
+        assert_eq!(loop_state.next_reconciliation_at, Some(now));
+        assert!(!loop_state.reconciliation_requested_while_pending);
+
+        loop_state.schedule_subscription_retry();
+        let subscription_deadline = loop_state
+            .next_subscription_at
+            .expect("closed stream should schedule subscription retry");
+        loop_state.schedule_subscription_retry();
+        assert_eq!(loop_state.next_subscription_at, Some(subscription_deadline));
+        assert_eq!(
+            subscription_deadline.saturating_duration_since(TokioInstant::now()),
+            UPDATE_SUBSCRIPTION_RETRY_DELAY
+        );
+    }
+
     #[tokio::test]
     async fn absent_notification_deadline_creates_no_wake_timer() {
         assert!(
@@ -4478,6 +4945,7 @@ mod tests {
         senders
             .subscribe_updates
             .send(SubscribeUpdatesResult {
+                request_id: 0,
                 result: Ok(update_rx),
             })
             .expect("subscription receiver should be open");
@@ -4494,6 +4962,10 @@ mod tests {
         loop_state.staged_update = Some(Update::Error("staged".to_string()));
 
         let client = MockTelegramClient::new();
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation);
         let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
         let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
         let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
@@ -4504,6 +4976,8 @@ mod tests {
         assert!(drain_ready_results(
             &mut loop_state,
             &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
             &chat_loader,
             &older_loader,
             &folder_loader,
@@ -4525,6 +4999,563 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_applies_snapshot_before_deferred_updates() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        loop_state.reconciliation_pending = true;
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0)];
+        app.state.chats = vec![chat(1)];
+        let mut first = message(1);
+        first.chat_id = 1;
+        app.state.messages = vec![first];
+        let context = app.state.reconciliation_context();
+
+        let client = MockTelegramClient::new();
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation.clone());
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+
+        let mut deferred = message(3);
+        deferred.chat_id = 1;
+        assert!(!handle_received_update(
+            &mut loop_state,
+            &mut app,
+            Update::NewMessage(deferred),
+            &mark_read_loader,
+        ));
+        assert_eq!(loop_state.deferred_updates.len(), 1);
+
+        let mut snapshot_message = message(2);
+        snapshot_message.chat_id = 1;
+        senders
+            .reconciliation
+            .send(ReconciliationResult {
+                request_id: 0,
+                context,
+                result: Ok(ReconciliationSnapshot {
+                    folders: vec![all_folder(0)],
+                    selected_folder_id: Some(0),
+                    chats: vec![chat(1)],
+                    chat_last_message_ids: Default::default(),
+                    selected_chat_id: Some(1),
+                    thread_topics: Vec::new(),
+                    selected_topic_id: None,
+                    messages: vec![snapshot_message],
+                }),
+            })
+            .expect("reconciliation receiver should be open");
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        assert_eq!(
+            app.state
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(loop_state.deferred_updates.is_empty());
+        assert!(!loop_state.reconciliation_pending);
+    }
+
+    #[test]
+    fn reconciliation_deduplicates_background_updates_already_in_snapshot() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        loop_state.reconciliation_pending = true;
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0)];
+        app.state.chats = vec![chat(1), chat(2)];
+        let context = app.state.reconciliation_context();
+
+        let client = MockTelegramClient::new();
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation.clone());
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+
+        let mut background = message(3);
+        background.chat_id = 2;
+        assert!(!handle_received_update(
+            &mut loop_state,
+            &mut app,
+            Update::NewMessage(background),
+            &mark_read_loader,
+        ));
+        let mut refreshed_background = chat(2);
+        refreshed_background.unread_count = 1;
+        let mut high_water = std::collections::HashMap::new();
+        high_water.insert(2, 3);
+        senders
+            .reconciliation
+            .send(ReconciliationResult {
+                request_id: 0,
+                context,
+                result: Ok(ReconciliationSnapshot {
+                    folders: vec![all_folder(1)],
+                    selected_folder_id: Some(0),
+                    chats: vec![chat(1), refreshed_background],
+                    chat_last_message_ids: high_water,
+                    selected_chat_id: Some(1),
+                    thread_topics: Vec::new(),
+                    selected_topic_id: None,
+                    messages: Vec::new(),
+                }),
+            })
+            .expect("reconciliation receiver should be open");
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        assert_eq!(app.state.chats[1].unread_count, 1);
+        assert!(loop_state.deferred_updates.is_empty());
+    }
+
+    #[test]
+    fn stale_reconciliation_replays_deferred_updates_without_new_high_water_filtering() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        loop_state.reconciliation_pending = true;
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0)];
+        app.state.chats = vec![chat(1), chat(2)];
+        let context = app.state.reconciliation_context();
+        app.state.selected_chat_index = 1;
+        app.state.messages.clear();
+
+        let client = MockTelegramClient::new();
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation.clone());
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+
+        let mut deferred = message(3);
+        deferred.chat_id = 2;
+        assert!(!handle_received_update(
+            &mut loop_state,
+            &mut app,
+            Update::NewMessage(deferred),
+            &mark_read_loader,
+        ));
+        let mut high_water = HashMap::new();
+        high_water.insert(2, 3);
+        senders
+            .reconciliation
+            .send(ReconciliationResult {
+                request_id: 0,
+                context,
+                result: Ok(ReconciliationSnapshot {
+                    folders: vec![all_folder(0)],
+                    selected_folder_id: Some(0),
+                    chats: vec![chat(1), chat(2)],
+                    chat_last_message_ids: high_water,
+                    selected_chat_id: Some(1),
+                    thread_topics: Vec::new(),
+                    selected_topic_id: None,
+                    messages: Vec::new(),
+                }),
+            })
+            .expect("reconciliation receiver should be open");
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        assert_eq!(app.state.selected_chat_id(), Some(2));
+        assert_eq!(app.state.messages.len(), 1);
+        assert_eq!(app.state.messages[0].id, 3);
+        assert!(loop_state.reconciliation_high_water_ids.is_empty());
+    }
+
+    #[test]
+    fn queued_background_update_uses_accepted_snapshot_high_water() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        loop_state.reconciliation_pending = true;
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0)];
+        app.state.chats = vec![chat(1), chat(2)];
+        let context = app.state.reconciliation_context();
+        let (update_tx, update_rx) = mpsc::unbounded_channel();
+        loop_state.update_rx = Some(update_rx);
+        let mut queued = message(3);
+        queued.chat_id = 2;
+        update_tx
+            .send(Update::NewMessage(queued))
+            .expect("update receiver should be open");
+
+        let client = MockTelegramClient::new();
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation.clone());
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+
+        let mut refreshed_background = chat(2);
+        refreshed_background.unread_count = 1;
+        let mut high_water = HashMap::new();
+        high_water.insert(2, 3);
+        senders
+            .reconciliation
+            .send(ReconciliationResult {
+                request_id: 0,
+                context,
+                result: Ok(ReconciliationSnapshot {
+                    folders: vec![all_folder(1)],
+                    selected_folder_id: Some(0),
+                    chats: vec![chat(1), refreshed_background],
+                    chat_last_message_ids: high_water,
+                    selected_chat_id: Some(1),
+                    thread_topics: Vec::new(),
+                    selected_topic_id: None,
+                    messages: Vec::new(),
+                }),
+            })
+            .expect("reconciliation receiver should be open");
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        assert_eq!(app.state.chats[1].unread_count, 1);
+    }
+
+    #[test]
+    fn represented_other_topic_update_is_not_replayed_into_selected_topic_state() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        loop_state.reconciliation_pending = true;
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0)];
+        app.state.chats = vec![chat(1)];
+        app.state.thread_topics = vec![thread_topic(10, 0), thread_topic(20, 0)];
+        let mut selected_message = message(1);
+        selected_message.chat_id = 1;
+        selected_message.thread_topic_id = Some(10);
+        app.state.messages = vec![selected_message.clone()];
+        let context = app.state.reconciliation_context();
+
+        let client = MockTelegramClient::new();
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation.clone());
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+
+        let mut other_topic_message = message(30);
+        other_topic_message.chat_id = 1;
+        other_topic_message.thread_topic_id = Some(20);
+        assert!(!handle_received_update(
+            &mut loop_state,
+            &mut app,
+            Update::NewMessage(other_topic_message),
+            &mark_read_loader,
+        ));
+        let mut refreshed_chat = chat(1);
+        refreshed_chat.unread_count = 1;
+        let mut high_water = HashMap::new();
+        high_water.insert(1, 30);
+        senders
+            .reconciliation
+            .send(ReconciliationResult {
+                request_id: 0,
+                context,
+                result: Ok(ReconciliationSnapshot {
+                    folders: vec![all_folder(1)],
+                    selected_folder_id: Some(0),
+                    chats: vec![refreshed_chat],
+                    chat_last_message_ids: high_water,
+                    selected_chat_id: Some(1),
+                    thread_topics: vec![thread_topic(10, 0), thread_topic(20, 1)],
+                    selected_topic_id: Some(10),
+                    messages: vec![selected_message],
+                }),
+            })
+            .expect("reconciliation receiver should be open");
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        assert_eq!(app.state.messages.len(), 1);
+        assert_eq!(app.state.chats[0].unread_count, 1);
+        assert_eq!(app.state.thread_topics[1].unread_count, 1);
+    }
+
+    #[test]
+    fn selected_chat_tail_update_is_replayed_when_older_history_is_preserved() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        loop_state.reconciliation_pending = true;
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0)];
+        app.state.chats = vec![chat(1)];
+        app.state.messages = (1..=3)
+            .map(|id| {
+                let mut message = message(id);
+                message.chat_id = 1;
+                message
+            })
+            .collect();
+        app.state.selected_message_index = 0;
+        let context = app.state.reconciliation_context();
+
+        let client = MockTelegramClient::new();
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation.clone());
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+
+        let mut tail = message(4);
+        tail.chat_id = 1;
+        assert!(!handle_received_update(
+            &mut loop_state,
+            &mut app,
+            Update::NewMessage(tail.clone()),
+            &mark_read_loader,
+        ));
+        let mut high_water = HashMap::new();
+        high_water.insert(1, 4);
+        senders
+            .reconciliation
+            .send(ReconciliationResult {
+                request_id: 0,
+                context,
+                result: Ok(ReconciliationSnapshot {
+                    folders: vec![all_folder(0)],
+                    selected_folder_id: Some(0),
+                    chats: vec![chat(1)],
+                    chat_last_message_ids: high_water,
+                    selected_chat_id: Some(1),
+                    thread_topics: Vec::new(),
+                    selected_topic_id: None,
+                    messages: vec![tail],
+                }),
+            })
+            .expect("reconciliation receiver should be open");
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        assert_eq!(
+            app.state
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            app.state.selected_message().map(|message| message.id),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_reconciliation_marks_only_the_selected_thread_read() {
+        let (mut loop_state, _) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        loop_state.reconciliation_pending = true;
+        let mut app = App::new();
+        let mut local_chat = chat(1);
+        local_chat.unread_count = 3;
+        app.state.folders = vec![all_folder(3)];
+        app.state.chats = vec![local_chat];
+        app.state.thread_topics = vec![thread_topic(10, 0), thread_topic(20, 3)];
+        app.state.messages = (1..=3)
+            .map(|id| {
+                let mut message = message(id);
+                message.chat_id = 1;
+                message.thread_topic_id = Some(10);
+                message
+            })
+            .collect();
+        app.state.selected_message_index = 0;
+        let context = app.state.reconciliation_context();
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
+            marked_chat_ids: Arc::clone(&marked_chat_ids),
+            marked_threads: Arc::clone(&marked_threads),
+        });
+        let mut refreshed_message = message(30);
+        refreshed_message.chat_id = 1;
+        refreshed_message.thread_topic_id = Some(10);
+        let mut refreshed_chat = chat(1);
+        refreshed_chat.unread_count = 5;
+
+        assert!(apply_reconciliation_result(
+            &mut app,
+            ReconciliationResult {
+                request_id: 0,
+                context,
+                result: Ok(ReconciliationSnapshot {
+                    folders: vec![all_folder(5)],
+                    selected_folder_id: Some(0),
+                    chats: vec![refreshed_chat],
+                    chat_last_message_ids: Default::default(),
+                    selected_chat_id: Some(1),
+                    thread_topics: vec![thread_topic(10, 2), thread_topic(20, 3)],
+                    selected_topic_id: Some(10),
+                    messages: vec![refreshed_message],
+                }),
+            },
+            0,
+            &mut loop_state,
+            &mark_read_loader,
+        ));
+        tokio::task::yield_now().await;
+
+        assert!(marked_chat_ids.lock().unwrap().is_empty());
+        assert_eq!(*marked_threads.lock().unwrap(), vec![(1, 10, 30)]);
+        assert_eq!(app.state.chats[0].unread_count, 3);
+        assert_eq!(app.state.folders[0].unread_count, 3);
+        assert_eq!(
+            app.state
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(app.state.thread_topics[0].unread_count, 0);
+        assert_eq!(app.state.thread_topics[1].unread_count, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconciliation_timeout_releases_deferred_updates() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        loop_state.reconciliation_pending = true;
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0)];
+        app.state.chats = vec![chat(1)];
+        let context = app.state.reconciliation_context();
+
+        let mut reconciliation_loader =
+            ReconciliationLoader::new(HangingReconciliationClient, senders.reconciliation);
+        reconciliation_loader.spawn_reconciliation(context);
+        tokio::task::yield_now().await;
+        let client = HangingReconciliationClient;
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+
+        let mut incoming = message(7);
+        incoming.chat_id = 1;
+        assert!(!handle_received_update(
+            &mut loop_state,
+            &mut app,
+            Update::NewMessage(incoming),
+            &mark_read_loader,
+        ));
+        tokio::time::advance(crate::actions::RECONCILIATION_TIMEOUT + Duration::from_millis(1))
+            .await;
+        tokio::task::yield_now().await;
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        assert!(!loop_state.reconciliation_pending);
+        assert!(loop_state.deferred_updates.is_empty());
+        assert_eq!(app.state.messages.len(), 1);
+        assert_eq!(app.state.messages[0].id, 7);
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some("Telegram state refresh timed out")
+        );
+    }
+
+    #[test]
     fn loop_step_applies_ready_results_before_releasing_staged_input() {
         let (mut loop_state, senders) = EventLoopState::new();
         senders
@@ -4537,6 +5568,10 @@ mod tests {
         loop_state.staged_terminal_event = Some(Event::Key(key));
 
         let client = MockTelegramClient::new();
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation);
         let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
         let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
         let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
@@ -4547,6 +5582,8 @@ mod tests {
         let step = prepare_loop_step(
             &mut loop_state,
             &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
             &chat_loader,
             &older_loader,
             &folder_loader,
@@ -4660,6 +5697,66 @@ mod tests {
     struct RecordingMarkReadClient {
         marked_chat_ids: Arc<Mutex<Vec<i64>>>,
         marked_threads: Arc<Mutex<Vec<(i64, i32, i32)>>>,
+    }
+
+    #[derive(Clone)]
+    struct HangingReconciliationClient;
+
+    impl TelegramClient for HangingReconciliationClient {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_folders(&self) -> Result<Vec<Folder>> {
+            std::future::pending().await
+        }
+
+        async fn get_chats(&self, _folder_id: Option<i32>, _limit: usize) -> Result<Vec<Chat>> {
+            panic!("hanging reconciliation should time out while fetching folders")
+        }
+
+        async fn get_messages(&self, _chat_id: i64, _limit: usize) -> Result<Vec<Message>> {
+            panic!("hanging reconciliation should not fetch messages")
+        }
+
+        async fn get_messages_before(
+            &self,
+            _chat_id: i64,
+            _before_message_id: i32,
+            _limit: usize,
+        ) -> Result<Vec<Message>> {
+            panic!("hanging reconciliation should not fetch older messages")
+        }
+
+        async fn send_message(&self, _chat_id: i64, _content: String) -> Result<Message> {
+            panic!("hanging reconciliation should not send messages")
+        }
+
+        async fn edit_message(
+            &self,
+            _chat_id: i64,
+            _message_id: i32,
+            _content: String,
+        ) -> Result<()> {
+            panic!("hanging reconciliation should not edit messages")
+        }
+
+        async fn reply_to_message(
+            &self,
+            _chat_id: i64,
+            _reply_to: i32,
+            _content: String,
+        ) -> Result<Message> {
+            panic!("hanging reconciliation should not reply to messages")
+        }
+
+        async fn delete_message(&self, _chat_id: i64, _message_id: i32) -> Result<()> {
+            panic!("hanging reconciliation should not delete messages")
+        }
+
+        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+            panic!("hanging reconciliation should not subscribe to updates")
+        }
     }
 
     impl TelegramClient for SlowFirstLatestMessagesClient {
@@ -5300,22 +6397,26 @@ mod tests {
     fn async_subscribe_updates_result_installs_receiver() {
         let mut app = App::new();
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut update_rx = None;
+        let (mut loop_state, _) = EventLoopState::new();
 
         apply_subscribe_updates_result(
             &mut app,
-            SubscribeUpdatesResult { result: Ok(rx) },
-            &mut update_rx,
+            SubscribeUpdatesResult {
+                request_id: 1,
+                result: Ok(rx),
+            },
+            1,
+            &mut loop_state,
         );
 
-        assert!(update_rx.is_some());
+        assert!(loop_state.update_rx.is_some());
         assert!(app.state.error_message.is_none());
     }
 
     #[tokio::test]
     async fn async_subscribe_updates_loader_sends_result_without_blocking_handler() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let loader = SubscribeUpdatesLoader::new(MockTelegramClient::new(), tx);
+        let mut loader = SubscribeUpdatesLoader::new(MockTelegramClient::new(), tx);
 
         loader.spawn_subscribe_updates();
 
