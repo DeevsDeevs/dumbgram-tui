@@ -122,11 +122,11 @@ mod tests {
 
         for cell in &buffer.content {
             assert!(
-                matches!(cell.bg, Color::Reset | Color::Green),
+                matches!(cell.bg, Color::Reset | Color::DarkGray),
                 "unexpected opaque background {:?}",
                 cell.bg
             );
-            if cell.bg == Color::Green {
+            if cell.bg == Color::DarkGray {
                 selected_cells += 1;
                 assert_eq!(cell.fg, Color::White);
             }
@@ -135,7 +135,7 @@ mod tests {
         for area in [app.state.chats_area, app.state.messages_area] {
             assert!(
                 area.rows().flat_map(|row| row.columns()).any(|position| {
-                    buffer[position].bg == Color::Green && buffer[position].fg == Color::White
+                    buffer[position].bg == Color::DarkGray && buffer[position].fg == Color::White
                 }),
                 "selected row in {area:?} did not use the explicit contrast pair"
             );

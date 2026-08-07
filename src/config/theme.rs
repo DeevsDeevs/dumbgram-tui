@@ -19,7 +19,7 @@ impl Theme {
         Self {
             background: Color::Reset,
             foreground: Color::Reset,
-            selection: Color::Green,
+            selection: Color::DarkGray,
             selection_foreground: Color::White,
             unread_chat: Color::Yellow,
             selected_item: Color::LightGreen,
@@ -50,7 +50,7 @@ mod tests {
         assert_eq!(theme.background, Color::Reset);
         assert_eq!(theme.foreground, Color::Reset);
         assert_eq!(theme.other_message, Color::Reset);
-        assert_eq!(theme.selection, Color::Green);
+        assert_eq!(theme.selection, Color::DarkGray);
         assert_eq!(theme.selection_foreground, Color::White);
         assert_eq!(theme.border_focused, Color::LightGreen);
     }
