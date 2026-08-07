@@ -526,6 +526,8 @@ async fn run_smoke_with_client<C: TelegramClient + Clone + Send + Sync + 'static
     assert_smoke_render(&mut app, theme)?;
     run_mouse_smoke(&mut app, &mut client).await?;
     assert_smoke_render(&mut app, theme)?;
+    run_lazy_preview_smoke(&mut app, &mut client, theme).await?;
+    assert_smoke_render(&mut app, theme)?;
 
     println!(
         "{}",
@@ -673,6 +675,18 @@ fn assert_smoke_message_render(app: &App, rendered: &str) -> Result<()> {
     if app.state.messages.is_empty() {
         return Ok(());
     }
+    if app
+        .state
+        .selected_message()
+        .and_then(|message| message.media.as_ref())
+        .and_then(|media| media.local_image_path())
+        .is_some()
+        && !rendered.contains(ui::layout::IMAGE_VIEWPORT_TITLE)
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "smoke render did not include the lazily loaded image viewport"
+        ));
+    }
 
     let message_position = ui::messages::message_position_label(
         app.state.selected_message_index,
@@ -785,6 +799,42 @@ fn assert_smoke_shell_render(rendered: &str) -> Result<()> {
         ));
     }
 
+    Ok(())
+}
+
+async fn run_lazy_preview_smoke<C: TelegramClient + Clone + Send + Sync + 'static>(
+    app: &mut App,
+    client: &mut C,
+    theme: &config::Theme,
+) -> Result<()> {
+    actions::load_initial_state(&mut app.state, client).await?;
+    let chat_index = app
+        .state
+        .chats
+        .iter()
+        .position(|chat| chat.id == 4)
+        .ok_or_else(|| color_eyre::eyre::eyre!("smoke data did not include image chat"))?;
+    actions::begin_open_chat_at(&mut app.state, chat_index);
+    actions::load_selected_chat_messages(&mut app.state, client).await?;
+    app.state.selected_message_index = 0;
+    let (chat_id, message_id) = app
+        .state
+        .selected_media_preview_request()
+        .ok_or_else(|| color_eyre::eyre::eyre!("smoke image was not text-first"))?;
+    assert_smoke_render(app, theme)?;
+
+    let path = client
+        .load_message_media_preview(chat_id, message_id)
+        .await?
+        .ok_or_else(|| color_eyre::eyre::eyre!("mock preview was unavailable"))?;
+    if !app
+        .state
+        .apply_selected_media_preview(chat_id, message_id, path)
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "smoke preview did not attach to selected message"
+        ));
+    }
     Ok(())
 }
 
@@ -1500,6 +1550,8 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
     let reply_message_loader = ReplyMessageLoader::new(client.clone(), reply_message_tx);
     let (download_media_tx, mut download_media_rx) = tokio::sync::mpsc::unbounded_channel();
     let download_media_loader = DownloadMediaLoader::new(client.clone(), download_media_tx);
+    let (media_preview_tx, mut media_preview_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut media_preview_loader = MediaPreviewLoader::new(client.clone(), media_preview_tx);
     loop {
         while let Ok(subscribe_result) = subscribe_updates_rx.try_recv() {
             apply_subscribe_updates_result(app, subscribe_result, &mut update_rx);
@@ -1558,8 +1610,16 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
         while let Ok(download_result) = download_media_rx.try_recv() {
             apply_download_media_result(app, download_result);
         }
+        while let Ok(preview_result) = media_preview_rx.try_recv() {
+            apply_media_preview_result(
+                app,
+                media_preview_loader.latest_request_id(),
+                preview_result,
+            );
+        }
 
         app.state.check_notification_timeout();
+        media_preview_loader.request(app.state.selected_media_preview_request());
 
         let draw_started = Instant::now();
         terminal.draw(|f| ui::render_layout(f, app, theme))?;
@@ -1677,6 +1737,13 @@ struct DownloadMediaResult {
     chat_id: i64,
     message_id: i32,
     result: std::result::Result<telegram::DownloadedMedia, String>,
+}
+
+struct MediaPreviewResult {
+    request_id: u64,
+    chat_id: i64,
+    message_id: i32,
+    result: std::result::Result<Option<PathBuf>, String>,
 }
 
 struct HandlerLoaders<'a, C> {
@@ -2004,6 +2071,15 @@ struct DownloadMediaLoader<C> {
     tx: tokio::sync::mpsc::UnboundedSender<DownloadMediaResult>,
 }
 
+struct MediaPreviewLoader<C> {
+    client: C,
+    tx: tokio::sync::mpsc::UnboundedSender<MediaPreviewResult>,
+    latest_request_id: u64,
+    // ponytail: failed/empty previews retry only after selection changes; add timed retry if transient failures matter.
+    last_requested: Option<(i64, i32)>,
+    current_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
 impl<C> SendMessageLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
@@ -2128,6 +2204,61 @@ where
                 result,
             });
         });
+    }
+}
+
+impl<C> MediaPreviewLoader<C>
+where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    fn new(client: C, tx: tokio::sync::mpsc::UnboundedSender<MediaPreviewResult>) -> Self {
+        Self {
+            client,
+            tx,
+            latest_request_id: 0,
+            last_requested: None,
+            current_handle: None,
+        }
+    }
+
+    fn latest_request_id(&self) -> u64 {
+        self.latest_request_id
+    }
+
+    fn request(&mut self, request: Option<(i64, i32)>) {
+        if self.last_requested == request {
+            return;
+        }
+        abort_running_task(
+            &mut self.current_handle,
+            "media_preview_abort",
+            self.latest_request_id,
+        );
+        self.last_requested = request;
+        let Some((chat_id, message_id)) = request else {
+            return;
+        };
+
+        self.latest_request_id = self.latest_request_id.saturating_add(1);
+        let request_id = self.latest_request_id;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        diagnostics::event(
+            "media_preview_spawn",
+            format!("request_id={request_id} chat_id={chat_id} message_id={message_id}"),
+        );
+        self.current_handle = Some(tokio::spawn(async move {
+            let result = client
+                .load_message_media_preview(chat_id, message_id)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(MediaPreviewResult {
+                request_id,
+                chat_id,
+                message_id,
+                result,
+            });
+        }));
     }
 }
 
@@ -2676,6 +2807,52 @@ async fn download_selected_message_media<C: TelegramClient>(
         },
     );
     Ok(())
+}
+
+fn apply_media_preview_result(app: &mut App, latest_request_id: u64, preview: MediaPreviewResult) {
+    if preview.request_id != latest_request_id
+        || app.state.selected_media_preview_request() != Some((preview.chat_id, preview.message_id))
+    {
+        diagnostics::event(
+            "media_preview_stale",
+            format!(
+                "request_id={} latest_request_id={} chat_id={} message_id={}",
+                preview.request_id, latest_request_id, preview.chat_id, preview.message_id
+            ),
+        );
+        return;
+    }
+
+    match preview.result {
+        Ok(Some(path)) => {
+            if app
+                .state
+                .apply_selected_media_preview(preview.chat_id, preview.message_id, path)
+            {
+                diagnostics::event(
+                    "media_preview_apply",
+                    format!(
+                        "request_id={} chat_id={} message_id={}",
+                        preview.request_id, preview.chat_id, preview.message_id
+                    ),
+                );
+            }
+        }
+        Ok(None) => diagnostics::event(
+            "media_preview_unavailable",
+            format!(
+                "request_id={} chat_id={} message_id={}",
+                preview.request_id, preview.chat_id, preview.message_id
+            ),
+        ),
+        Err(_) => diagnostics::event(
+            "media_preview_download_error",
+            format!(
+                "request_id={} chat_id={} message_id={} error=true",
+                preview.request_id, preview.chat_id, preview.message_id
+            ),
+        ),
+    }
 }
 
 fn apply_download_media_result(app: &mut App, download: DownloadMediaResult) {
@@ -3281,31 +3458,34 @@ mod tests {
         LOGIN_2FA_HINT_PREFIX, LOGIN_2FA_PROMPT, LOGIN_2FA_SIGNED_IN_PREFIX, LOGIN_CODE_PROMPT,
         LOGIN_CODE_SENT_PREFIX, LOGIN_FAILED_PREFIX, LOGIN_HEADER, LOGIN_PHONE_PROMPT,
         LOGIN_REQUESTING_CODE_STATUS, LOGIN_SESSION_SAVED_STATUS, LOGIN_SIGNED_IN_PREFIX,
-        LOGIN_SIGNING_IN_STATUS, LOGIN_START_PROMPT, MarkChatReadLoader, OlderMessageLoadResult,
-        OlderMessageLoader, OlderMessageNavigation, PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR,
-        ReplyMessageLoader, ReplyMessageResult, RunMode, SAVING_EDIT_STATUS,
-        SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE,
+        LOGIN_SIGNING_IN_STATUS, LOGIN_START_PROMPT, MarkChatReadLoader, MediaPreviewLoader,
+        MediaPreviewResult, OlderMessageLoadResult, OlderMessageLoader, OlderMessageNavigation,
+        PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR, ReplyMessageLoader, ReplyMessageResult, RunMode,
+        SAVING_EDIT_STATUS, SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE,
         SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_OK_PREFIX, SendMessageLoader,
         SendMessageResult, SubscribeUpdatesLoader, SubscribeUpdatesResult, UiProgress,
         abort_running_task, apply_chat_message_load_result, apply_delete_message_result,
         apply_edit_message_result, apply_folder_chat_load_result, apply_initial_state_load_result,
-        apply_older_message_load_result, apply_reply_message_result, apply_send_message_result,
-        apply_subscribe_updates_result, apply_update_with_read_ack, check_auth_ok_message,
-        check_auth_unauthorized_message, check_config_message, check_config_session_status,
-        default_config_path_string, ensure_session_parent_dir, handle_input_focused,
-        handle_mouse_event, load_checked_config, load_checked_config_with_session_parent,
-        login_2fa_hint_message, login_2fa_signed_in_message, login_code_sent_message,
-        login_failed_message, login_signed_in_message, message_submit_action_status,
-        older_message_key_navigation, open_chat_at_with_optional_async_loader, parse_args_from,
+        apply_media_preview_result, apply_older_message_load_result, apply_reply_message_result,
+        apply_send_message_result, apply_subscribe_updates_result, apply_update_with_read_ack,
+        check_auth_ok_message, check_auth_unauthorized_message, check_config_message,
+        check_config_session_status, default_config_path_string, ensure_session_parent_dir,
+        handle_input_focused, handle_mouse_event, load_checked_config,
+        load_checked_config_with_session_parent, login_2fa_hint_message,
+        login_2fa_signed_in_message, login_code_sent_message, login_failed_message,
+        login_signed_in_message, message_submit_action_status, older_message_key_navigation,
+        open_chat_at_with_optional_async_loader, parse_args_from,
         preserve_prompt_input_line_spaces, require_prompt_line, require_prompt_response,
         save_app_preferences_if_changed, smoke_ok_message, trim_prompt_input_line, validate_config,
     };
     use crate::app::App;
     use crate::config::telegram::{Config, TelegramConfig};
-    use crate::state::{DeleteConfirmation, FocusedPanel};
+    use crate::state::{ConversationLoadStatus, DeleteConfirmation, FocusedPanel};
     use crate::telegram::{
         MockTelegramClient, TelegramClient,
-        types::{Chat, Folder, Message, MessageStatus, ThreadTopic, Update, all_folder},
+        types::{
+            Chat, Folder, Message, MessageMedia, MessageStatus, ThreadTopic, Update, all_folder,
+        },
     };
     use chrono::Utc;
     use color_eyre::Result;
@@ -4217,6 +4397,100 @@ mod tests {
         .expect("typing after switching chats should succeed");
         tokio::task::yield_now().await;
         assert_eq!(observer.typing_action_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn media_preview_loader_deduplicates_until_selection_changes() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut loader = MediaPreviewLoader::new(MockTelegramClient::new(), tx);
+
+        loader.request(Some((1, 10)));
+        loader.request(Some((1, 10)));
+        let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("preview load should respond")
+            .expect("preview channel should stay open");
+        assert_eq!(first.request_id, 1);
+        assert_eq!((first.chat_id, first.message_id), (1, 10));
+        assert!(first.result.expect("mock preview should load").is_some());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), rx.recv())
+                .await
+                .is_err(),
+            "unchanged selection should not request another preview"
+        );
+
+        loader.request(None);
+        loader.request(Some((1, 10)));
+        let second = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("reselected preview should respond")
+            .expect("preview channel should stay open");
+        assert_eq!(second.request_id, 2);
+    }
+
+    #[test]
+    fn media_preview_result_rejects_cross_chat_collision_and_keeps_errors_silent() {
+        let mut app = App::new();
+        app.state.chats = vec![chat(2)];
+        app.state.messages = vec![message(7)];
+        app.state.messages[0].chat_id = 2;
+        app.state.messages[0].content = "unchanged".to_string();
+        app.state.messages[0].media = Some(MessageMedia::photo());
+        app.state.conversation_load_status = ConversationLoadStatus::Failed;
+
+        apply_media_preview_result(
+            &mut app,
+            1,
+            MediaPreviewResult {
+                request_id: 1,
+                chat_id: 1,
+                message_id: 7,
+                result: Ok(Some("/tmp/chat-a.png".into())),
+            },
+        );
+        assert!(
+            app.state.messages[0]
+                .media
+                .as_ref()
+                .and_then(|media| media.local_path.as_ref())
+                .is_none()
+        );
+
+        apply_media_preview_result(
+            &mut app,
+            2,
+            MediaPreviewResult {
+                request_id: 2,
+                chat_id: 2,
+                message_id: 7,
+                result: Err("preview unavailable".to_string()),
+            },
+        );
+        assert_eq!(app.state.messages[0].content, "unchanged");
+        assert_eq!(
+            app.state.conversation_load_status,
+            ConversationLoadStatus::Failed
+        );
+        assert!(app.state.error_message.is_none());
+
+        apply_media_preview_result(
+            &mut app,
+            3,
+            MediaPreviewResult {
+                request_id: 3,
+                chat_id: 2,
+                message_id: 7,
+                result: Ok(Some("/tmp/chat-b.png".into())),
+            },
+        );
+        assert_eq!(
+            app.state.messages[0]
+                .media
+                .as_ref()
+                .and_then(|media| media.local_image_path()),
+            Some(Path::new("/tmp/chat-b.png"))
+        );
     }
 
     #[tokio::test]

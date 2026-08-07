@@ -1918,6 +1918,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_history_publishes_without_loading_media_previews() {
+        let mut state = AppState::new();
+        state.chats = vec![Chat {
+            id: 4,
+            name: "Release Channel".to_string(),
+            last_message: None,
+            unread_count: 0,
+            is_group: true,
+            folder_id: None,
+        }];
+        let mut client = MockTelegramClient::new();
+        let observer = client.clone();
+
+        action_should_succeed(load_selected_chat_messages(&mut state, &mut client).await);
+
+        assert!(!state.messages.is_empty());
+        assert!(state.messages[0].media.is_some());
+        assert!(
+            state.messages[0]
+                .media
+                .as_ref()
+                .and_then(|media| media.local_path.as_ref())
+                .is_none()
+        );
+        assert_eq!(observer.preview_load_count(), 0);
+    }
+
+    #[tokio::test]
     async fn load_selected_thread_topic_messages_replaces_messages_with_topic_history() {
         let mut state = AppState::new();
         state.chats = vec![Chat {

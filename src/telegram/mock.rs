@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 pub struct MockTelegramClient {
     connected: bool,
     typing_action_count: Arc<AtomicUsize>,
+    preview_load_count: Arc<AtomicUsize>,
 }
 
 impl MockTelegramClient {
@@ -27,12 +28,18 @@ impl MockTelegramClient {
         Self {
             connected: false,
             typing_action_count: Arc::new(AtomicUsize::new(0)),
+            preview_load_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     #[cfg(test)]
     pub fn typing_action_count(&self) -> usize {
         self.typing_action_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn preview_load_count(&self) -> usize {
+        self.preview_load_count.load(Ordering::Relaxed)
     }
 }
 
@@ -52,6 +59,7 @@ fn mock_image_path() -> Option<PathBuf> {
     Some(path)
 }
 
+#[cfg(test)]
 fn mock_photo_media() -> MessageMedia {
     mock_image_path().map_or_else(MessageMedia::photo, |path| {
         MessageMedia::photo().with_local_path(path)
@@ -73,6 +81,15 @@ impl TelegramClient for MockTelegramClient {
     async fn send_typing_action(&self, _chat_id: i64, _topic_id: Option<i32>) -> Result<()> {
         self.typing_action_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    async fn load_message_media_preview(
+        &self,
+        _chat_id: i64,
+        _message_id: i32,
+    ) -> Result<Option<PathBuf>> {
+        self.preview_load_count.fetch_add(1, Ordering::Relaxed);
+        Ok(mock_image_path())
     }
 
     #[allow(clippy::manual_async_fn)]
@@ -422,7 +439,7 @@ impl TelegramClient for MockTelegramClient {
                         is_own: false,
                         is_edited: false,
                         reply_to_content: None,
-                        media: Some(mock_photo_media()),
+                        media: Some(MessageMedia::photo()),
                         status: MessageStatus::Delivered,
                         can_edit: false,
                         can_delete: false,

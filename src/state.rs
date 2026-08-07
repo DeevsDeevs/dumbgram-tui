@@ -1,6 +1,6 @@
 use crate::diagnostics;
 use crate::telegram::types::{
-    Chat, Folder, Message, MessageStatus, OWN_SENDER_NAME, ThreadTopic,
+    Chat, Folder, Message, MessageMediaKind, MessageStatus, OWN_SENDER_NAME, ThreadTopic,
     UNKNOWN_DELETE_UPDATE_CHAT_ID, Update, is_all_folder, message_display_content,
     message_display_preview,
 };
@@ -1636,6 +1636,42 @@ impl AppState {
 
     pub fn selected_message(&self) -> Option<&Message> {
         self.messages.get(self.selected_message_index)
+    }
+
+    pub fn selected_media_preview_request(&self) -> Option<(i64, i32)> {
+        let message = self.selected_message()?;
+        let media = message.media.as_ref()?;
+        (media.local_path.is_none()
+            && matches!(
+                media.kind,
+                MessageMediaKind::Photo | MessageMediaKind::Image
+            ))
+        .then_some((message.chat_id, message.id))
+    }
+
+    pub fn apply_selected_media_preview(
+        &mut self,
+        chat_id: i64,
+        message_id: i32,
+        path: PathBuf,
+    ) -> bool {
+        let Some(message) = self.messages.get_mut(self.selected_message_index) else {
+            return false;
+        };
+        if message.chat_id != chat_id || message.id != message_id {
+            return false;
+        }
+        let Some(media) = message.media.as_mut() else {
+            return false;
+        };
+        if !matches!(
+            media.kind,
+            MessageMediaKind::Photo | MessageMediaKind::Image
+        ) {
+            return false;
+        }
+        media.local_path = Some(path);
+        true
     }
 
     pub fn record_downloaded_media(&mut self, chat_id: i64, message_id: i32, path: PathBuf) {
@@ -3963,6 +3999,30 @@ mod tests {
 
         state.selected_message_index = 99;
         assert!(state.selected_message().is_none());
+    }
+
+    #[test]
+    fn selected_media_preview_request_and_apply_require_exact_image_message() {
+        let mut state = AppState::new();
+        state.messages = vec![message(10), message(20)];
+        state.messages[0].chat_id = 1;
+        state.messages[0].media = Some(MessageMedia::photo());
+
+        assert_eq!(state.selected_media_preview_request(), Some((1, 10)));
+        assert!(!state.apply_selected_media_preview(2, 10, "/tmp/wrong-chat.png".into()));
+        assert!(!state.apply_selected_media_preview(1, 20, "/tmp/wrong-message.png".into()));
+        assert!(state.apply_selected_media_preview(1, 10, "/tmp/preview.png".into()));
+        assert_eq!(state.selected_media_preview_request(), None);
+        assert_eq!(
+            state.messages[0]
+                .media
+                .as_ref()
+                .and_then(|media| media.local_image_path()),
+            Some(std::path::Path::new("/tmp/preview.png"))
+        );
+
+        state.selected_message_index = 1;
+        assert_eq!(state.selected_media_preview_request(), None);
     }
 
     #[test]

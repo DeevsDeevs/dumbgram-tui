@@ -116,6 +116,7 @@ impl MessageMedia {
         Self::new(MessageMediaKind::Image, "[image]")
     }
 
+    #[cfg(test)]
     pub fn with_local_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.local_path = Some(path.into());
         self

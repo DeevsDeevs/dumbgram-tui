@@ -77,6 +77,14 @@ pub trait TelegramClient {
     ) -> impl std::future::Future<Output = Result<Vec<Message>>> + Send + '_ {
         async move { Ok(Vec::new()) }
     }
+    /// Returns a cached local preview path, `None` when no preview exists, or an attempt error.
+    fn load_message_media_preview(
+        &self,
+        _chat_id: i64,
+        _message_id: i32,
+    ) -> impl std::future::Future<Output = Result<Option<PathBuf>>> + Send + '_ {
+        async move { Ok(None) }
+    }
     fn download_message_media(
         &self,
         _chat_id: i64,

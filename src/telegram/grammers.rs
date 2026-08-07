@@ -449,33 +449,13 @@ fn message_media(media: Option<&grammers_client::types::Media>) -> Option<Messag
     }
 }
 
-async fn message_media_with_local_preview(
-    client: &Client,
-    cache_dir: &Path,
-    chat_id: i64,
-    message_id: i32,
-    media: Option<&grammers_client::types::Media>,
-) -> Option<MessageMedia> {
-    let mut message_media = message_media(media);
-    if let (Some(message_media), Some(media)) = (message_media.as_mut(), media)
-        && matches!(
-            message_media.kind,
-            MessageMediaKind::Photo | MessageMediaKind::Image
-        )
-    {
-        match download_media_thumbnail(client, cache_dir, chat_id, message_id, media).await {
-            Ok(Some(path)) => *message_media = message_media.clone().with_local_path(path),
-            Ok(None) => {}
-            Err(error) => diagnostics::event(
-                "media_preview_download_error",
-                format!(
-                    "chat_id={chat_id} message_id={message_id} error_kind={:?}",
-                    error.kind()
-                ),
-            ),
-        }
-    }
-    message_media
+fn media_thumbnail_cache_path(cache_dir: &Path, chat_id: i64, message_id: i32) -> PathBuf {
+    cache_dir.join(format!("chat-{chat_id}-message-{message_id}-thumb.jpg"))
+}
+
+fn cached_media_thumbnail_path(cache_dir: &Path, chat_id: i64, message_id: i32) -> Option<PathBuf> {
+    let path = media_thumbnail_cache_path(cache_dir, chat_id, message_id);
+    path.is_file().then_some(path)
 }
 
 async fn download_media_thumbnail(
@@ -489,13 +469,12 @@ async fn download_media_thumbnail(
     let Some(thumbnail) = thumbnail else {
         return Ok(None);
     };
-
-    std::fs::create_dir_all(cache_dir)?;
-    let path = cache_dir.join(format!("chat-{chat_id}-message-{message_id}-thumb.jpg"));
-    if path.exists() {
+    if let Some(path) = cached_media_thumbnail_path(cache_dir, chat_id, message_id) {
         return Ok(Some(path));
     }
 
+    std::fs::create_dir_all(cache_dir)?;
+    let path = media_thumbnail_cache_path(cache_dir, chat_id, message_id);
     client
         .download_media(&Downloadable::PhotoSize(thumbnail), &path)
         .await?;
@@ -594,48 +573,6 @@ fn media_thumbnail(media: &grammers_client::types::Media) -> Option<PhotoSize> {
     };
     thumbs.sort_by_key(PhotoSize::size);
     thumbs.pop()
-}
-
-async fn convert_message_with_media_preview(
-    client: &Client,
-    media_cache_dir: &Path,
-    msg: grammers_client::types::Message,
-    outbox_read_max_id: Option<i32>,
-) -> Message {
-    let is_outgoing = msg.outgoing();
-    let chat = msg.chat();
-    let media = msg.media();
-    let message_media = message_media_with_local_preview(
-        client,
-        media_cache_dir,
-        chat.id(),
-        msg.id(),
-        media.as_ref(),
-    )
-    .await;
-    let thread_topic_id = message_thread_topic_id(msg.raw.reply_to.as_ref());
-
-    Message {
-        id: msg.id(),
-        chat_id: chat.id(),
-        thread_topic_id,
-        sender_name: message_sender_name(
-            is_outgoing,
-            msg.sender().map(|s| s.name().to_string()),
-            msg.raw.post_author.clone(),
-            Some(chat.name().to_string()),
-        ),
-        content: msg.text().to_string(),
-        timestamp: msg.date(),
-        is_own: is_outgoing,
-        is_edited: msg.edit_date().is_some(),
-        reply_to_content: None,
-        media: message_media,
-        status: message_status_for_read_state(is_outgoing, msg.id(), outbox_read_max_id),
-        can_edit: is_outgoing && is_within_edit_window(msg.date()),
-        can_delete: is_outgoing,
-        error: None,
-    }
 }
 
 fn message_preview_from_grammers_message(message: &grammers_client::types::Message) -> String {
@@ -899,8 +836,6 @@ fn folders_from_dialog_filters(
 }
 
 async fn collect_message_page(
-    client: &Client,
-    media_cache_dir: &Path,
     user_name_cache: &Arc<Mutex<UserNameCache>>,
     mut iter: grammers_client::client::messages::MessageIter,
     chat_id: i64,
@@ -912,10 +847,7 @@ async fn collect_message_page(
 
     while let Some(msg) = iter.next().await? {
         cache_sender_name_from_message(user_name_cache, &msg);
-        messages.push(
-            convert_message_with_media_preview(client, media_cache_dir, msg, outbox_read_max_id)
-                .await,
-        );
+        messages.push(convert_message(msg, outbox_read_max_id));
         if messages.len() % 10 == 0 || messages.len() >= limit {
             diagnostics::event(
                 "message_iter_progress",
@@ -999,7 +931,6 @@ fn raw_message_id(message: &tl::enums::Message) -> Option<i32> {
 
 async fn collect_raw_message_page(
     client: &Client,
-    media_cache_dir: &Path,
     user_name_cache: &Arc<Mutex<UserNameCache>>,
     response: tl::enums::messages::Messages,
     chat_id: i64,
@@ -1016,15 +947,7 @@ async fn collect_raw_message_page(
             grammers_client::types::Message::from_raw(client, raw_message, &chat_map)
         {
             cache_sender_name_from_message(user_name_cache, &message);
-            messages.push(
-                convert_message_with_media_preview(
-                    client,
-                    media_cache_dir,
-                    message,
-                    outbox_read_max_id,
-                )
-                .await,
-            );
+            messages.push(convert_message(message, outbox_read_max_id));
         }
     }
 
@@ -1115,7 +1038,6 @@ impl TelegramClient for GrammersClient {
 
             Ok(collect_raw_message_page(
                 &self.client,
-                &self.media_cache_dir,
                 &self.user_name_cache,
                 response,
                 chat_id,
@@ -1159,7 +1081,6 @@ impl TelegramClient for GrammersClient {
 
             Ok(collect_raw_message_page(
                 &self.client,
-                &self.media_cache_dir,
                 &self.user_name_cache,
                 response,
                 chat_id,
@@ -1168,6 +1089,48 @@ impl TelegramClient for GrammersClient {
                 "older_thread",
             )
             .await)
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn load_message_media_preview(
+        &self,
+        chat_id: i64,
+        message_id: i32,
+    ) -> impl std::future::Future<Output = Result<Option<PathBuf>>> + Send + '_ {
+        async move {
+            if let Some(path) =
+                cached_media_thumbnail_path(&self.media_cache_dir, chat_id, message_id)
+            {
+                diagnostics::event(
+                    "media_preview_cache_hit",
+                    format!("chat_id={chat_id} message_id={message_id}"),
+                );
+                return Ok(Some(path));
+            }
+
+            let chat = self.cached_chat(chat_id)?;
+            let mut messages = self.client.get_messages_by_id(&chat, &[message_id]).await?;
+            let Some(message) = messages.pop().flatten() else {
+                return Ok(None);
+            };
+            let Some(media) = message.media() else {
+                return Ok(None);
+            };
+            if !matches!(
+                message_media(Some(&media)).map(|media| media.kind),
+                Some(MessageMediaKind::Photo | MessageMediaKind::Image)
+            ) {
+                return Ok(None);
+            }
+            Ok(download_media_thumbnail(
+                &self.client,
+                &self.media_cache_dir,
+                chat_id,
+                message_id,
+                &media,
+            )
+            .await?)
         }
     }
 
@@ -1379,8 +1342,6 @@ impl TelegramClient for GrammersClient {
             let outbox_read_max_id = self.cached_outbox_read_max_id(chat_id)?;
             let iter = self.client.iter_messages(chat);
             collect_message_page(
-                &self.client,
-                &self.media_cache_dir,
                 &self.user_name_cache,
                 iter,
                 chat_id,
@@ -1404,8 +1365,6 @@ impl TelegramClient for GrammersClient {
             let outbox_read_max_id = self.cached_outbox_read_max_id(chat_id)?;
             let iter = self.client.iter_messages(chat).offset_id(before_message_id);
             collect_message_page(
-                &self.client,
-                &self.media_cache_dir,
                 &self.user_name_cache,
                 iter,
                 chat_id,
@@ -1670,18 +1629,45 @@ impl TelegramClient for GrammersClient {
 mod tests {
     use super::{
         CHAT_CACHE_LOCK_FAILED, CHAT_NOT_FOUND_IN_CACHE_PREFIX, DialogPageParts,
-        UPDATE_ERROR_PREFIX, chat_cache_lock_failed_message, chat_matches_filter_categories,
-        chat_not_found_in_cache_message, delete_message_updates, delete_update_chat_id,
-        dialog_chats_from_page_parts, dumbgram_init_params, folders_from_dialog_filters,
-        input_peers_contain_chat, message_sender_name, message_status_for_read_state,
-        message_thread_topic_id, read_outbox_update_from_raw, typing_status_update_from_raw,
-        typing_status_update_from_raw_with_user_names, update_error_message,
+        UPDATE_ERROR_PREFIX, cached_media_thumbnail_path, chat_cache_lock_failed_message,
+        chat_matches_filter_categories, chat_not_found_in_cache_message, delete_message_updates,
+        delete_update_chat_id, dialog_chats_from_page_parts, dumbgram_init_params,
+        folders_from_dialog_filters, input_peers_contain_chat, message_sender_name,
+        message_status_for_read_state, message_thread_topic_id, read_outbox_update_from_raw,
+        typing_status_update_from_raw, typing_status_update_from_raw_with_user_names,
+        update_error_message,
     };
     use crate::telegram::types::{
         MessageStatus, OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update,
     };
     use grammers_client::grammers_tl_types as tl;
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn cached_media_thumbnail_path_requires_existing_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock should be after epoch")
+            .as_nanos();
+        let cache_dir = std::env::temp_dir().join(format!(
+            "dumbgram-thumbnail-cache-test-{}-{unique}",
+            std::process::id()
+        ));
+        let expected = cache_dir.join("chat-7-message-11-thumb.jpg");
+
+        assert_eq!(cached_media_thumbnail_path(&cache_dir, 7, 11), None);
+        std::fs::create_dir_all(&cache_dir).expect("test cache directory should be created");
+        std::fs::write(&expected, b"cached thumbnail").expect("test thumbnail should be written");
+        assert_eq!(
+            cached_media_thumbnail_path(&cache_dir, 7, 11),
+            Some(expected)
+        );
+
+        std::fs::remove_dir_all(cache_dir).expect("test cache directory should be removed");
+    }
 
     #[test]
     fn grammers_init_params_do_not_replay_offline_update_backlog() {
