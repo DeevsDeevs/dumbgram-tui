@@ -19,6 +19,8 @@ target
 # Local agent/mission state
 .missions/
 .chains/
+.collaboration/
+.artifacts/
 
 # Config, session, and local runtime files
 config.toml

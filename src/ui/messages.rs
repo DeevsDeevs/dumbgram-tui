@@ -3,7 +3,8 @@ use crate::{
     app::App,
     config::Theme,
     state::{
-        FOLDER_LEFT_SCROLL_INDICATOR, FOLDER_RIGHT_SCROLL_INDICATOR, FOLDER_SEPARATOR, FocusedPanel,
+        ConversationLoadStatus, FOLDER_LEFT_SCROLL_INDICATOR, FOLDER_RIGHT_SCROLL_INDICATOR,
+        FOLDER_SEPARATOR, FocusedPanel,
     },
     telegram::types::{MessageStatus, ThreadTopic, message_display_content},
     text::{display_width, truncate_with_ellipsis, wrap_display_lines_limited},
@@ -19,6 +20,8 @@ use ratatui::{
 pub(crate) const MESSAGE_PANEL_LABEL: &str = "Messages";
 pub(crate) const MESSAGE_EMPTY_NO_CHAT_LABEL: &str = "No chat selected";
 pub(crate) const MESSAGE_EMPTY_NO_MESSAGES_LABEL: &str = "No messages loaded";
+pub(crate) const MESSAGE_LOADING_LABEL: &str = "Loading messages…";
+pub(crate) const MESSAGE_LOAD_FAILED_LABEL: &str = "Messages failed to load";
 pub(crate) const MESSAGE_METADATA_SEPARATOR: &str = " · ";
 pub(crate) const EDITED_METADATA_LABEL: &str = "edited";
 pub(crate) const REPLY_LINE_PREFIX: &str = "   ";
@@ -99,7 +102,10 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
     let (items, selected_index) = if app.state.messages.is_empty() {
         (
             vec![ListItem::new(Line::from(Span::raw(
-                message_empty_placeholder(app.state.selected_chat_id().is_some()),
+                message_empty_placeholder(
+                    app.state.selected_chat_id().is_some(),
+                    app.state.conversation_load_status,
+                ),
             )))],
             selected_list_index(app.state.selected_message_index, 0),
         )
@@ -163,11 +169,15 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
     }
 }
 
-pub(crate) fn message_empty_placeholder(has_selected_chat: bool) -> &'static str {
-    if has_selected_chat {
-        MESSAGE_EMPTY_NO_MESSAGES_LABEL
-    } else {
-        MESSAGE_EMPTY_NO_CHAT_LABEL
+pub(crate) fn message_empty_placeholder(
+    has_selected_chat: bool,
+    load_status: ConversationLoadStatus,
+) -> &'static str {
+    match load_status {
+        ConversationLoadStatus::Loading => MESSAGE_LOADING_LABEL,
+        ConversationLoadStatus::Failed => MESSAGE_LOAD_FAILED_LABEL,
+        _ if has_selected_chat => MESSAGE_EMPTY_NO_MESSAGES_LABEL,
+        _ => MESSAGE_EMPTY_NO_CHAT_LABEL,
     }
 }
 
@@ -491,13 +501,17 @@ mod tests {
     use super::{
         DELETE_CONFIRMATION_POPUP_HEIGHT_PERCENT, DELETE_CONFIRMATION_POPUP_WIDTH_PERCENT,
         DELETE_CONFIRMATION_TEXT, DELETE_CONFIRMATION_TITLE, MESSAGE_EMPTY_NO_CHAT_LABEL,
-        MESSAGE_EMPTY_NO_MESSAGES_LABEL, MESSAGE_TITLE_BORDER_RESERVED_COLUMNS, REPLY_LINE_PREFIX,
-        REPLY_MARKER, REPLY_MARKER_SEPARATOR, THREAD_TOPICS_PANEL_TITLE, display_width,
-        message_content_spans, message_empty_placeholder, message_lines, message_metadata,
-        message_panel_title, message_position_label, message_status_label, message_title_width,
-        reply_content_width, thread_topic_label, thread_topic_tab_label, typing_label,
+        MESSAGE_EMPTY_NO_MESSAGES_LABEL, MESSAGE_LOAD_FAILED_LABEL, MESSAGE_LOADING_LABEL,
+        MESSAGE_TITLE_BORDER_RESERVED_COLUMNS, REPLY_LINE_PREFIX, REPLY_MARKER,
+        REPLY_MARKER_SEPARATOR, THREAD_TOPICS_PANEL_TITLE, display_width, message_content_spans,
+        message_empty_placeholder, message_lines, message_metadata, message_panel_title,
+        message_position_label, message_status_label, message_title_width, reply_content_width,
+        thread_topic_label, thread_topic_tab_label, typing_label,
     };
-    use crate::telegram::types::{MessageStatus, ThreadTopic};
+    use crate::{
+        state::ConversationLoadStatus,
+        telegram::types::{MessageStatus, ThreadTopic},
+    };
 
     #[test]
     fn message_position_label_shows_clamped_position() {
@@ -534,14 +548,22 @@ mod tests {
     }
 
     #[test]
-    fn message_empty_placeholder_distinguishes_missing_chat_from_empty_history() {
+    fn message_empty_placeholder_distinguishes_load_states() {
         assert_eq!(
-            message_empty_placeholder(false),
+            message_empty_placeholder(false, ConversationLoadStatus::Idle),
             MESSAGE_EMPTY_NO_CHAT_LABEL
         );
         assert_eq!(
-            message_empty_placeholder(true),
+            message_empty_placeholder(true, ConversationLoadStatus::Empty),
             MESSAGE_EMPTY_NO_MESSAGES_LABEL
+        );
+        assert_eq!(
+            message_empty_placeholder(true, ConversationLoadStatus::Loading),
+            MESSAGE_LOADING_LABEL
+        );
+        assert_eq!(
+            message_empty_placeholder(true, ConversationLoadStatus::Failed),
+            MESSAGE_LOAD_FAILED_LABEL
         );
     }
 

@@ -6,17 +6,33 @@ use super::types::{
 use base64::Engine;
 use chrono::Utc;
 use color_eyre::Result;
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub struct MockTelegramClient {
     connected: bool,
+    typing_action_count: Arc<AtomicUsize>,
 }
 
 impl MockTelegramClient {
     pub fn new() -> Self {
-        Self { connected: false }
+        Self {
+            connected: false,
+            typing_action_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn typing_action_count(&self) -> usize {
+        self.typing_action_count.load(Ordering::Relaxed)
     }
 }
 
@@ -51,6 +67,11 @@ impl Default for MockTelegramClient {
 impl TelegramClient for MockTelegramClient {
     async fn connect(&mut self) -> Result<()> {
         self.connected = true;
+        Ok(())
+    }
+
+    async fn send_typing_action(&self, _chat_id: i64, _topic_id: Option<i32>) -> Result<()> {
+        self.typing_action_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

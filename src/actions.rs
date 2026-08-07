@@ -326,6 +326,7 @@ pub fn begin_open_chat_at(state: &mut AppState, chat_index: usize) -> Option<i64
     state.select_chat(chat_index);
     if old_index != state.selected_chat_index {
         state.clear_loaded_chat_messages();
+        state.begin_conversation_load();
         return state.selected_chat_id();
     }
 
@@ -431,6 +432,7 @@ pub async fn load_selected_thread_topic_messages<C: TelegramClient>(
         return Ok(());
     };
 
+    state.begin_conversation_load();
     match fetch_thread_topic_messages(client, chat_id, topic_id).await {
         Ok(messages) => {
             let max_message_id = messages.iter().map(|message| message.id).max();
@@ -439,7 +441,10 @@ pub async fn load_selected_thread_topic_messages<C: TelegramClient>(
                 mark_thread_read_best_effort(client, chat_id, topic_id, max_message_id).await;
             }
         }
-        Err(error) => state.set_error(error),
+        Err(error) => {
+            state.mark_conversation_load_failed();
+            state.set_error(error);
+        }
     }
 
     Ok(())
@@ -451,6 +456,7 @@ pub async fn load_selected_chat_messages<C: TelegramClient>(
 ) -> Result<()> {
     if let Some(chat_id) = state.selected_chat_id() {
         state.clear_loaded_chat_messages();
+        state.begin_conversation_load();
         match fetch_latest_chat_messages(client, chat_id).await {
             Ok(messages) => {
                 state.apply_loaded_selected_chat_messages(messages);
@@ -459,7 +465,10 @@ pub async fn load_selected_chat_messages<C: TelegramClient>(
                 }
                 mark_chat_read_best_effort(client, chat_id).await;
             }
-            Err(error) => state.set_error(error),
+            Err(error) => {
+                state.mark_conversation_load_failed();
+                state.set_error(error);
+            }
         }
     } else {
         state.clear_loaded_chat_messages();
@@ -705,11 +714,17 @@ pub fn apply_initial_state_load_result(
                     state.clear_loaded_chat_messages();
                 }
                 Ok(messages) => state.apply_loaded_selected_chat_messages(messages),
-                Err(error) => state.set_error(error),
+                Err(error) => {
+                    state.mark_conversation_load_failed();
+                    state.set_error(error);
+                }
             }
             state.apply_loaded_selected_chat_thread_topics(load.thread_topics);
         }
-        Err(error) => state.set_error(error),
+        Err(error) => {
+            state.mark_conversation_load_failed();
+            state.set_error(error);
+        }
     }
 }
 
@@ -805,6 +820,7 @@ pub fn begin_selected_folder_reload(state: &mut AppState) -> Option<(usize, Opti
         state.reset_chat_selection();
     }
     state.clear_loaded_chat_messages();
+    state.begin_conversation_load();
     Some((state.selected_folder_index, folder_id))
 }
 
@@ -823,11 +839,17 @@ pub fn apply_folder_chat_load_result(
                     state.clear_loaded_chat_messages();
                 }
                 Ok(messages) => state.apply_loaded_selected_chat_messages(messages),
-                Err(error) => state.set_error(error),
+                Err(error) => {
+                    state.mark_conversation_load_failed();
+                    state.set_error(error);
+                }
             }
             state.apply_loaded_selected_chat_thread_topics(load.thread_topics);
         }
-        Err(error) => state.set_error(error),
+        Err(error) => {
+            state.mark_conversation_load_failed();
+            state.set_error(error);
+        }
     }
 }
 
@@ -858,6 +880,7 @@ pub fn begin_open_folder_at(
     }
 }
 
+#[cfg(test)]
 pub async fn open_folder_at<C: TelegramClient>(
     state: &mut AppState,
     client: &mut C,
@@ -901,6 +924,7 @@ pub async fn open_previous_folder<C: TelegramClient>(
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn open_chat_at<C: TelegramClient>(
     state: &mut AppState,
     client: &mut C,
@@ -1106,16 +1130,17 @@ pub async fn finish_send_message<C: TelegramClient>(
 mod tests {
     use super::{
         LOAD_CHATS_TIMED_OUT_STATUS, NO_OLDER_MESSAGES_STATUS, apply_initial_state_load_result,
-        begin_open_folder_at, begin_send_message, confirm_delete, download_message_media_result,
-        fetch_folder_chats_and_selected_messages, fetch_initial_state, fetch_latest_chat_messages,
-        finish_send_message, load_initial_state, load_older_messages_failed_error,
-        load_older_selected_chat_messages, load_selected_chat_messages,
-        load_selected_thread_topic_messages, open_chat_at, open_folder_at, open_next_chat,
-        open_next_folder, open_previous_chat, open_previous_folder, reload_selected_folder_chats,
-        send_typing_action_best_effort, submit_message,
+        begin_open_chat_at, begin_open_folder_at, begin_send_message, confirm_delete,
+        download_message_media_result, fetch_folder_chats_and_selected_messages,
+        fetch_initial_state, fetch_latest_chat_messages, finish_send_message, load_initial_state,
+        load_older_messages_failed_error, load_older_selected_chat_messages,
+        load_selected_chat_messages, load_selected_thread_topic_messages, open_chat_at,
+        open_folder_at, open_next_chat, open_next_folder, open_previous_chat, open_previous_folder,
+        reload_selected_folder_chats, send_typing_action_best_effort, submit_message,
     };
     use crate::state::{
-        AppState, DeleteConfirmation, MESSAGE_DELETED_STATUS, NO_CHAT_SELECTED_ERROR,
+        AppState, ConversationLoadStatus, DeleteConfirmation, MESSAGE_DELETED_STATUS,
+        NO_CHAT_SELECTED_ERROR,
     };
     use crate::telegram::types::{
         Chat, Folder, Message, MessageMediaKind, MessageStatus, OWN_SENDER_NAME, ThreadTopic,
@@ -1742,6 +1767,10 @@ mod tests {
         assert_eq!(state.messages.len(), 3);
         assert_eq!(state.selected_folder_index, 0);
         assert_eq!(state.selected_chat_index, 0);
+        assert_eq!(
+            state.conversation_load_status,
+            ConversationLoadStatus::Loaded
+        );
     }
 
     #[test]
@@ -1761,6 +1790,26 @@ mod tests {
         assert!(state.chats.is_empty());
         assert!(state.messages.is_empty());
         assert_eq!(state.error_message.as_deref(), Some("initial unavailable"));
+        assert_eq!(
+            state.conversation_load_status,
+            ConversationLoadStatus::Failed
+        );
+    }
+
+    #[test]
+    fn opening_another_chat_clears_old_content_and_marks_loading() {
+        let mut state = AppState::new();
+        state.chats = vec![chat(1, "Alice"), chat(2, "Bob")];
+        state.messages = vec![message(10, 1, "Alice message")];
+
+        assert_eq!(begin_open_chat_at(&mut state, 1), Some(2));
+
+        assert_eq!(state.selected_chat_id(), Some(2));
+        assert!(state.messages.is_empty());
+        assert_eq!(
+            state.conversation_load_status,
+            ConversationLoadStatus::Loading
+        );
     }
 
     #[tokio::test]
@@ -1862,6 +1911,10 @@ mod tests {
         assert_eq!(state.chats[0].unread_count, 0);
         assert_eq!(state.input_buffer, "draft");
         assert_eq!(state.selected_message_index, 2);
+        assert_eq!(
+            state.conversation_load_status,
+            ConversationLoadStatus::Loaded
+        );
     }
 
     #[tokio::test]
@@ -2351,6 +2404,10 @@ mod tests {
             state.error_message.as_deref(),
             Some(super::LOAD_MESSAGES_TIMED_OUT_STATUS)
         );
+        assert_eq!(
+            state.conversation_load_status,
+            ConversationLoadStatus::Failed
+        );
     }
 
     #[tokio::test]
@@ -2405,6 +2462,10 @@ mod tests {
         assert_eq!(state.message_scroll_offset, 0);
         assert_eq!(state.input_buffer, "");
         assert_eq!(state.error_message.as_deref(), Some("history unavailable"));
+        assert_eq!(
+            state.conversation_load_status,
+            ConversationLoadStatus::Failed
+        );
     }
 
     #[tokio::test]

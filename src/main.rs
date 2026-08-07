@@ -1501,11 +1501,6 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
     let (download_media_tx, mut download_media_rx) = tokio::sync::mpsc::unbounded_channel();
     let download_media_loader = DownloadMediaLoader::new(client.clone(), download_media_tx);
     loop {
-        let draw_started = Instant::now();
-        terminal.draw(|f| ui::render_layout(f, app, theme))?;
-        terminal_images::render_selected_image(terminal.backend_mut(), app)?;
-        log_draw_duration("main_loop", draw_started);
-
         while let Ok(subscribe_result) = subscribe_updates_rx.try_recv() {
             apply_subscribe_updates_result(app, subscribe_result, &mut update_rx);
         }
@@ -1565,6 +1560,11 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
         }
 
         app.state.check_notification_timeout();
+
+        let draw_started = Instant::now();
+        terminal.draw(|f| ui::render_layout(f, app, theme))?;
+        terminal_images::render_selected_image(terminal.backend_mut(), app)?;
+        log_draw_duration("main_loop", draw_started);
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
@@ -2422,7 +2422,10 @@ fn apply_chat_message_load_result<C>(
             }
             app.state.clear_status();
         }
-        Err(error) => app.state.set_error(error),
+        Err(error) => {
+            app.state.mark_conversation_load_failed();
+            app.state.set_error(error);
+        }
     }
 }
 
@@ -3000,21 +3003,21 @@ async fn open_folder_at_with_optional_async_loader<
     folder_chat_loader: &mut Option<&mut FolderChatLoader<C>>,
     index: usize,
 ) -> Result<()> {
+    let Some((folder_index, folder_id)) = actions::begin_open_folder_at(&mut app.state, index)
+    else {
+        return Ok(());
+    };
+
     progress.show(app, LOADING_FOLDER_CHATS_STATUS)?;
     if let Some(loader) = folder_chat_loader.as_deref_mut() {
-        if let Some((folder_index, folder_id)) =
-            actions::begin_open_folder_at(&mut app.state, index)
-        {
-            loader.spawn_folder_chats(folder_index, folder_id);
-        }
+        loader.spawn_folder_chats(folder_index, folder_id);
         return Ok(());
     }
 
-    let result = actions::open_folder_at(&mut app.state, client, index).await;
-    if result.is_ok() {
-        app.state.clear_status();
-    }
-    result
+    let result = actions::fetch_folder_chats_and_selected_messages(client, folder_id).await;
+    actions::apply_folder_chat_load_result(&mut app.state, result);
+    app.state.clear_status();
+    Ok(())
 }
 
 async fn open_selected_thread_topic_with_optional_async_loader<
@@ -3033,6 +3036,7 @@ async fn open_selected_thread_topic_with_optional_async_loader<
         return Ok(());
     };
 
+    app.state.begin_conversation_load();
     progress.show(app, LOADING_CHAT_MESSAGES_STATUS)?;
     if let Some(loader) = chat_message_loader.as_deref_mut() {
         loader.spawn_thread_topic_messages(chat_id, topic_id);
@@ -3055,24 +3059,19 @@ async fn open_chat_at_with_optional_async_loader<
     chat_message_loader: &mut Option<&mut ChatMessageLoader<C>>,
     index: usize,
 ) -> Result<()> {
-    if index >= app.state.chats.len() || app.state.selected_chat_index == index {
+    let Some(chat_id) = actions::begin_open_chat_at(&mut app.state, index) else {
         return Ok(());
-    }
-
-    if let Some(loader) = chat_message_loader.as_deref_mut() {
-        if let Some(chat_id) = actions::begin_open_chat_at(&mut app.state, index) {
-            progress.show(app, LOADING_CHAT_MESSAGES_STATUS)?;
-            loader.spawn_latest_chat_messages(chat_id);
-        }
-        return Ok(());
-    }
+    };
 
     progress.show(app, LOADING_CHAT_MESSAGES_STATUS)?;
-    let result = actions::open_chat_at(&mut app.state, client, index).await;
-    if result.is_ok() {
-        app.state.clear_status();
+    if let Some(loader) = chat_message_loader.as_deref_mut() {
+        loader.spawn_latest_chat_messages(chat_id);
+        return Ok(());
     }
-    result
+
+    actions::load_selected_chat_messages(&mut app.state, client).await?;
+    app.state.clear_status();
+    Ok(())
 }
 
 async fn handle_input_focused<C: TelegramClient + Clone + Send + Sync + 'static>(
@@ -3086,16 +3085,19 @@ async fn handle_input_focused<C: TelegramClient + Clone + Send + Sync + 'static>
 ) -> Result<()> {
     let input_before = app.state.input_buffer.clone();
     let outcome = input_keys::handle_input_key(&mut app.state, key);
-    if outcome != input_keys::InputKeyOutcome::Submit
-        && input_before != app.state.input_buffer
-        && app.state.input_has_submit_text()
-    {
-        if let Some(chat_id) = app.state.selected_chat_id() {
-            let topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
-            let client = client.clone();
-            tokio::spawn(async move {
-                actions::send_typing_action_best_effort(&client, chat_id, topic_id).await;
-            });
+    if outcome != input_keys::InputKeyOutcome::Submit && input_before != app.state.input_buffer {
+        if app.state.input_has_submit_text() {
+            if let Some(chat_id) = app.state.selected_chat_id() {
+                let topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
+                if app.state.typing_action_due(chat_id, topic_id) {
+                    let client = client.clone();
+                    tokio::spawn(async move {
+                        actions::send_typing_action_best_effort(&client, chat_id, topic_id).await;
+                    });
+                }
+            }
+        } else {
+            app.state.reset_typing_action_cooldown();
         }
     }
 
@@ -3290,11 +3292,11 @@ mod tests {
         apply_older_message_load_result, apply_reply_message_result, apply_send_message_result,
         apply_subscribe_updates_result, apply_update_with_read_ack, check_auth_ok_message,
         check_auth_unauthorized_message, check_config_message, check_config_session_status,
-        default_config_path_string, ensure_session_parent_dir, handle_mouse_event,
-        load_checked_config, load_checked_config_with_session_parent, login_2fa_hint_message,
-        login_2fa_signed_in_message, login_code_sent_message, login_failed_message,
-        login_signed_in_message, message_submit_action_status, older_message_key_navigation,
-        open_chat_at_with_optional_async_loader, parse_args_from,
+        default_config_path_string, ensure_session_parent_dir, handle_input_focused,
+        handle_mouse_event, load_checked_config, load_checked_config_with_session_parent,
+        login_2fa_hint_message, login_2fa_signed_in_message, login_code_sent_message,
+        login_failed_message, login_signed_in_message, message_submit_action_status,
+        older_message_key_navigation, open_chat_at_with_optional_async_loader, parse_args_from,
         preserve_prompt_input_line_spaces, require_prompt_line, require_prompt_response,
         save_app_preferences_if_changed, smoke_ok_message, trim_prompt_input_line, validate_config,
     };
@@ -4174,6 +4176,47 @@ mod tests {
                 .is_err(),
             "no-op chat open should not spawn a message loader"
         );
+    }
+
+    #[tokio::test]
+    async fn rapid_typing_sends_once_per_chat_during_cooldown() {
+        let mut app = App::new();
+        app.state.chats = vec![chat(1), chat(2)];
+        app.state.focused_panel = FocusedPanel::Input;
+        let mut client = MockTelegramClient::new();
+        let observer = client.clone();
+        let mut progress = UiProgress::Silent;
+
+        for character in "A multi-sentence message. Still typing.".chars() {
+            handle_input_focused(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut client,
+                &mut progress,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("typing should succeed");
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(observer.typing_action_count(), 1);
+
+        app.state.selected_chat_index = 1;
+        handle_input_focused(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+            &mut client,
+            &mut progress,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("typing after switching chats should succeed");
+        tokio::task::yield_now().await;
+        assert_eq!(observer.typing_action_count(), 2);
     }
 
     #[tokio::test]

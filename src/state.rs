@@ -10,6 +10,7 @@ use ratatui::layout::Rect;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -42,6 +43,7 @@ pub(crate) const CHAT_LIST_ITEM_HEIGHT: u16 = 2;
 pub(crate) const FOLDER_VIEWPORT_RESERVED_COLUMNS: u16 = 4;
 pub(crate) const MESSAGE_ROW_HEIGHT: usize = 1;
 pub(crate) const REPLY_MESSAGE_ROW_HEIGHT: usize = 2;
+pub(crate) const TYPING_ACTION_COOLDOWN: Duration = Duration::from_secs(4);
 
 fn last_index(item_count: usize) -> usize {
     item_count.saturating_sub(1)
@@ -186,6 +188,15 @@ impl FocusedPanel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationLoadStatus {
+    Idle,
+    Loading,
+    Loaded,
+    Empty,
+    Failed,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum OlderHistoryKey {
     Chat(i64),
@@ -265,6 +276,9 @@ pub struct AppState {
     pub delete_confirmation: Option<DeleteConfirmation>,
     pub typing_users: HashMap<i64, Vec<String>>,
     pub thread_typing_users: HashMap<(i64, i32), Vec<String>>,
+    pub conversation_load_status: ConversationLoadStatus,
+    last_typing_action_context: Option<(i64, Option<i32>)>,
+    last_typing_action_at: Option<Instant>,
 }
 
 impl AppState {
@@ -309,6 +323,9 @@ impl AppState {
             delete_confirmation: None,
             typing_users: HashMap::new(),
             thread_typing_users: HashMap::new(),
+            conversation_load_status: ConversationLoadStatus::Idle,
+            last_typing_action_context: None,
+            last_typing_action_at: None,
         }
     }
 
@@ -797,8 +814,10 @@ impl AppState {
         self.clear_selected_chat_older_history_exhausted();
         self.messages = messages;
         if self.messages.is_empty() {
+            self.conversation_load_status = ConversationLoadStatus::Empty;
             self.reset_message_selection();
         } else {
+            self.conversation_load_status = ConversationLoadStatus::Loaded;
             self.select_last_message();
         }
         if let Some(chat) = self.chats.get_mut(self.selected_chat_index) {
@@ -938,6 +957,41 @@ impl AppState {
         self.input_buffer.clear();
         self.input_cursor = 0;
         self.input_scroll_offset = 0;
+        self.conversation_load_status = ConversationLoadStatus::Idle;
+    }
+
+    pub fn begin_conversation_load(&mut self) {
+        self.messages.clear();
+        self.reset_message_selection();
+        self.conversation_load_status = ConversationLoadStatus::Loading;
+    }
+
+    pub fn mark_conversation_load_failed(&mut self) {
+        self.messages.clear();
+        self.reset_message_selection();
+        self.conversation_load_status = ConversationLoadStatus::Failed;
+    }
+
+    pub(crate) fn typing_action_due(&mut self, chat_id: i64, topic_id: Option<i32>) -> bool {
+        self.typing_action_due_at(chat_id, topic_id, Instant::now())
+    }
+
+    fn typing_action_due_at(&mut self, chat_id: i64, topic_id: Option<i32>, now: Instant) -> bool {
+        let context = (chat_id, topic_id);
+        let due = self.last_typing_action_context != Some(context)
+            || self.last_typing_action_at.is_none_or(|sent_at| {
+                now.saturating_duration_since(sent_at) >= TYPING_ACTION_COOLDOWN
+            });
+        if due {
+            self.last_typing_action_context = Some(context);
+            self.last_typing_action_at = Some(now);
+        }
+        due
+    }
+
+    pub(crate) fn reset_typing_action_cooldown(&mut self) {
+        self.last_typing_action_context = None;
+        self.last_typing_action_at = None;
     }
 
     fn input_visible_capacity(&self) -> usize {
@@ -1778,6 +1832,7 @@ impl AppState {
         self.input_buffer.clear();
         self.input_cursor = 0;
         self.input_scroll_offset = 0;
+        self.reset_typing_action_cooldown();
     }
 
     pub fn cancel_compose_mode(&mut self) {
@@ -1903,6 +1958,7 @@ impl AppState {
         self.input_buffer.clear();
         self.input_cursor = 0;
         self.input_scroll_offset = 0;
+        self.reset_typing_action_cooldown();
         self.discard_draft_for_selected_chat();
     }
 
@@ -2039,15 +2095,15 @@ impl Default for AppState {
 mod tests {
     use super::{
         AppState, CANNOT_DELETE_MESSAGE_ERROR, CANNOT_EDIT_MESSAGE_ERROR,
-        CANNOT_REPLY_UNSENT_MESSAGE_ERROR, CHAT_LIST_ITEM_HEIGHT, DEFAULT_SPLIT_RATIO,
-        DeleteConfirmation, FAILED_SEND_DISMISSED_STATUS, FOLDER_VIEWPORT_RESERVED_COLUMNS,
-        FocusedPanel, MAX_SPLIT_RATIO, MESSAGE_DELETED_STATUS, MESSAGE_EDITED_STATUS,
-        MESSAGE_ROW_HEIGHT, MIN_SPLIT_RATIO, MessageSubmitAction, NO_CHAT_SELECTED_ERROR,
-        NOTIFICATION_TIMEOUT_SECONDS, PANEL_BORDER_RESERVED_COLUMNS, PANEL_BORDER_RESERVED_ROWS,
-        REMOTE_EDIT_WHILE_EDITING_STATUS, REPLY_MESSAGE_ROW_HEIGHT, REPLY_SENT_STATUS,
-        SPLIT_RATIO_STEP, delete_failed_error, delete_update_matches_chat, edit_failed_error,
-        last_index, message_visible_row_height, message_visible_row_height_for_width,
-        reply_failed_error, send_failed_error,
+        CANNOT_REPLY_UNSENT_MESSAGE_ERROR, CHAT_LIST_ITEM_HEIGHT, ConversationLoadStatus,
+        DEFAULT_SPLIT_RATIO, DeleteConfirmation, FAILED_SEND_DISMISSED_STATUS,
+        FOLDER_VIEWPORT_RESERVED_COLUMNS, FocusedPanel, MAX_SPLIT_RATIO, MESSAGE_DELETED_STATUS,
+        MESSAGE_EDITED_STATUS, MESSAGE_ROW_HEIGHT, MIN_SPLIT_RATIO, MessageSubmitAction,
+        NO_CHAT_SELECTED_ERROR, NOTIFICATION_TIMEOUT_SECONDS, PANEL_BORDER_RESERVED_COLUMNS,
+        PANEL_BORDER_RESERVED_ROWS, REMOTE_EDIT_WHILE_EDITING_STATUS, REPLY_MESSAGE_ROW_HEIGHT,
+        REPLY_SENT_STATUS, SPLIT_RATIO_STEP, TYPING_ACTION_COOLDOWN, delete_failed_error,
+        delete_update_matches_chat, edit_failed_error, last_index, message_visible_row_height,
+        message_visible_row_height_for_width, reply_failed_error, send_failed_error,
     };
     use crate::telegram::types::{
         Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, ThreadTopic,
@@ -2055,6 +2111,7 @@ mod tests {
     };
     use chrono::{Duration, Utc};
     use ratatui::layout::Rect;
+    use std::time::{Duration as StdDuration, Instant};
 
     const TEST_MESSAGE_AREA_WIDTH: u16 = 80;
     const TEST_VISIBLE_ROW_MESSAGE_AREA_WIDTH: u16 = 40;
@@ -3481,6 +3538,60 @@ mod tests {
 
         assert!(state.status_message.is_none());
         assert!(state.error_message.is_none());
+    }
+
+    #[test]
+    fn conversation_load_status_tracks_loading_success_empty_and_failure() {
+        let mut state = AppState::new();
+        state.messages = vec![message(1)];
+
+        state.begin_conversation_load();
+        assert_eq!(
+            state.conversation_load_status,
+            ConversationLoadStatus::Loading
+        );
+        assert!(state.messages.is_empty());
+
+        state.apply_loaded_selected_chat_messages(vec![message(2)]);
+        assert_eq!(
+            state.conversation_load_status,
+            ConversationLoadStatus::Loaded
+        );
+
+        state.begin_conversation_load();
+        state.apply_loaded_selected_chat_messages(Vec::new());
+        assert_eq!(
+            state.conversation_load_status,
+            ConversationLoadStatus::Empty
+        );
+
+        state.begin_conversation_load();
+        state.mark_conversation_load_failed();
+        assert_eq!(
+            state.conversation_load_status,
+            ConversationLoadStatus::Failed
+        );
+    }
+
+    #[test]
+    fn typing_action_cooldown_resets_for_context_changes() {
+        let mut state = AppState::new();
+        let now = Instant::now();
+
+        assert!(state.typing_action_due_at(1, None, now));
+        assert!(!state.typing_action_due_at(1, None, now + StdDuration::from_secs(1)));
+        assert!(state.typing_action_due_at(2, None, now + StdDuration::from_secs(1)));
+        assert!(state.typing_action_due_at(2, Some(10), now + StdDuration::from_secs(2)));
+        assert!(state.typing_action_due_at(1, None, now + StdDuration::from_secs(2)));
+        assert!(!state.typing_action_due_at(1, None, now + StdDuration::from_secs(3)));
+        assert!(state.typing_action_due_at(
+            1,
+            None,
+            now + StdDuration::from_secs(2) + TYPING_ACTION_COOLDOWN
+        ));
+
+        state.reset_typing_action_cooldown();
+        assert!(state.typing_action_due_at(1, None, now + StdDuration::from_secs(3)));
     }
 
     #[test]
