@@ -62,7 +62,7 @@ mod tests {
     };
     use crate::{
         app::App,
-        state::DeleteConfirmation,
+        state::{ContextMenuTarget, DeleteConfirmation},
         telegram::types::{Chat, Message, MessageStatus, ThreadTopic},
     };
     use chrono::Utc;
@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn delete_popup_clear_prevents_underlying_message_bleed() {
         let mut app = app_with_selected_message("UNDERLYING ".repeat(300));
-        app.state.delete_confirmation = Some(DeleteConfirmation {
+        app.state.set_delete_confirmation(DeleteConfirmation {
             chat_id: 1,
             message_id: 10,
         });
@@ -194,6 +194,60 @@ mod tests {
 
         assert!(rendered_popup.contains("Delete?"));
         assert!(!rendered_popup.contains("UNDERLYING"));
+    }
+
+    #[test]
+    fn context_menu_clear_preserves_transparency_and_blocks_underlying_text() {
+        let mut app = app_with_selected_message("UNDERLYING ".repeat(300));
+        app.state.screen_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        assert!(app.state.open_context_menu(
+            ContextMenuTarget::Message {
+                chat_id: 1,
+                message_id: 10,
+            },
+            79,
+            23,
+        ));
+
+        let buffer = render_app_to_buffer_for_test(&mut app);
+        let menu = app.state.context_menu_rect().expect("menu should render");
+        let rendered = menu
+            .rows()
+            .flat_map(|row| row.columns())
+            .map(|position| buffer[position].symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Reply"));
+        assert!(!rendered.contains("UNDERLYING"));
+        for position in menu.rows().flat_map(|row| row.columns()) {
+            assert!(matches!(
+                buffer[position].bg,
+                Color::Reset | Color::DarkGray
+            ));
+        }
+    }
+
+    #[test]
+    fn offscreen_active_chat_does_not_force_selection_highlight_into_scrolled_view() {
+        let mut app = app_with_selected_message("Hello".to_string());
+        app.state.chats.extend((2..=8).map(|id| Chat {
+            id,
+            name: format!("Chat {id}"),
+            last_message: None,
+            unread_count: 0,
+            is_group: false,
+            folder_id: None,
+        }));
+        app.state.chat_scroll_offset = 3;
+
+        let buffer = render_app_to_buffer_for_test(&mut app);
+        assert!(
+            app.state
+                .chats_area
+                .rows()
+                .flat_map(|row| row.columns())
+                .all(|position| buffer[position].bg != Color::DarkGray)
+        );
     }
 
     #[test]

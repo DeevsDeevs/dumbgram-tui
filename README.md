@@ -133,7 +133,9 @@ Message actions:
 Mouse:
 
 - Click folders, chats, messages, or input to focus/select.
-- Click a chat to load it. Chat-list scrolling only focuses the chat list; use keyboard arrows or clicks to change chats.
+- Click a chat to load it; scroll the chat list without opening another conversation.
+- Right-click a chat or message for its available actions. Use the mouse or `Up`/`Down` and `Enter`; `Esc` closes the menu.
+- Drag the divider between chats and messages to resize the conversation panes.
 - Scroll messages to move selection. Use `Up` or `PageUp` at the first loaded message to request older history.
 - Mouse input is ignored while a delete confirmation prompt is open.
 

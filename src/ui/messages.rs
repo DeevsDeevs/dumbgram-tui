@@ -134,11 +134,15 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(if app.state.focused_panel == FocusedPanel::Messages {
-                    Style::default().fg(theme.border_focused)
-                } else {
-                    Style::default().fg(theme.border)
-                })
+                .border_style(
+                    if app.state.focused_panel == FocusedPanel::Messages
+                        || app.state.split_drag_active
+                    {
+                        Style::default().fg(theme.border_focused)
+                    } else {
+                        Style::default().fg(theme.border)
+                    },
+                )
                 .title(title),
         )
         .highlight_style(
@@ -152,7 +156,7 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
     let mut list_state = ListState::default().with_selected(selected_index);
     frame.render_stateful_widget(list, area, &mut list_state);
 
-    if app.state.delete_confirmation.is_some() {
+    if app.state.delete_confirmation().is_some() {
         let popup_area = centered_rect(
             DELETE_CONFIRMATION_POPUP_WIDTH_PERCENT,
             DELETE_CONFIRMATION_POPUP_HEIGHT_PERCENT,

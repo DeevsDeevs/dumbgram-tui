@@ -76,11 +76,14 @@ pub fn render_chats(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, t
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(if app.state.focused_panel == FocusedPanel::Chats {
-                    Style::default().fg(theme.border_focused)
-                } else {
-                    Style::default().fg(theme.border)
-                })
+                .border_style(
+                    if app.state.focused_panel == FocusedPanel::Chats || app.state.split_drag_active
+                    {
+                        Style::default().fg(theme.border_focused)
+                    } else {
+                        Style::default().fg(theme.border)
+                    },
+                )
                 .title(title),
         )
         .highlight_style(
@@ -104,6 +107,9 @@ pub fn render_chats(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, t
     } else {
         app.state.chat_scroll_offset
     };
+    let selected_index = selected_index.filter(|selected| {
+        *selected >= offset && *selected < offset + app.state.chat_visible_capacity()
+    });
 
     let mut list_state = ListState::default()
         .with_offset(offset)

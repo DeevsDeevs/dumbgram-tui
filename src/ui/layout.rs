@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
 pub(crate) const HELP_SEPARATOR: &str = " · ";
@@ -44,6 +44,7 @@ const SLOW_RENDER_LOG_THRESHOLD_MS: u128 = 100;
 
 pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
     let render_started = diagnostics::enabled().then(Instant::now);
+    app.state.screen_area = frame.area();
 
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.background)),
@@ -131,6 +132,8 @@ pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
         render_status_banner(frame, main_chunks[banner_index], status, theme);
     }
 
+    render_context_menu(frame, app, theme);
+
     if let Some(started) = render_started {
         let elapsed_ms = started.elapsed().as_millis();
         if elapsed_ms >= SLOW_RENDER_LOG_THRESHOLD_MS {
@@ -149,6 +152,29 @@ pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
             );
         }
     }
+}
+
+fn render_context_menu(frame: &mut Frame, app: &App, theme: &Theme) {
+    let (Some(menu), Some(area)) = (app.state.context_menu(), app.state.context_menu_rect()) else {
+        return;
+    };
+    let items = menu
+        .actions
+        .iter()
+        .map(|action| ListItem::new(action.label()))
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" Actions "))
+        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .highlight_style(
+            Style::default()
+                .fg(theme.selection_foreground)
+                .bg(theme.selection)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut state = ListState::default().with_selected(Some(menu.highlighted));
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn message_and_image_areas(area: Rect, app: &App) -> (Rect, Rect) {
@@ -203,8 +229,10 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 }
 
 fn help_bar_controls(app: &App) -> String {
-    if app.state.delete_confirmation.is_some() {
+    if app.state.delete_confirmation().is_some() {
         join_help_controls(&["Confirm delete: y yes", "n/Esc/Ctrl-C cancel"])
+    } else if app.state.context_menu().is_some() {
+        join_help_controls(&["Menu: Up/Down choose", "Enter select", "Esc close"])
     } else if app.state.editing_message_id.is_some() {
         if app.state.focused_panel != FocusedPanel::Input {
             let edit_label = if app.state.input_has_submit_text() {
@@ -629,7 +657,7 @@ mod tests {
     #[test]
     fn help_bar_modes_use_unicode_separators() {
         let mut confirm = App::new();
-        confirm.state.delete_confirmation = Some(DeleteConfirmation {
+        confirm.state.set_delete_confirmation(DeleteConfirmation {
             chat_id: 10,
             message_id: 20,
         });

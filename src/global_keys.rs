@@ -8,7 +8,7 @@ pub enum GlobalKeyOutcome {
 }
 
 pub fn handle_global_key(state: &mut AppState, key: KeyEvent) -> GlobalKeyOutcome {
-    if key.code == KeyCode::Tab && state.delete_confirmation.is_none() {
+    if key.code == KeyCode::Tab && state.delete_confirmation().is_none() {
         state.focus_next_panel();
         return GlobalKeyOutcome::Handled;
     }
@@ -58,7 +58,7 @@ mod tests {
     fn tab_is_left_for_confirmation_prompt_when_delete_confirmation_is_open() {
         let mut state = AppState::new();
         state.focused_panel = FocusedPanel::Folders;
-        state.delete_confirmation = Some(DeleteConfirmation {
+        state.set_delete_confirmation(DeleteConfirmation {
             chat_id: 1,
             message_id: 2,
         });

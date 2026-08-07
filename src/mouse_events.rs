@@ -1,5 +1,8 @@
 use crate::{
-    state::{AppState, FocusedPanel, message_visible_row_height_for_width_capped},
+    state::{
+        AppState, ContextMenuAction, ContextMenuTarget, FocusedPanel,
+        message_visible_row_height_for_width_capped,
+    },
     telegram::types::message_display_content,
     text::{char_display_width, display_width},
     ui::{self, SELECTED_ROW_SYMBOL},
@@ -20,17 +23,36 @@ pub enum MouseClickOutcome {
     OpenChatAt(usize),
     OpenThreadTopicAt(usize),
     OpenLink(String),
+    ContextMenuAction(ContextMenuTarget, ContextMenuAction),
     Ignored,
 }
 
 pub fn handle_mouse_scroll(state: &mut AppState, mouse_event: MouseEvent) -> MouseScrollOutcome {
+    let is_scroll = matches!(
+        mouse_event.kind,
+        MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+    );
+    if !is_scroll {
+        return MouseScrollOutcome::Ignored;
+    }
+    if state.split_drag_active || state.context_menu().is_some() {
+        return MouseScrollOutcome::Handled;
+    }
+
     let position = Position::new(mouse_event.column, mouse_event.row);
 
     match mouse_event.kind {
-        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
-            if state.chats_area.contains(position) =>
-        {
+        MouseEventKind::ScrollDown if state.chats_area.contains(position) => {
             state.focused_panel = FocusedPanel::Chats;
+            state.scroll_chats(1);
+            MouseScrollOutcome::Handled
+        }
+        MouseEventKind::ScrollUp if state.chats_area.contains(position) => {
+            state.focused_panel = FocusedPanel::Chats;
+            state.scroll_chats(-1);
             MouseScrollOutcome::Handled
         }
         MouseEventKind::ScrollDown if state.messages_area.contains(position) => {
@@ -47,14 +69,99 @@ pub fn handle_mouse_scroll(state: &mut AppState, mouse_event: MouseEvent) -> Mou
     }
 }
 
-pub fn handle_mouse_click(state: &mut AppState, mouse_event: MouseEvent) -> MouseClickOutcome {
-    if !matches!(mouse_event.kind, MouseEventKind::Down(MouseButton::Left)) {
-        return MouseClickOutcome::Ignored;
-    }
+fn panel_inner_contains(area: ratatui::layout::Rect, position: Position) -> bool {
+    position.x > area.x
+        && position.x < area.x.saturating_add(area.width).saturating_sub(1)
+        && position.y > area.y
+        && position.y < area.y.saturating_add(area.height).saturating_sub(1)
+}
 
+fn chat_index_at(state: &AppState, x: u16, y: u16) -> Option<usize> {
+    if !panel_inner_contains(state.chats_area, Position::new(x, y)) || state.chats.is_empty() {
+        return None;
+    }
+    let relative_y = y.saturating_sub(state.chats_area.y + 1);
+    let display_offset = if state.chat_search_active() {
+        state.chat_search_scroll_offset
+    } else {
+        state.chat_scroll_offset
+    };
+    let display_index = display_offset + (relative_y / 2) as usize;
+    state.chat_display_indices().get(display_index).copied()
+}
+
+pub fn handle_mouse_click(state: &mut AppState, mouse_event: MouseEvent) -> MouseClickOutcome {
     let x = mouse_event.column;
     let y = mouse_event.row;
     let position = Position::new(x, y);
+
+    if state.split_drag_active {
+        match mouse_event.kind {
+            MouseEventKind::Drag(MouseButton::Left) => state.drag_split_to(x),
+            MouseEventKind::Up(MouseButton::Left) => state.end_split_drag(),
+            _ => {}
+        }
+        return MouseClickOutcome::Handled;
+    }
+
+    if state.context_menu().is_some() {
+        match mouse_event.kind {
+            MouseEventKind::Moved => state.hover_context_menu_at(x, y),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(index) = state.context_menu_item_at(x, y) {
+                    if let Some((target, action)) = state.take_context_menu_action(index) {
+                        return MouseClickOutcome::ContextMenuAction(target, action);
+                    }
+                } else {
+                    state.close_context_menu();
+                }
+            }
+            _ => {}
+        }
+        return MouseClickOutcome::Handled;
+    }
+
+    if matches!(mouse_event.kind, MouseEventKind::Down(MouseButton::Left))
+        && state.split_divider_contains(x, y)
+    {
+        state.begin_split_drag(x);
+        return MouseClickOutcome::Handled;
+    }
+
+    if matches!(mouse_event.kind, MouseEventKind::Down(MouseButton::Right)) {
+        if let Some(chat_index) = chat_index_at(state, x, y) {
+            state.focused_panel = FocusedPanel::Chats;
+            let chat_id = state.chats[chat_index].id;
+            state.open_context_menu(ContextMenuTarget::Chat { chat_id }, x, y);
+            return MouseClickOutcome::Handled;
+        }
+        if panel_inner_contains(state.messages_area, position) {
+            let relative_y = y.saturating_sub(state.messages_area.y + 1) as usize;
+            if let Some(message_index) = state.message_index_at_visible_row(relative_y) {
+                state.focused_panel = FocusedPanel::Messages;
+                state.selected_message_index = message_index;
+                state.ensure_selected_message_visible();
+                let (chat_id, message_id) = {
+                    let message = &state.messages[message_index];
+                    (message.chat_id, message.id)
+                };
+                state.open_context_menu(
+                    ContextMenuTarget::Message {
+                        chat_id,
+                        message_id,
+                    },
+                    x,
+                    y,
+                );
+            }
+            return MouseClickOutcome::Handled;
+        }
+        return MouseClickOutcome::Ignored;
+    }
+
+    if !matches!(mouse_event.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return MouseClickOutcome::Ignored;
+    }
 
     if state.folders_area.contains(position) {
         state.focused_panel = FocusedPanel::Folders;
@@ -69,31 +176,16 @@ pub fn handle_mouse_click(state: &mut AppState, mouse_event: MouseEvent) -> Mous
         } else {
             MouseClickOutcome::Handled
         }
-    } else if state.chats_area.contains(position) {
+    } else if let Some(chat_index) = chat_index_at(state, x, y) {
         state.focused_panel = FocusedPanel::Chats;
-
-        if state.chats.is_empty() {
-            return MouseClickOutcome::Handled;
-        }
-
-        let border_offset = 1;
-        let relative_y = y.saturating_sub(state.chats_area.y + border_offset);
-        let height_per_chat = 2;
-        let display_offset = if state.chat_search_active() {
-            state.chat_search_scroll_offset
-        } else {
-            state.chat_scroll_offset
-        };
-        let display_index = display_offset + (relative_y / height_per_chat) as usize;
-        let display_indices = state.chat_display_indices();
-        let Some(chat_index) = display_indices.get(display_index).copied() else {
-            return MouseClickOutcome::Handled;
-        };
         if chat_index == state.selected_chat_index {
             MouseClickOutcome::Handled
         } else {
             MouseClickOutcome::OpenChatAt(chat_index)
         }
+    } else if state.chats_area.contains(position) {
+        state.focused_panel = FocusedPanel::Chats;
+        MouseClickOutcome::Handled
     } else if state.thread_topics_area.contains(position) {
         state.focused_panel = FocusedPanel::Messages;
         let relative_x = x.saturating_sub(state.thread_topics_area.x + 1) as usize;
@@ -250,10 +342,10 @@ fn link_in_wrapped_line_at_column(
 #[cfg(test)]
 mod tests {
     use super::{MouseClickOutcome, MouseScrollOutcome, handle_mouse_click, handle_mouse_scroll};
-    use crate::state::{AppState, FocusedPanel};
+    use crate::state::{AppState, ContextMenuTarget, FocusedPanel};
     use crate::telegram::types::{Chat, Folder, Message, MessageStatus, ThreadTopic, all_folder};
     use chrono::Utc;
-    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -322,7 +414,7 @@ mod tests {
     fn chat_scroll_focuses_chats_without_opening_or_loading_chat() {
         let mut state = AppState::new();
         state.chats_area = Rect::new(10, 5, 20, 8);
-        state.chats = vec![chat(1, "Chat 1"), chat(2, "Chat 2")];
+        state.chats = (1..=5).map(|id| chat(id, &format!("Chat {id}"))).collect();
         state.focused_panel = FocusedPanel::Messages;
 
         assert_eq!(
@@ -331,15 +423,16 @@ mod tests {
         );
         assert_eq!(state.focused_panel, FocusedPanel::Chats);
         assert_eq!(state.selected_chat_index, 0);
+        assert_eq!(state.chat_scroll_offset, 1);
 
-        state.selected_chat_index = 1;
         state.focused_panel = FocusedPanel::Messages;
         assert_eq!(
             handle_mouse_scroll(&mut state, mouse(MouseEventKind::ScrollUp, 11, 6)),
             MouseScrollOutcome::Handled
         );
         assert_eq!(state.focused_panel, FocusedPanel::Chats);
-        assert_eq!(state.selected_chat_index, 1);
+        assert_eq!(state.selected_chat_index, 0);
+        assert_eq!(state.chat_scroll_offset, 0);
     }
 
     #[test]
@@ -607,6 +700,123 @@ mod tests {
             ),
             MouseClickOutcome::Handled
         );
+    }
+
+    #[test]
+    fn right_click_opens_stable_context_targets_and_menu_blocks_wheel() {
+        let mut state = AppState::new();
+        state.screen_area = Rect::new(0, 0, 80, 24);
+        state.chats_area = Rect::new(0, 5, 30, 8);
+        state.messages_area = Rect::new(30, 5, 50, 8);
+        state.chats = (1..=5).map(|id| chat(id, &format!("Chat {id}"))).collect();
+        state.messages = vec![message(1), message(2)];
+
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(MouseEventKind::Down(MouseButton::Right), 2, 8)
+            ),
+            MouseClickOutcome::Handled
+        );
+        assert_eq!(state.selected_chat_index, 0);
+        assert!(matches!(
+            state.context_menu().map(|menu| menu.target),
+            Some(ContextMenuTarget::Chat { chat_id: 2 })
+        ));
+
+        assert_eq!(
+            handle_mouse_scroll(&mut state, mouse(MouseEventKind::ScrollDown, 2, 6)),
+            MouseScrollOutcome::Handled
+        );
+        assert_eq!(state.chat_scroll_offset, 0);
+
+        let outside_click = mouse(MouseEventKind::Down(MouseButton::Left), 79, 0);
+        assert_eq!(
+            handle_mouse_scroll(&mut state, outside_click),
+            MouseScrollOutcome::Ignored
+        );
+        assert_eq!(
+            handle_mouse_click(&mut state, outside_click),
+            MouseClickOutcome::Handled
+        );
+        assert!(state.context_menu().is_none());
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(MouseEventKind::Down(MouseButton::Right), 29, 6)
+            ),
+            MouseClickOutcome::Ignored
+        );
+        assert!(state.context_menu().is_none());
+
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(MouseEventKind::Down(MouseButton::Right), 32, 7)
+            ),
+            MouseClickOutcome::Handled
+        );
+        assert_eq!(state.selected_message_index, 1);
+        assert!(matches!(
+            state.context_menu().map(|menu| menu.target),
+            Some(ContextMenuTarget::Message {
+                chat_id: 7,
+                message_id: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn divider_drag_exclusively_captures_mouse_until_release() {
+        let mut state = AppState::new();
+        state.screen_area = Rect::new(0, 0, 100, 24);
+        state.chats_area = Rect::new(0, 5, 30, 8);
+        state.messages_area = Rect::new(30, 5, 70, 8);
+        state.chats = (1..=5).map(|id| chat(id, &format!("Chat {id}"))).collect();
+
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(MouseEventKind::Down(MouseButton::Left), 29, 6)
+            ),
+            MouseClickOutcome::Handled
+        );
+        assert!(state.split_drag_active);
+
+        assert_eq!(
+            handle_mouse_scroll(&mut state, mouse(MouseEventKind::ScrollDown, 2, 6)),
+            MouseScrollOutcome::Handled
+        );
+        assert_eq!(state.chat_scroll_offset, 0);
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(MouseEventKind::Down(MouseButton::Right), 2, 6)
+            ),
+            MouseClickOutcome::Handled
+        );
+        assert!(state.context_menu().is_none());
+
+        handle_mouse_click(
+            &mut state,
+            mouse(MouseEventKind::Drag(MouseButton::Left), 29, 6),
+        );
+        assert_eq!(state.split_ratio, crate::state::DEFAULT_SPLIT_RATIO);
+
+        let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 60, 6);
+        assert_eq!(
+            handle_mouse_scroll(&mut state, drag),
+            MouseScrollOutcome::Ignored
+        );
+        handle_mouse_click(&mut state, drag);
+        assert_eq!(state.split_ratio, 0.6);
+        let release = mouse(MouseEventKind::Up(MouseButton::Left), 120, 30);
+        assert_eq!(
+            handle_mouse_scroll(&mut state, release),
+            MouseScrollOutcome::Ignored
+        );
+        handle_mouse_click(&mut state, release);
+        assert!(!state.split_drag_active);
     }
 
     #[test]

@@ -143,7 +143,7 @@ mod tests {
             handle_message_key(&mut state, key(KeyCode::Char('d'))),
             MessageKeyOutcome::Handled
         );
-        assert!(state.delete_confirmation.is_some_and(|confirmation| {
+        assert!(state.delete_confirmation().is_some_and(|confirmation| {
             confirmation.chat_id == 7 && confirmation.message_id == 42
         }));
     }

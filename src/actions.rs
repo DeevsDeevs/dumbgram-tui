@@ -104,8 +104,8 @@ pub struct PendingSend {
 }
 
 pub fn begin_confirm_delete(state: &mut AppState) -> Option<DeleteConfirmation> {
-    let confirmation = state.delete_confirmation?;
-    state.delete_confirmation = None;
+    let confirmation = state.delete_confirmation()?;
+    state.cancel_delete_confirmation();
     Some(confirmation)
 }
 
@@ -2496,7 +2496,7 @@ mod tests {
         let mut state = AppState::new();
         state.messages = vec![message(1, 10, "keep"), message(2, 10, "delete")];
         state.selected_message_index = 1;
-        state.delete_confirmation = Some(DeleteConfirmation {
+        state.set_delete_confirmation(DeleteConfirmation {
             chat_id: 10,
             message_id: 2,
         });
@@ -2507,7 +2507,7 @@ mod tests {
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].id, 1);
         assert_eq!(state.selected_message_index, 0);
-        assert!(state.delete_confirmation.is_none());
+        assert!(state.delete_confirmation().is_none());
         assert_eq!(
             state.status_message.as_deref(),
             Some(MESSAGE_DELETED_STATUS)

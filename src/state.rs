@@ -34,6 +34,7 @@ pub(crate) const FAILED_SEND_DISMISSED_STATUS: &str = "Failed send dismissed";
 pub(crate) const REMOTE_EDIT_WHILE_EDITING_STATUS: &str = "Message updated remotely while editing";
 pub(crate) const DEFAULT_SPLIT_RATIO: f32 = 0.3;
 pub(crate) const SPLIT_RATIO_STEP: f32 = 0.05;
+pub(crate) const SPLIT_DRAG_THRESHOLD_COLUMNS: u16 = 1;
 pub(crate) const MIN_SPLIT_RATIO: f32 = 0.1;
 pub(crate) const MAX_SPLIT_RATIO: f32 = 0.9;
 pub(crate) const NOTIFICATION_TIMEOUT_SECONDS: u64 = 5;
@@ -211,6 +212,60 @@ pub struct DeleteConfirmation {
     pub message_id: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuTarget {
+    Chat { chat_id: i64 },
+    Message { chat_id: i64, message_id: i32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuAction {
+    OpenChat,
+    MarkChatRead,
+    CopyChatName,
+    ReplyMessage,
+    EditMessage,
+    CopyMessageText,
+    OpenMessageLink,
+    SaveMessageMedia,
+    OpenDownloadedMedia,
+    DeleteMessage,
+    DismissFailedSend,
+}
+
+impl ContextMenuAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenChat => "Open",
+            Self::MarkChatRead => "Mark read",
+            Self::CopyChatName => "Copy chat name",
+            Self::ReplyMessage => "Reply",
+            Self::EditMessage => "Edit",
+            Self::CopyMessageText => "Copy text",
+            Self::OpenMessageLink => "Open link",
+            Self::SaveMessageMedia => "Save media",
+            Self::OpenDownloadedMedia => "Open saved media",
+            Self::DeleteMessage => "Delete",
+            Self::DismissFailedSend => "Dismiss failed send",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextMenuState {
+    pub target: ContextMenuTarget,
+    pub column: u16,
+    pub row: u16,
+    pub highlighted: usize,
+    pub actions: Vec<ContextMenuAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModalState {
+    DeleteConfirmation(DeleteConfirmation),
+    ContextMenu(ContextMenuState),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageSubmitAction {
     Edit {
@@ -260,7 +315,10 @@ pub struct AppState {
     cached_folder_chats: HashMap<Option<i32>, Vec<Chat>>,
     older_history_exhausted: HashSet<OlderHistoryKey>,
     pub split_ratio: f32,
+    pub split_drag_active: bool,
+    split_drag_origin: Option<u16>,
     pub show_help_bar: bool,
+    pub screen_area: Rect,
     pub folders_area: Rect,
     pub chats_area: Rect,
     pub messages_area: Rect,
@@ -275,7 +333,7 @@ pub struct AppState {
     pub status_message: Option<String>,
     pub status_timestamp: Option<tokio::time::Instant>,
     pub last_downloaded_media: Option<DownloadedMediaReference>,
-    pub delete_confirmation: Option<DeleteConfirmation>,
+    pub modal: Option<ModalState>,
     pub typing_users: HashMap<i64, Vec<String>>,
     pub thread_typing_users: HashMap<(i64, i32), Vec<String>>,
     pub conversation_load_status: ConversationLoadStatus,
@@ -307,7 +365,10 @@ impl AppState {
             cached_folder_chats: HashMap::new(),
             older_history_exhausted: HashSet::new(),
             split_ratio: DEFAULT_SPLIT_RATIO,
+            split_drag_active: false,
+            split_drag_origin: None,
             show_help_bar: true,
+            screen_area: Rect::default(),
             folders_area: Rect::default(),
             chats_area: Rect::default(),
             messages_area: Rect::default(),
@@ -322,7 +383,7 @@ impl AppState {
             status_message: None,
             status_timestamp: None,
             last_downloaded_media: None,
-            delete_confirmation: None,
+            modal: None,
             typing_users: HashMap::new(),
             thread_typing_users: HashMap::new(),
             conversation_load_status: ConversationLoadStatus::Idle,
@@ -333,6 +394,260 @@ impl AppState {
 
     pub fn toggle_help_bar(&mut self) {
         self.show_help_bar = !self.show_help_bar;
+    }
+
+    pub fn delete_confirmation(&self) -> Option<DeleteConfirmation> {
+        match self.modal.as_ref() {
+            Some(ModalState::DeleteConfirmation(confirmation)) => Some(*confirmation),
+            _ => None,
+        }
+    }
+
+    pub fn context_menu(&self) -> Option<&ContextMenuState> {
+        match self.modal.as_ref() {
+            Some(ModalState::ContextMenu(menu)) => Some(menu),
+            _ => None,
+        }
+    }
+
+    pub fn context_menu_mut(&mut self) -> Option<&mut ContextMenuState> {
+        match self.modal.as_mut() {
+            Some(ModalState::ContextMenu(menu)) => Some(menu),
+            _ => None,
+        }
+    }
+
+    pub fn set_delete_confirmation(&mut self, confirmation: DeleteConfirmation) {
+        self.modal = Some(ModalState::DeleteConfirmation(confirmation));
+    }
+
+    pub fn close_context_menu(&mut self) {
+        if matches!(self.modal.as_ref(), Some(ModalState::ContextMenu(_))) {
+            self.modal = None;
+        }
+    }
+
+    pub fn context_actions_for_target(&self, target: ContextMenuTarget) -> Vec<ContextMenuAction> {
+        match target {
+            ContextMenuTarget::Chat { chat_id } => {
+                let Some(chat) = self.chats.iter().find(|chat| chat.id == chat_id) else {
+                    return Vec::new();
+                };
+                let mut actions = vec![ContextMenuAction::OpenChat];
+                if chat.unread_count > 0 {
+                    actions.push(ContextMenuAction::MarkChatRead);
+                }
+                actions.push(ContextMenuAction::CopyChatName);
+                actions
+            }
+            ContextMenuTarget::Message {
+                chat_id,
+                message_id,
+            } => {
+                let Some(message) = self
+                    .messages
+                    .iter()
+                    .find(|message| message.chat_id == chat_id && message.id == message_id)
+                else {
+                    return Vec::new();
+                };
+                let actionable = Self::is_remote_actionable_message(message);
+                let mut actions = Vec::new();
+                if actionable {
+                    actions.push(ContextMenuAction::ReplyMessage);
+                }
+                if message.is_own && message.can_edit && actionable {
+                    actions.push(ContextMenuAction::EditMessage);
+                }
+                if !message.content.trim().is_empty() {
+                    actions.push(ContextMenuAction::CopyMessageText);
+                }
+                if crate::links::first_url(&message.content).is_some() {
+                    actions.push(ContextMenuAction::OpenMessageLink);
+                }
+                if message
+                    .media
+                    .as_ref()
+                    .is_some_and(|media| media.kind.is_downloadable())
+                {
+                    actions.push(ContextMenuAction::SaveMessageMedia);
+                }
+                if self
+                    .last_downloaded_media
+                    .as_ref()
+                    .is_some_and(|downloaded| {
+                        downloaded.chat_id == chat_id && downloaded.message_id == message_id
+                    })
+                {
+                    actions.push(ContextMenuAction::OpenDownloadedMedia);
+                }
+                if message.status == MessageStatus::Failed {
+                    actions.push(ContextMenuAction::DismissFailedSend);
+                } else if message.is_own && message.can_delete && actionable {
+                    actions.push(ContextMenuAction::DeleteMessage);
+                }
+                actions
+            }
+        }
+    }
+
+    pub fn open_context_menu(&mut self, target: ContextMenuTarget, column: u16, row: u16) -> bool {
+        if matches!(self.modal.as_ref(), Some(ModalState::DeleteConfirmation(_))) {
+            return false;
+        }
+        let actions = self.context_actions_for_target(target);
+        if actions.is_empty() {
+            return false;
+        }
+        self.modal = Some(ModalState::ContextMenu(ContextMenuState {
+            target,
+            column,
+            row,
+            highlighted: 0,
+            actions,
+        }));
+        true
+    }
+
+    pub fn context_menu_rect(&self) -> Option<Rect> {
+        let menu = self.context_menu()?;
+        let width = menu
+            .actions
+            .iter()
+            .map(|action| display_width(action.label()))
+            .max()
+            .unwrap_or(0) as u16
+            + 4;
+        let width = width.max(14).min(self.screen_area.width.max(1));
+        let height = (menu.actions.len() as u16 + 2).min(self.screen_area.height.max(1));
+        let column = menu
+            .column
+            .min(self.screen_area.x + self.screen_area.width.saturating_sub(width));
+        let row = menu
+            .row
+            .min(self.screen_area.y + self.screen_area.height.saturating_sub(height));
+        Some(Rect::new(column, row, width, height))
+    }
+
+    pub fn context_menu_item_at(&self, column: u16, row: u16) -> Option<usize> {
+        let area = self.context_menu_rect()?;
+        let inner = Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        );
+        if !inner.contains(ratatui::layout::Position::new(column, row)) {
+            return None;
+        }
+        let index = row.saturating_sub(inner.y) as usize;
+        (index < self.context_menu()?.actions.len()).then_some(index)
+    }
+
+    pub fn hover_context_menu_at(&mut self, column: u16, row: u16) {
+        let hovered = self.context_menu_item_at(column, row);
+        if let (Some(index), Some(menu)) = (hovered, self.context_menu_mut()) {
+            menu.highlighted = index;
+        }
+    }
+
+    pub fn move_context_menu_highlight(&mut self, delta: isize) {
+        let Some(menu) = self.context_menu_mut() else {
+            return;
+        };
+        let last = menu.actions.len().saturating_sub(1);
+        menu.highlighted = if delta < 0 {
+            menu.highlighted.saturating_sub(delta.unsigned_abs())
+        } else {
+            menu.highlighted.saturating_add(delta as usize).min(last)
+        };
+    }
+
+    pub fn take_context_menu_action(
+        &mut self,
+        index: usize,
+    ) -> Option<(ContextMenuTarget, ContextMenuAction)> {
+        let menu = self.context_menu()?;
+        let result = Some((menu.target, *menu.actions.get(index)?));
+        self.modal = None;
+        result
+    }
+
+    pub fn take_highlighted_context_menu_action(
+        &mut self,
+    ) -> Option<(ContextMenuTarget, ContextMenuAction)> {
+        let highlighted = self.context_menu()?.highlighted;
+        self.take_context_menu_action(highlighted)
+    }
+
+    pub fn select_message_by_identity(&mut self, chat_id: i64, message_id: i32) -> bool {
+        if self.selected_chat_id() != Some(chat_id) {
+            return false;
+        }
+        let Some(index) = self
+            .messages
+            .iter()
+            .position(|message| message.chat_id == chat_id && message.id == message_id)
+        else {
+            return false;
+        };
+        self.selected_message_index = index;
+        self.ensure_selected_message_visible();
+        true
+    }
+
+    pub fn mark_chat_read_locally(&mut self, chat_id: i64) -> bool {
+        let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == chat_id) else {
+            return false;
+        };
+        chat.unread_count = 0;
+        self.sync_folder_unread_counts_from_loaded_chats();
+        true
+    }
+
+    pub fn scroll_chats(&mut self, delta: isize) {
+        let item_count = self.chat_display_indices().len();
+        let max_offset = item_count.saturating_sub(self.chat_visible_capacity());
+        let offset = if self.chat_search_active() {
+            &mut self.chat_search_scroll_offset
+        } else {
+            &mut self.chat_scroll_offset
+        };
+        *offset = if delta < 0 {
+            offset.saturating_sub(delta.unsigned_abs())
+        } else {
+            offset.saturating_add(delta as usize).min(max_offset)
+        };
+    }
+
+    pub fn split_divider_contains(&self, column: u16, row: u16) -> bool {
+        let left_border = self.chats_area.x + self.chats_area.width.saturating_sub(1);
+        let right_border = self.messages_area.x;
+        row >= self.chats_area.y
+            && row < self.chats_area.y + self.chats_area.height
+            && (column == left_border || column == right_border)
+    }
+
+    pub fn begin_split_drag(&mut self, column: u16) {
+        self.split_drag_active = true;
+        self.split_drag_origin = Some(column);
+    }
+
+    pub fn drag_split_to(&mut self, column: u16) {
+        if self
+            .split_drag_origin
+            .is_none_or(|origin| origin.abs_diff(column) < SPLIT_DRAG_THRESHOLD_COLUMNS)
+        {
+            return;
+        }
+        let width = self.screen_area.width.max(1);
+        let ratio = column.saturating_sub(self.screen_area.x) as f32 / width as f32;
+        self.split_ratio = ratio.clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
+    }
+
+    pub fn end_split_drag(&mut self) {
+        self.split_drag_active = false;
+        self.split_drag_origin = None;
     }
 
     fn folder_label_display_width(folder: &Folder) -> usize {
@@ -1395,11 +1710,11 @@ impl AppState {
                         .retain(|m| !(m.id == message_id && m.chat_id == chat_id));
                 }
 
-                if self.delete_confirmation.is_some_and(|confirmation| {
+                if self.delete_confirmation().is_some_and(|confirmation| {
                     confirmation.message_id == message_id
                         && delete_update_matches_chat(chat_id, confirmation.chat_id)
                 }) {
-                    self.delete_confirmation = None;
+                    self.modal = None;
                 }
                 self.clear_compose_for_deleted_message(chat_id, message_id);
 
@@ -1677,9 +1992,9 @@ impl AppState {
         self.messages.is_empty() || self.selected_message_index >= last_index(self.messages.len())
     }
 
-    pub fn select_message_at_visible_row(&mut self, row: usize) {
+    pub fn message_index_at_visible_row(&self, row: usize) -> Option<usize> {
         if self.messages.is_empty() {
-            return;
+            return None;
         }
 
         let mut current_row = 0;
@@ -1696,14 +2011,20 @@ impl AppState {
                 remaining_rows,
             );
             if row < current_row + message_height {
-                self.selected_message_index = idx;
-                self.ensure_selected_message_visible();
-                return;
+                return Some(idx);
             }
             current_row += message_height;
             if current_row >= self.message_visible_capacity() {
-                return;
+                return None;
             }
+        }
+        None
+    }
+
+    pub fn select_message_at_visible_row(&mut self, row: usize) {
+        if let Some(index) = self.message_index_at_visible_row(row) {
+            self.selected_message_index = index;
+            self.ensure_selected_message_visible();
         }
     }
 
@@ -1760,7 +2081,7 @@ impl AppState {
         if status == MessageStatus::Failed {
             self.dismiss_failed_send(chat_id, message_id);
         } else if can_delete {
-            self.delete_confirmation = Some(DeleteConfirmation {
+            self.set_delete_confirmation(DeleteConfirmation {
                 chat_id,
                 message_id,
             });
@@ -1777,7 +2098,7 @@ impl AppState {
         }
         self.ensure_selected_message_visible();
         self.refresh_selected_chat_last_message_from_loaded_messages();
-        self.delete_confirmation = None;
+        self.modal = None;
         self.set_status(FAILED_SEND_DISMISSED_STATUS);
     }
 
@@ -2026,16 +2347,18 @@ impl AppState {
         self.ensure_selected_message_visible();
         self.refresh_selected_chat_last_message_from_loaded_messages();
         self.set_status(MESSAGE_DELETED_STATUS);
-        self.delete_confirmation = None;
+        self.modal = None;
     }
 
     pub fn apply_delete_failure(&mut self, error: String) {
         self.set_error(delete_failed_error(error));
-        self.delete_confirmation = None;
+        self.modal = None;
     }
 
     pub fn cancel_delete_confirmation(&mut self) {
-        self.delete_confirmation = None;
+        if matches!(self.modal.as_ref(), Some(ModalState::DeleteConfirmation(_))) {
+            self.modal = None;
+        }
     }
 
     pub fn clear_compose_for_deleted_message(&mut self, chat_id: i64, message_id: i32) -> bool {
@@ -2126,14 +2449,15 @@ impl Default for AppState {
 mod tests {
     use super::{
         AppState, CANNOT_DELETE_MESSAGE_ERROR, CANNOT_EDIT_MESSAGE_ERROR,
-        CANNOT_REPLY_UNSENT_MESSAGE_ERROR, CHAT_LIST_ITEM_HEIGHT, ConversationLoadStatus,
-        DEFAULT_SPLIT_RATIO, DeleteConfirmation, FAILED_SEND_DISMISSED_STATUS,
-        FOLDER_VIEWPORT_RESERVED_COLUMNS, FocusedPanel, MAX_SPLIT_RATIO, MESSAGE_DELETED_STATUS,
-        MESSAGE_EDITED_STATUS, MESSAGE_ROW_HEIGHT, MIN_SPLIT_RATIO, MessageSubmitAction,
-        NO_CHAT_SELECTED_ERROR, NOTIFICATION_LIFETIME, PANEL_BORDER_RESERVED_COLUMNS,
-        PANEL_BORDER_RESERVED_ROWS, REMOTE_EDIT_WHILE_EDITING_STATUS, REPLY_MESSAGE_ROW_HEIGHT,
-        REPLY_SENT_STATUS, SPLIT_RATIO_STEP, TYPING_ACTION_COOLDOWN, delete_failed_error,
-        delete_update_matches_chat, edit_failed_error, last_index, message_visible_row_height,
+        CANNOT_REPLY_UNSENT_MESSAGE_ERROR, CHAT_LIST_ITEM_HEIGHT, ContextMenuAction,
+        ContextMenuTarget, ConversationLoadStatus, DEFAULT_SPLIT_RATIO, DeleteConfirmation,
+        FAILED_SEND_DISMISSED_STATUS, FOLDER_VIEWPORT_RESERVED_COLUMNS, FocusedPanel,
+        MAX_SPLIT_RATIO, MESSAGE_DELETED_STATUS, MESSAGE_EDITED_STATUS, MESSAGE_ROW_HEIGHT,
+        MIN_SPLIT_RATIO, MessageSubmitAction, NO_CHAT_SELECTED_ERROR, NOTIFICATION_LIFETIME,
+        PANEL_BORDER_RESERVED_COLUMNS, PANEL_BORDER_RESERVED_ROWS,
+        REMOTE_EDIT_WHILE_EDITING_STATUS, REPLY_MESSAGE_ROW_HEIGHT, REPLY_SENT_STATUS,
+        SPLIT_RATIO_STEP, TYPING_ACTION_COOLDOWN, delete_failed_error, delete_update_matches_chat,
+        edit_failed_error, last_index, message_visible_row_height,
         message_visible_row_height_for_width, reply_failed_error, send_failed_error,
     };
     use crate::telegram::types::{
@@ -2775,7 +3099,7 @@ mod tests {
     fn delete_update_clears_matching_delete_confirmation() {
         let mut state = AppState::new();
         state.messages = vec![update_message(21, 1, "delete me", true)];
-        state.delete_confirmation = Some(DeleteConfirmation {
+        state.set_delete_confirmation(DeleteConfirmation {
             chat_id: 1,
             message_id: 21,
         });
@@ -2786,7 +3110,7 @@ mod tests {
         });
 
         assert!(state.messages.is_empty());
-        assert!(state.delete_confirmation.is_none());
+        assert!(state.delete_confirmation().is_none());
     }
 
     #[test]
@@ -2796,7 +3120,7 @@ mod tests {
             update_message(21, 1, "delete me", true),
             update_message(22, 2, "other chat", true),
         ];
-        state.delete_confirmation = Some(DeleteConfirmation {
+        state.set_delete_confirmation(DeleteConfirmation {
             chat_id: 2,
             message_id: 22,
         });
@@ -2808,7 +3132,7 @@ mod tests {
 
         assert_eq!(state.messages.len(), 1);
         assert_eq!(
-            state.delete_confirmation,
+            state.delete_confirmation(),
             Some(DeleteConfirmation {
                 chat_id: 2,
                 message_id: 22,
@@ -3475,7 +3799,7 @@ mod tests {
             update_message(42, 10, "delete", true),
         ];
         state.selected_message_index = 1;
-        state.delete_confirmation = Some(confirmation);
+        state.set_delete_confirmation(confirmation);
 
         state.apply_delete_success(confirmation);
 
@@ -3484,7 +3808,7 @@ mod tests {
         assert_eq!(state.selected_message_index, 0);
         assert_eq!(state.message_scroll_offset, 0);
         assert_eq!(state.chats[0].last_message.as_deref(), Some("keep"));
-        assert!(state.delete_confirmation.is_none());
+        assert!(state.delete_confirmation().is_none());
         assert_eq!(
             state.status_message.as_deref(),
             Some(MESSAGE_DELETED_STATUS)
@@ -3500,7 +3824,7 @@ mod tests {
         };
         state.chats[0].last_message = Some("delete".to_string());
         state.messages = vec![update_message(42, 10, "delete", true)];
-        state.delete_confirmation = Some(confirmation);
+        state.set_delete_confirmation(confirmation);
 
         state.apply_delete_success(confirmation);
 
@@ -3511,14 +3835,14 @@ mod tests {
     #[test]
     fn apply_delete_failure_sets_error_and_clears_confirmation() {
         let mut state = AppState::new();
-        state.delete_confirmation = Some(DeleteConfirmation {
+        state.set_delete_confirmation(DeleteConfirmation {
             chat_id: 10,
             message_id: 42,
         });
 
         state.apply_delete_failure("network down".to_string());
 
-        assert!(state.delete_confirmation.is_none());
+        assert!(state.delete_confirmation().is_none());
         assert_eq!(
             state.error_message.as_deref(),
             Some(delete_failed_error("network down").as_str())
@@ -3528,14 +3852,14 @@ mod tests {
     #[test]
     fn cancel_delete_confirmation_clears_pending_confirmation() {
         let mut state = AppState::new();
-        state.delete_confirmation = Some(DeleteConfirmation {
+        state.set_delete_confirmation(DeleteConfirmation {
             chat_id: 10,
             message_id: 42,
         });
 
         state.cancel_delete_confirmation();
 
-        assert!(state.delete_confirmation.is_none());
+        assert!(state.delete_confirmation().is_none());
     }
 
     #[test]
@@ -4156,7 +4480,7 @@ mod tests {
         state.request_delete_selected_message();
 
         assert_eq!(
-            state.delete_confirmation,
+            state.delete_confirmation(),
             Some(DeleteConfirmation {
                 chat_id: 10,
                 message_id: 21,
@@ -4172,7 +4496,7 @@ mod tests {
 
         state.request_delete_selected_message();
 
-        assert!(state.delete_confirmation.is_none());
+        assert!(state.delete_confirmation().is_none());
         assert_eq!(
             state.error_message.as_deref(),
             Some(CANNOT_DELETE_MESSAGE_ERROR)
@@ -4188,7 +4512,7 @@ mod tests {
 
         state.request_delete_selected_message();
 
-        assert!(state.delete_confirmation.is_none());
+        assert!(state.delete_confirmation().is_none());
         assert_eq!(
             state.error_message.as_deref(),
             Some(CANNOT_DELETE_MESSAGE_ERROR)
@@ -4213,7 +4537,7 @@ mod tests {
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].content, "previous");
         assert_eq!(state.selected_message_index, 0);
-        assert!(state.delete_confirmation.is_none());
+        assert!(state.delete_confirmation().is_none());
         assert_eq!(state.chats[0].last_message.as_deref(), Some("previous"));
         assert_eq!(state.input_buffer, "failed draft");
         assert_eq!(
@@ -4304,6 +4628,75 @@ mod tests {
         state.split_ratio = MAX_SPLIT_RATIO;
         state.adjust_split_right();
         assert_eq!(state.split_ratio, MAX_SPLIT_RATIO);
+    }
+
+    #[test]
+    fn context_menu_capabilities_clamp_and_stay_mutually_exclusive_with_delete() {
+        let mut state = AppState::new();
+        state.screen_area = Rect::new(0, 0, 80, 24);
+        state.chats = vec![chat_with_unread(7, "Alice", 3, Some(1))];
+        let target = ContextMenuTarget::Chat { chat_id: 7 };
+
+        assert!(state.open_context_menu(target, 79, 23));
+        assert_eq!(
+            state.context_menu().map(|menu| menu.actions.as_slice()),
+            Some(
+                [
+                    ContextMenuAction::OpenChat,
+                    ContextMenuAction::MarkChatRead,
+                    ContextMenuAction::CopyChatName,
+                ]
+                .as_slice()
+            )
+        );
+        let area = state
+            .context_menu_rect()
+            .expect("menu should have geometry");
+        assert!(area.x + area.width <= state.screen_area.width);
+        assert!(area.y + area.height <= state.screen_area.height);
+
+        state.set_delete_confirmation(DeleteConfirmation {
+            chat_id: 7,
+            message_id: 1,
+        });
+        assert!(state.context_menu().is_none());
+        assert!(!state.open_context_menu(target, 1, 1));
+        assert!(state.delete_confirmation().is_some());
+    }
+
+    #[test]
+    fn context_menu_re_resolves_message_capabilities_after_target_disappears() {
+        let mut state = AppState::new();
+        state.chats = vec![chat_with_unread(7, "Alice", 0, Some(1))];
+        state.messages = vec![update_message(1, 7, "https://example.com", true)];
+        let target = ContextMenuTarget::Message {
+            chat_id: 7,
+            message_id: 1,
+        };
+
+        let actions = state.context_actions_for_target(target);
+        assert!(actions.contains(&ContextMenuAction::ReplyMessage));
+        assert!(actions.contains(&ContextMenuAction::OpenMessageLink));
+        assert!(actions.contains(&ContextMenuAction::DeleteMessage));
+
+        state.messages.clear();
+        assert!(state.context_actions_for_target(target).is_empty());
+    }
+
+    #[test]
+    fn split_drag_clamps_and_releases() {
+        let mut state = AppState::new();
+        state.screen_area = Rect::new(10, 0, 100, 24);
+
+        state.begin_split_drag(50);
+        state.drag_split_to(50);
+        assert_eq!(state.split_ratio, DEFAULT_SPLIT_RATIO);
+        state.drag_split_to(0);
+        assert_eq!(state.split_ratio, MIN_SPLIT_RATIO);
+        state.drag_split_to(200);
+        assert_eq!(state.split_ratio, MAX_SPLIT_RATIO);
+        state.end_split_drag();
+        assert!(!state.split_drag_active);
     }
 
     #[test]

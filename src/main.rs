@@ -52,6 +52,7 @@ const LOADING_CHAT_MESSAGES_STATUS: &str = "Loading chat messages…";
 const LOADING_FOLDER_CHATS_STATUS: &str = "Loading folder chats…";
 const LINK_OPENED_STATUS: &str = "Link opened";
 const MESSAGE_TEXT_COPIED_STATUS: &str = "Message text copied";
+const CHAT_NAME_COPIED_STATUS: &str = "Chat name copied";
 const DOWNLOADING_MEDIA_STATUS: &str = "Downloading media…";
 const MEDIA_DOWNLOADED_STATUS: &str = "Media downloaded to Downloads";
 const DOWNLOADED_MEDIA_OPENED_STATUS: &str = "Downloaded media opened";
@@ -742,7 +743,7 @@ fn assert_smoke_message_render(app: &App, rendered: &str) -> Result<()> {
             "smoke render still included the legacy edited marker"
         ));
     }
-    if app.state.delete_confirmation.is_some()
+    if app.state.delete_confirmation().is_some()
         && (!rendered.contains(ui::messages::DELETE_CONFIRMATION_TEXT.trim())
             || !rendered.contains(ui::messages::DELETE_CONFIRMATION_TITLE.trim()))
     {
@@ -1014,7 +1015,7 @@ async fn run_interaction_smoke<C: TelegramClient + Clone + Send + Sync + 'static
         .position(|message| message.id == 2)
         .ok_or_else(|| color_eyre::eyre::eyre!("message to delete was not found"))?;
     handle_key_event(app, smoke_key(KeyCode::Char('d')), client).await?;
-    if app.state.delete_confirmation.is_none_or(|confirmation| {
+    if app.state.delete_confirmation().is_none_or(|confirmation| {
         confirmation.message_id != 2 || confirmation.chat_id != app.state.chats[1].id
     }) {
         return Err(color_eyre::eyre::eyre!(
@@ -1273,6 +1274,7 @@ async fn run_mouse_smoke<C: TelegramClient + Clone + Send + Sync + 'static>(
         ));
     }
 
+    app.state.chats_area.height = 6;
     let chat_scroll_down = smoke_mouse(
         MouseEventKind::ScrollDown,
         app.state.chats_area.x + 2,
@@ -1281,10 +1283,11 @@ async fn run_mouse_smoke<C: TelegramClient + Clone + Send + Sync + 'static>(
     handle_mouse_event(app, chat_scroll_down, client).await?;
     if app.state.focused_panel != state::FocusedPanel::Chats
         || app.state.selected_chat_index != 0
+        || app.state.chat_scroll_offset != 1
         || app.state.messages.len() != 3
     {
         return Err(color_eyre::eyre::eyre!(
-            "mouse wheel over chats should focus chats without loading another chat"
+            "mouse wheel over chats should scroll without loading another chat"
         ));
     }
 
@@ -1298,13 +1301,84 @@ async fn run_mouse_smoke<C: TelegramClient + Clone + Send + Sync + 'static>(
         ));
     }
 
-    app.state.delete_confirmation =
+    let message_menu = smoke_mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        app.state.messages_area.x + 2,
+        app.state.messages_area.y + 2,
+    );
+    handle_mouse_event(app, message_menu, client).await?;
+    if app.state.context_menu().is_none() {
+        return Err(color_eyre::eyre::eyre!(
+            "right-click did not open a message context menu"
+        ));
+    }
+    let blocked_offset = app.state.chat_scroll_offset;
+    handle_mouse_event(app, chat_scroll_down, client).await?;
+    if app.state.chat_scroll_offset != blocked_offset {
+        return Err(color_eyre::eyre::eyre!(
+            "context menu leaked an underlying chat wheel event"
+        ));
+    }
+    handle_key_event(app, smoke_key(KeyCode::Esc), client).await?;
+    if app.state.context_menu().is_some() {
+        return Err(color_eyre::eyre::eyre!(
+            "Escape did not close the context menu"
+        ));
+    }
+
+    let original_split_ratio = app.state.split_ratio;
+    let divider_column = app.state.chats_area.x + app.state.chats_area.width - 1;
+    let divider_row = app.state.chats_area.y + 1;
+    let drag_column = if original_split_ratio < 0.5 {
+        app.state.screen_area.x + app.state.screen_area.width * 3 / 4
+    } else {
+        app.state.screen_area.x + app.state.screen_area.width / 4
+    };
+    handle_mouse_event(
+        app,
+        smoke_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            divider_column,
+            divider_row,
+        ),
+        client,
+    )
+    .await?;
+    handle_mouse_event(
+        app,
+        smoke_mouse(MouseEventKind::Drag(MouseButton::Left), drag_column, 10),
+        client,
+    )
+    .await?;
+    handle_mouse_event(
+        app,
+        smoke_mouse(MouseEventKind::Up(MouseButton::Left), drag_column, 10),
+        client,
+    )
+    .await?;
+    if app.state.split_drag_active || app.state.split_ratio == original_split_ratio {
+        return Err(color_eyre::eyre::eyre!(
+            "mouse divider drag did not resize and release: active={} before={} after={} divider=({}, {}) drag_column={}",
+            app.state.split_drag_active,
+            original_split_ratio,
+            app.state.split_ratio,
+            divider_column,
+            divider_row,
+            drag_column,
+        ));
+    }
+    app.state.split_ratio = original_split_ratio;
+
+    if let Some(confirmation) =
         app.state
             .selected_message()
             .map(|message| state::DeleteConfirmation {
                 chat_id: message.chat_id,
                 message_id: message.id,
-            });
+            })
+    {
+        app.state.set_delete_confirmation(confirmation);
+    }
     let blocked_chat_index = app.state.selected_chat_index;
     let blocked_focus = app.state.focused_panel;
     let blocked_message_count = app.state.messages.len();
@@ -1322,7 +1396,7 @@ async fn run_mouse_smoke<C: TelegramClient + Clone + Send + Sync + 'static>(
             "mouse event changed chat/focus while delete confirmation was open"
         ));
     }
-    app.state.delete_confirmation = None;
+    app.state.cancel_delete_confirmation();
     app.state.selected_message_index = 0;
     app.state.ensure_selected_message_visible();
 
@@ -1498,17 +1572,12 @@ fn load_app_preferences(app: &mut App) {
     }
 }
 
-fn save_app_preferences_if_changed(app: &mut App, before: preferences::AppPreferences) {
-    let after = preferences::AppPreferences::from_state(&app.state);
-    if before == after {
-        return;
-    }
-
+fn save_app_preferences(app: &mut App) {
     let Some(path) = app.preferences_path.as_deref() else {
         return;
     };
 
-    match after.save(path) {
+    match preferences::AppPreferences::from_state(&app.state).save(path) {
         Ok(()) => diagnostics::event("preferences_save", format!("path={}", path.display())),
         Err(error) => {
             diagnostics::event(
@@ -1518,6 +1587,12 @@ fn save_app_preferences_if_changed(app: &mut App, before: preferences::AppPrefer
             app.state
                 .set_error(format!("Save preferences failed: {error}"));
         }
+    }
+}
+
+fn save_app_preferences_if_changed(app: &mut App, before: preferences::AppPreferences) {
+    if before != preferences::AppPreferences::from_state(&app.state) {
+        save_app_preferences(app);
     }
 }
 
@@ -1614,6 +1689,7 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
                 chat_message_loader,
                 older_message_loader,
                 folder_chat_loader,
+                mark_read_loader,
                 send_message_loader,
                 delete_message_loader,
                 edit_message_loader,
@@ -1690,6 +1766,7 @@ async fn dispatch_terminal_event<C: TelegramClient + Clone + Send + Sync + 'stat
     chat_message_loader: &mut ChatMessageLoader<C>,
     older_message_loader: &mut OlderMessageLoader<C>,
     folder_chat_loader: &mut FolderChatLoader<C>,
+    mark_read_loader: &MarkChatReadLoader<C>,
     send_message_loader: &SendMessageLoader<C>,
     delete_message_loader: &DeleteMessageLoader<C>,
     edit_message_loader: &EditMessageLoader<C>,
@@ -1708,6 +1785,7 @@ async fn dispatch_terminal_event<C: TelegramClient + Clone + Send + Sync + 'stat
                     chat_message: Some(chat_message_loader),
                     older_message: Some(older_message_loader),
                     folder_chat: Some(folder_chat_loader),
+                    mark_read: Some(mark_read_loader),
                     send_message: Some(send_message_loader),
                     delete_message: Some(delete_message_loader),
                     edit_message: Some(edit_message_loader),
@@ -1719,19 +1797,41 @@ async fn dispatch_terminal_event<C: TelegramClient + Clone + Send + Sync + 'stat
             Ok(true)
         }
         TerminalAction::Mouse(mouse_event) => {
+            let split_drag_was_active = app.state.split_drag_active;
             let mut progress = UiProgress::Live { terminal };
             handle_mouse_event_with_progress(
                 app,
                 mouse_event,
                 client,
                 &mut progress,
-                Some(chat_message_loader),
-                Some(folder_chat_loader),
+                HandlerLoaders {
+                    chat_message: Some(chat_message_loader),
+                    older_message: Some(older_message_loader),
+                    folder_chat: Some(folder_chat_loader),
+                    mark_read: Some(mark_read_loader),
+                    send_message: Some(send_message_loader),
+                    delete_message: Some(delete_message_loader),
+                    edit_message: Some(edit_message_loader),
+                    reply_message: Some(reply_message_loader),
+                    download_media: Some(download_media_loader),
+                },
             )
             .await?;
+            if split_drag_was_active
+                && matches!(mouse_event.kind, MouseEventKind::Up(MouseButton::Left))
+            {
+                save_app_preferences(app);
+            }
             Ok(true)
         }
         TerminalAction::Resize => Ok(true),
+        TerminalAction::FocusLost => {
+            if app.state.split_drag_active {
+                app.state.end_split_drag();
+                save_app_preferences(app);
+            }
+            Ok(true)
+        }
         TerminalAction::Ignore => Ok(false),
     }
 }
@@ -1741,6 +1841,7 @@ enum TerminalAction {
     Key(KeyEvent),
     Mouse(crossterm::event::MouseEvent),
     Resize,
+    FocusLost,
     Ignore,
 }
 
@@ -1749,9 +1850,8 @@ fn classify_terminal_event(event: Event) -> TerminalAction {
         Event::Key(key) if key.kind == KeyEventKind::Press => TerminalAction::Key(key),
         Event::Mouse(mouse) => TerminalAction::Mouse(mouse),
         Event::Resize(_, _) => TerminalAction::Resize,
-        Event::Key(_) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {
-            TerminalAction::Ignore
-        }
+        Event::FocusLost => TerminalAction::FocusLost,
+        Event::Key(_) | Event::FocusGained | Event::Paste(_) => TerminalAction::Ignore,
     }
 }
 
@@ -2199,6 +2299,7 @@ struct HandlerLoaders<'a, C> {
     chat_message: Option<&'a mut ChatMessageLoader<C>>,
     older_message: Option<&'a mut OlderMessageLoader<C>>,
     folder_chat: Option<&'a mut FolderChatLoader<C>>,
+    mark_read: Option<&'a MarkChatReadLoader<C>>,
     send_message: Option<&'a SendMessageLoader<C>>,
     delete_message: Option<&'a DeleteMessageLoader<C>>,
     edit_message: Option<&'a EditMessageLoader<C>>,
@@ -2212,6 +2313,7 @@ impl<C> HandlerLoaders<'_, C> {
             chat_message: None,
             older_message: None,
             folder_chat: None,
+            mark_read: None,
             send_message: None,
             delete_message: None,
             edit_message: None,
@@ -3251,29 +3353,38 @@ fn selected_media_download_request(
     Some((message.chat_id, message.id, media.kind.clone()))
 }
 
-async fn download_selected_message_media<C: TelegramClient>(
+async fn download_selected_media_with_optional_async_loader<
+    C: TelegramClient + Clone + Send + Sync + 'static,
+>(
     app: &mut App,
     client: &C,
+    progress: &mut UiProgress<'_>,
+    loader: Option<&DownloadMediaLoader<C>>,
 ) -> Result<()> {
     let Some((chat_id, message_id, media_kind)) = selected_media_download_request(app) else {
         return Ok(());
     };
-    let result = actions::download_message_media_result(
-        client,
-        chat_id,
-        message_id,
-        media_kind,
-        actions::default_download_dir(),
-    )
-    .await;
-    apply_download_media_result(
-        app,
-        DownloadMediaResult {
+    progress.show(app, DOWNLOADING_MEDIA_STATUS)?;
+    if let Some(loader) = loader {
+        loader.spawn_download_media(chat_id, message_id, media_kind);
+    } else {
+        let result = actions::download_message_media_result(
+            client,
             chat_id,
             message_id,
-            result,
-        },
-    );
+            media_kind,
+            actions::default_download_dir(),
+        )
+        .await;
+        apply_download_media_result(
+            app,
+            DownloadMediaResult {
+                chat_id,
+                message_id,
+                result,
+            },
+        );
+    }
     Ok(())
 }
 
@@ -3421,7 +3532,7 @@ async fn handle_key_event_with_progress<C: TelegramClient + Clone + Send + Sync 
     key: KeyEvent,
     client: &mut C,
     progress: &mut UiProgress<'_>,
-    loaders: HandlerLoaders<'_, C>,
+    mut loaders: HandlerLoaders<'_, C>,
 ) -> Result<()> {
     diagnostics::event(
         "key_event",
@@ -3432,6 +3543,34 @@ async fn handle_key_event_with_progress<C: TelegramClient + Clone + Send + Sync 
             key.modifiers
         ),
     );
+    if app.state.context_menu().is_some() {
+        let action = match key.code {
+            KeyCode::Esc => {
+                app.state.close_context_menu();
+                None
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.state.close_context_menu();
+                None
+            }
+            KeyCode::Up => {
+                app.state.move_context_menu_highlight(-1);
+                None
+            }
+            KeyCode::Down => {
+                app.state.move_context_menu_highlight(1);
+                None
+            }
+            KeyCode::Enter => app.state.take_highlighted_context_menu_action(),
+            _ => None,
+        };
+        if let Some((target, action)) = action {
+            execute_context_menu_action(app, client, progress, &mut loaders, target, action)
+                .await?;
+        }
+        return Ok(());
+    }
+
     if global_keys::handle_global_key(&mut app.state, key) == global_keys::GlobalKeyOutcome::Handled
     {
         diagnostics::event("key_handled", "handler=global");
@@ -3462,7 +3601,7 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
     progress: &mut UiProgress<'_>,
     mut loaders: HandlerLoaders<'_, C>,
 ) -> Result<()> {
-    if app.state.delete_confirmation.is_some() {
+    if app.state.delete_confirmation().is_some() {
         match confirm_keys::handle_confirm_key(key) {
             confirm_keys::ConfirmKeyOutcome::Confirm => {
                 progress.show(app, DELETING_MESSAGE_STATUS)?;
@@ -3521,14 +3660,13 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
             return Ok(());
         }
         message_keys::MessageKeyOutcome::DownloadSelectedMedia => {
-            if let Some((chat_id, message_id, media_kind)) = selected_media_download_request(app) {
-                progress.show(app, DOWNLOADING_MEDIA_STATUS)?;
-                if let Some(loader) = loaders.download_media {
-                    loader.spawn_download_media(chat_id, message_id, media_kind);
-                } else {
-                    download_selected_message_media(app, client).await?;
-                }
-            }
+            download_selected_media_with_optional_async_loader(
+                app,
+                client,
+                progress,
+                loaders.download_media,
+            )
+            .await?;
             return Ok(());
         }
         message_keys::MessageKeyOutcome::OpenDownloadedMedia => {
@@ -3839,13 +3977,117 @@ fn message_submit_action_status(action: &state::MessageSubmitAction) -> &'static
     }
 }
 
+async fn execute_context_menu_action<C: TelegramClient + Clone + Send + Sync + 'static>(
+    app: &mut App,
+    client: &mut C,
+    progress: &mut UiProgress<'_>,
+    loaders: &mut HandlerLoaders<'_, C>,
+    target: state::ContextMenuTarget,
+    action: state::ContextMenuAction,
+) -> Result<()> {
+    if !app
+        .state
+        .context_actions_for_target(target)
+        .contains(&action)
+    {
+        return Ok(());
+    }
+
+    match (target, action) {
+        (state::ContextMenuTarget::Chat { chat_id }, state::ContextMenuAction::OpenChat) => {
+            let Some(index) = app.state.chats.iter().position(|chat| chat.id == chat_id) else {
+                return Ok(());
+            };
+            open_chat_at_with_optional_async_loader(
+                app,
+                client,
+                progress,
+                &mut loaders.chat_message,
+                index,
+            )
+            .await?;
+        }
+        (state::ContextMenuTarget::Chat { chat_id }, state::ContextMenuAction::MarkChatRead) => {
+            if app.state.mark_chat_read_locally(chat_id) {
+                if let Some(loader) = loaders.mark_read {
+                    loader.spawn_mark_chat_read(chat_id);
+                } else {
+                    actions::mark_chat_read_best_effort(client, chat_id).await;
+                }
+            }
+        }
+        (state::ContextMenuTarget::Chat { chat_id }, state::ContextMenuAction::CopyChatName) => {
+            let Some(name) = app
+                .state
+                .chats
+                .iter()
+                .find(|chat| chat.id == chat_id)
+                .map(|chat| chat.name.clone())
+            else {
+                return Ok(());
+            };
+            progress.copy_text(&name)?;
+            app.state.set_status(CHAT_NAME_COPIED_STATUS);
+        }
+        (
+            state::ContextMenuTarget::Message {
+                chat_id,
+                message_id,
+            },
+            message_action,
+        ) => {
+            if !app.state.select_message_by_identity(chat_id, message_id) {
+                return Ok(());
+            }
+            match message_action {
+                state::ContextMenuAction::ReplyMessage => {
+                    app.state.request_reply_to_selected_message()
+                }
+                state::ContextMenuAction::EditMessage => app.state.request_edit_selected_message(),
+                state::ContextMenuAction::CopyMessageText => {
+                    copy_selected_message_text(app, progress)?
+                }
+                state::ContextMenuAction::OpenMessageLink => open_selected_message_link(app),
+                state::ContextMenuAction::SaveMessageMedia => {
+                    download_selected_media_with_optional_async_loader(
+                        app,
+                        client,
+                        progress,
+                        loaders.download_media,
+                    )
+                    .await?;
+                }
+                state::ContextMenuAction::OpenDownloadedMedia => {
+                    open_selected_downloaded_media(app)
+                }
+                state::ContextMenuAction::DeleteMessage
+                | state::ContextMenuAction::DismissFailedSend => {
+                    app.state.request_delete_selected_message()
+                }
+                state::ContextMenuAction::OpenChat
+                | state::ContextMenuAction::MarkChatRead
+                | state::ContextMenuAction::CopyChatName => {}
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 async fn handle_mouse_event<C: TelegramClient + Clone + Send + Sync + 'static>(
     app: &mut App,
     mouse_event: crossterm::event::MouseEvent,
     client: &mut C,
 ) -> Result<()> {
     let mut progress = UiProgress::Silent;
-    handle_mouse_event_with_progress(app, mouse_event, client, &mut progress, None, None).await
+    handle_mouse_event_with_progress(
+        app,
+        mouse_event,
+        client,
+        &mut progress,
+        HandlerLoaders::none(),
+    )
+    .await
 }
 
 async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Sync + 'static>(
@@ -3853,10 +4095,9 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
     mouse_event: crossterm::event::MouseEvent,
     client: &mut C,
     progress: &mut UiProgress<'_>,
-    mut chat_message_loader: Option<&mut ChatMessageLoader<C>>,
-    mut folder_chat_loader: Option<&mut FolderChatLoader<C>>,
+    mut loaders: HandlerLoaders<'_, C>,
 ) -> Result<()> {
-    if app.state.delete_confirmation.is_some() {
+    if app.state.delete_confirmation().is_some() {
         diagnostics::event("mouse_ignored", "reason=delete_confirmation");
         return Ok(());
     }
@@ -3869,6 +4110,9 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
     match mouse_events::handle_mouse_click(&mut app.state, mouse_event) {
         mouse_events::MouseClickOutcome::Handled | mouse_events::MouseClickOutcome::Ignored => {}
         mouse_events::MouseClickOutcome::OpenLink(url) => open_message_link(app, &url),
+        mouse_events::MouseClickOutcome::ContextMenuAction(target, action) => {
+            execute_context_menu_action(app, client, progress, &mut loaders, target, action).await?
+        }
         mouse_events::MouseClickOutcome::OpenFolderAt(index) => {
             diagnostics::event(
                 "mouse_action",
@@ -3881,7 +4125,7 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
                 app,
                 client,
                 progress,
-                &mut folder_chat_loader,
+                &mut loaders.folder_chat,
                 index,
             )
             .await?;
@@ -3898,7 +4142,7 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
                 app,
                 client,
                 progress,
-                &mut chat_message_loader,
+                &mut loaders.chat_message,
                 index,
             )
             .await?;
@@ -3915,7 +4159,7 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
                 app,
                 client,
                 progress,
-                &mut chat_message_loader,
+                &mut loaders.chat_message,
             )
             .await?;
         }
@@ -3957,12 +4201,14 @@ mod tests {
         login_failed_message, login_signed_in_message, message_submit_action_status,
         older_message_key_navigation, open_chat_at_with_optional_async_loader, parse_args_from,
         prepare_loop_step, preserve_prompt_input_line_spaces, require_prompt_line,
-        require_prompt_response, save_app_preferences_if_changed, sleep_until_optional,
-        smoke_ok_message, trim_prompt_input_line, validate_config,
+        require_prompt_response, save_app_preferences, save_app_preferences_if_changed,
+        sleep_until_optional, smoke_ok_message, trim_prompt_input_line, validate_config,
     };
     use crate::app::App;
     use crate::config::telegram::{Config, TelegramConfig};
-    use crate::state::{ConversationLoadStatus, DeleteConfirmation, FocusedPanel};
+    use crate::state::{
+        ContextMenuTarget, ConversationLoadStatus, DeleteConfirmation, FocusedPanel,
+    };
     use crate::telegram::{
         MockTelegramClient, TelegramClient,
         types::{
@@ -4082,7 +4328,7 @@ mod tests {
         );
         assert_eq!(
             classify_terminal_event(Event::FocusLost),
-            TerminalAction::Ignore
+            TerminalAction::FocusLost
         );
         assert!(matches!(
             classify_terminal_event(Event::Mouse(MouseEvent {
@@ -4601,6 +4847,15 @@ mod tests {
             .expect("saved app preferences should reload");
         assert!(!saved.ui.show_help_bar);
         assert_eq!(saved.ui.split_ratio, app.state.split_ratio);
+
+        app.state.screen_area = Rect::new(0, 0, 100, 24);
+        app.state.begin_split_drag(30);
+        app.state.drag_split_to(75);
+        app.state.end_split_drag();
+        save_app_preferences(&mut app);
+        let saved = crate::preferences::AppPreferences::load(&path)
+            .expect("dragged split preference should reload");
+        assert_eq!(saved.ui.split_ratio, 0.75);
 
         std::fs::remove_file(path).ok();
     }
@@ -5604,13 +5859,13 @@ mod tests {
         message.chat_id = 1;
         app.state.chats = vec![chat(1)];
         app.state.messages = vec![message];
-        app.state.delete_confirmation = Some(DeleteConfirmation {
+        app.state.set_delete_confirmation(DeleteConfirmation {
             chat_id: 1,
             message_id: 7,
         });
         let confirmation = crate::actions::begin_confirm_delete(&mut app.state)
             .expect("delete confirmation should be present");
-        assert!(app.state.delete_confirmation.is_none());
+        assert!(app.state.delete_confirmation().is_none());
 
         apply_delete_message_result(
             &mut app,
@@ -5797,6 +6052,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_menu_keyboard_blocks_underlying_quit_and_closes_before_delete_confirmation() {
+        let mut app = App::new();
+        let mut client = MockTelegramClient::new();
+        let mut selected = message(7);
+        selected.is_own = true;
+        selected.can_edit = true;
+        selected.can_delete = true;
+        app.state.chats = vec![chat(10)];
+        app.state.messages = vec![selected];
+        assert!(app.state.open_context_menu(
+            ContextMenuTarget::Message {
+                chat_id: 10,
+                message_id: 7,
+            },
+            1,
+            1,
+        ));
+
+        let mut progress = UiProgress::Silent;
+        handle_key_event_with_progress(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut client,
+            &mut progress,
+            HandlerLoaders::none(),
+        )
+        .await
+        .expect("menu should consume unrelated key");
+        assert!(!app.should_quit);
+        assert!(app.state.context_menu().is_some());
+
+        let last = app
+            .state
+            .context_menu()
+            .expect("menu remains open")
+            .actions
+            .len()
+            - 1;
+        app.state
+            .context_menu_mut()
+            .expect("menu remains mutable")
+            .highlighted = last;
+        handle_key_event_with_progress(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut client,
+            &mut progress,
+            HandlerLoaders::none(),
+        )
+        .await
+        .expect("delete menu action should be handled");
+
+        assert!(app.state.context_menu().is_none());
+        assert!(app.state.delete_confirmation().is_some_and(|confirmation| {
+            confirmation.chat_id == 10 && confirmation.message_id == 7
+        }));
+    }
+
+    #[tokio::test]
     async fn mouse_events_are_ignored_while_delete_confirmation_is_open() {
         let mut app = App::new();
         let mut client = MockTelegramClient::new();
@@ -5805,7 +6119,7 @@ mod tests {
         app.state.input_area = Rect::new(0, 20, 40, 3);
         app.state.messages = vec![message(1), message(2)];
         app.state.selected_message_index = 0;
-        app.state.delete_confirmation = Some(DeleteConfirmation {
+        app.state.set_delete_confirmation(DeleteConfirmation {
             chat_id: 10,
             message_id: 1,
         });
@@ -5824,7 +6138,7 @@ mod tests {
         assert_eq!(app.state.selected_message_index, 0);
         assert!(app.state.status_message.is_none());
         assert!(app.state.error_message.is_none());
-        assert!(app.state.delete_confirmation.is_some());
+        assert!(app.state.delete_confirmation().is_some());
 
         let input_click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -5837,7 +6151,7 @@ mod tests {
             .expect("mouse click should be ignored without error");
 
         assert_eq!(app.state.focused_panel, FocusedPanel::Messages);
-        assert!(app.state.delete_confirmation.is_some());
+        assert!(app.state.delete_confirmation().is_some());
     }
 
     #[test]
