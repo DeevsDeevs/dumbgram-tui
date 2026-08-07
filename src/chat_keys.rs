@@ -21,8 +21,7 @@ pub fn handle_chat_key(state: &mut AppState, key: KeyEvent) -> ChatKeyOutcome {
                 ChatKeyOutcome::Handled
             }
             KeyCode::Enter => {
-                let selected_match =
-                    (!state.chat_display_indices().is_empty()).then_some(state.selected_chat_index);
+                let selected_match = state.selected_chat_search_result_index();
                 state.clear_chat_search();
                 selected_match.map_or(ChatKeyOutcome::Handled, ChatKeyOutcome::OpenChatAt)
             }
@@ -32,19 +31,11 @@ pub fn handle_chat_key(state: &mut AppState, key: KeyEvent) -> ChatKeyOutcome {
             }
             KeyCode::Down => {
                 state.select_next_chat_search_match();
-                if state.chat_display_indices().is_empty() {
-                    ChatKeyOutcome::Handled
-                } else {
-                    ChatKeyOutcome::OpenChatAt(state.selected_chat_index)
-                }
+                ChatKeyOutcome::Handled
             }
             KeyCode::Up => {
                 state.select_previous_chat_search_match();
-                if state.chat_display_indices().is_empty() {
-                    ChatKeyOutcome::Handled
-                } else {
-                    ChatKeyOutcome::OpenChatAt(state.selected_chat_index)
-                }
+                ChatKeyOutcome::Handled
             }
             KeyCode::Char(ch) if key.modifiers == KeyModifiers::NONE => {
                 state.push_chat_search_char(ch);
@@ -68,14 +59,10 @@ pub fn handle_chat_key(state: &mut AppState, key: KeyEvent) -> ChatKeyOutcome {
             ChatKeyOutcome::OpenNextChat
         }
         KeyCode::Down => ChatKeyOutcome::Handled,
-        KeyCode::Up => {
-            if state.chats.is_empty() || state.selected_chat_index == 0 {
-                state.focused_panel = FocusedPanel::Folders;
-                ChatKeyOutcome::Handled
-            } else {
-                ChatKeyOutcome::OpenChatAt(state.selected_chat_index - 1)
-            }
+        KeyCode::Up if state.chats.is_empty() || state.selected_chat_index == 0 => {
+            ChatKeyOutcome::Handled
         }
+        KeyCode::Up => ChatKeyOutcome::OpenChatAt(state.selected_chat_index - 1),
         KeyCode::Left => {
             state.focused_panel = FocusedPanel::Folders;
             ChatKeyOutcome::Handled
@@ -184,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_keys_move_up_to_folders_at_top_or_empty_list() {
+    fn chat_keys_stop_at_top_or_empty_list_without_changing_focus() {
         let mut state = AppState::new();
         state.focused_panel = FocusedPanel::Chats;
         state.chats = vec![chat(1)];
@@ -194,15 +181,14 @@ mod tests {
             handle_chat_key(&mut state, key(KeyCode::Up)),
             ChatKeyOutcome::Handled
         );
-        assert_eq!(state.focused_panel, FocusedPanel::Folders);
+        assert_eq!(state.focused_panel, FocusedPanel::Chats);
 
-        state.focused_panel = FocusedPanel::Chats;
         state.chats.clear();
         assert_eq!(
             handle_chat_key(&mut state, key(KeyCode::Up)),
             ChatKeyOutcome::Handled
         );
-        assert_eq!(state.focused_panel, FocusedPanel::Folders);
+        assert_eq!(state.focused_panel, FocusedPanel::Chats);
     }
 
     #[test]
@@ -261,7 +247,8 @@ mod tests {
             ChatKeyOutcome::Handled
         );
         assert_eq!(state.chat_search_query(), "proj");
-        assert_eq!(state.selected_chat_index, 2);
+        assert_eq!(state.selected_chat_index, 0);
+        assert_eq!(state.selected_chat_search_result_index(), Some(2));
 
         assert_eq!(
             handle_chat_key(&mut state, key(KeyCode::Enter)),
@@ -271,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_search_arrow_selection_opens_selected_result() {
+    fn chat_search_arrows_browse_without_opening_selected_result() {
         let mut state = AppState::new();
         state.focused_panel = FocusedPanel::Chats;
         state.chats = vec![
@@ -283,10 +270,17 @@ mod tests {
 
         assert_eq!(
             handle_chat_key(&mut state, key(KeyCode::Down)),
+            ChatKeyOutcome::Handled
+        );
+        assert_eq!(state.selected_chat_index, 0);
+        assert_eq!(state.selected_chat_search_result_index(), Some(1));
+        assert!(state.chat_search_active());
+
+        assert_eq!(
+            handle_chat_key(&mut state, key(KeyCode::Enter)),
             ChatKeyOutcome::OpenChatAt(1)
         );
-        assert_eq!(state.selected_chat_index, 1);
-        assert!(state.chat_search_active());
+        assert!(!state.chat_search_active());
     }
 
     #[test]

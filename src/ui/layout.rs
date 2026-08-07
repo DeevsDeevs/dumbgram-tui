@@ -331,7 +331,7 @@ fn help_bar_controls(app: &App) -> String {
                 "Enter open",
                 "Esc clear",
                 "Backspace edit",
-                "Up/Down open",
+                "Up/Down browse",
                 HIDE_HELP_CONTROL_LABEL,
             ]);
         }
@@ -359,6 +359,7 @@ fn help_bar_controls(app: &App) -> String {
     {
         join_help_controls(&[
             NO_MESSAGE_HELP_LABEL,
+            "Enter input",
             "Left chats",
             "Tab focus",
             "q quit",
@@ -374,6 +375,7 @@ fn help_bar_controls(app: &App) -> String {
         join_help_controls(&[
             "Sending: waiting for Telegram",
             "edit/delete/reply disabled",
+            "Enter input",
             "Left chats",
             "Tab focus",
             "q quit",
@@ -388,7 +390,7 @@ fn help_bar_controls(app: &App) -> String {
     {
         join_help_controls(&[
             "Failed send: d dismiss",
-            "Input restored: Enter retry",
+            "Enter input to retry",
             "Left chats",
             "Tab focus",
             "q quit",
@@ -418,22 +420,21 @@ fn selected_message_help_controls(state: &AppState, message: &Message) -> String
     let at_loaded_bottom = state.selected_message_is_last() && has_messages;
     let movement_label =
         if at_loaded_top && at_loaded_bottom && state.selected_chat_older_history_exhausted() {
-            "Messages: no older history · Down input · Pg/Home/End move"
+            "Messages: no older history · Pg/Home/End move"
         } else if at_loaded_top && state.selected_chat_older_history_exhausted() {
             "Messages: no older history · Down/PgDn/Home/End move"
         } else if at_loaded_top && at_loaded_bottom {
-            "Messages: Up/PgUp older · Down input · Pg/Home/End move"
+            "Messages: Up/PgUp older · Pg/Home/End move"
         } else if at_loaded_top {
             "Messages: Up/PgUp older · Down/PgDn/Home/End move"
         } else if at_loaded_bottom {
-            "Messages: Up/Pg/Home/End move · Down input"
+            "Messages: Up/Pg/Home/End move"
         } else {
             "Messages: Up/Down/Pg/Home/End move"
         };
-    let mut controls = vec![movement_label];
+    let mut controls = vec![movement_label, "Enter input"];
 
     if !state.thread_topics.is_empty() {
-        controls.push("Enter load topic");
         controls.push("Left/Right topics");
     }
 
@@ -893,7 +894,7 @@ mod tests {
         chats.state.begin_chat_search();
         assert_eq!(
             help_bar_controls(&chats),
-            "Search chats: type · Enter open · Esc clear · Backspace edit · Up/Down open · ? hide help"
+            "Search chats: type · Enter open · Esc clear · Backspace edit · Up/Down browse · ? hide help"
         );
     }
 
@@ -904,7 +905,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&app),
-            "Messages: no message selected · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: no message selected · Enter input · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
     }
 
@@ -916,7 +917,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&app),
-            "Sending: waiting for Telegram · edit/delete/reply disabled · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Sending: waiting for Telegram · edit/delete/reply disabled · Enter input · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
     }
 
@@ -928,7 +929,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&app),
-            "Failed send: d dismiss · Input restored: Enter retry · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Failed send: d dismiss · Enter input to retry · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
     }
 
@@ -940,7 +941,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&reply_only),
-            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · c copy text · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: Up/PgUp older · Pg/Home/End move · Enter input · r reply · c copy text · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         reply_only
@@ -950,7 +951,7 @@ mod tests {
         reply_only.state.selected_message_index = 1;
         assert_eq!(
             help_bar_controls(&reply_only),
-            "Messages: Up/Pg/Home/End move · Down input · r reply · c copy text · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: Up/Pg/Home/End move · Enter input · r reply · c copy text · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         reply_only
@@ -960,7 +961,7 @@ mod tests {
         reply_only.state.selected_message_index = 1;
         assert_eq!(
             help_bar_controls(&reply_only),
-            "Messages: Up/Down/Pg/Home/End move · r reply · c copy text · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: Up/Down/Pg/Home/End move · Enter input · r reply · c copy text · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         let mut full_actions = App::new();
@@ -971,7 +972,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&full_actions),
-            "Messages: Up/PgUp older · Down input · Pg/Home/End move · e edit · r reply · c copy text · d delete · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: Up/PgUp older · Pg/Home/End move · Enter input · e edit · r reply · c copy text · d delete · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         let mut link_actions = App::new();
@@ -981,7 +982,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&link_actions),
-            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · c copy text · o open link · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: Up/PgUp older · Pg/Home/End move · Enter input · r reply · c copy text · o open link · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         let mut media_actions = App::new();
@@ -991,7 +992,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&media_actions),
-            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · c copy text · s save media · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: Up/PgUp older · Pg/Home/End move · Enter input · r reply · c copy text · s save media · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
 
         media_actions
@@ -999,7 +1000,7 @@ mod tests {
             .record_downloaded_media(10, -1, "/tmp/downloaded-photo.jpg".into());
         assert_eq!(
             help_bar_controls(&media_actions),
-            "Messages: Up/PgUp older · Down input · Pg/Home/End move · r reply · c copy text · s save media · v open saved · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: Up/PgUp older · Pg/Home/End move · Enter input · r reply · c copy text · s save media · v open saved · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
     }
 
@@ -1013,7 +1014,7 @@ mod tests {
 
         assert_eq!(
             help_bar_controls(&app),
-            "Messages: no older history · Down input · Pg/Home/End move · r reply · c copy text · Left chats · Tab focus · q quit · < > resize · ? hide help"
+            "Messages: no older history · Pg/Home/End move · Enter input · r reply · c copy text · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
     }
 }

@@ -880,6 +880,64 @@ async fn run_interaction_smoke<C: TelegramClient + Clone + Send + Sync + 'static
         ));
     }
 
+    handle_key_event(app, smoke_key(KeyCode::Up), client).await?;
+    handle_key_event(app, smoke_key(KeyCode::Up), client).await?;
+    if app.state.selected_chat_index != 0 || app.state.focused_panel != state::FocusedPanel::Chats {
+        return Err(color_eyre::eyre::eyre!(
+            "Up at the first chat changed focus or selection"
+        ));
+    }
+    handle_key_event(app, smoke_key(KeyCode::Down), client).await?;
+
+    let active_messages = app
+        .state
+        .messages
+        .iter()
+        .map(|message| message.id)
+        .collect::<Vec<_>>();
+    let active_load_status = app.state.conversation_load_status;
+    handle_key_event(app, smoke_key(KeyCode::Char('/')), client).await?;
+    handle_key_event(app, smoke_key(KeyCode::Down), client).await?;
+    if app.state.selected_chat_index != 1
+        || app.state.selected_chat_search_result_index() != Some(2)
+        || app
+            .state
+            .messages
+            .iter()
+            .map(|message| message.id)
+            .ne(active_messages.iter().copied())
+        || app.state.conversation_load_status != active_load_status
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "chat search browsing changed the open conversation"
+        ));
+    }
+    handle_key_event(app, smoke_key(KeyCode::Esc), client).await?;
+    if app.state.chat_search_active() || app.state.selected_chat_index != 1 {
+        return Err(color_eyre::eyre::eyre!(
+            "cancelling chat search changed the open conversation"
+        ));
+    }
+
+    handle_key_event(app, smoke_key(KeyCode::Char('/')), client).await?;
+    handle_key_event(app, smoke_key(KeyCode::Down), client).await?;
+    handle_key_event(app, smoke_key(KeyCode::Enter), client).await?;
+    if app.state.chat_search_active() || app.state.selected_chat_index != 2 {
+        return Err(color_eyre::eyre::eyre!(
+            "committing chat search did not open exactly the browsed chat"
+        ));
+    }
+    handle_key_event(app, smoke_key(KeyCode::Char('/')), client).await?;
+    for character in "bob".chars() {
+        handle_key_event(app, smoke_key(KeyCode::Char(character)), client).await?;
+    }
+    handle_key_event(app, smoke_key(KeyCode::Enter), client).await?;
+    if app.state.chat_search_active() || app.state.selected_chat_index != 1 {
+        return Err(color_eyre::eyre::eyre!(
+            "search commit did not return to the second mock chat"
+        ));
+    }
+
     handle_key_event(app, smoke_key(KeyCode::Right), client).await?;
     handle_key_event(app, smoke_key(KeyCode::End), client).await?;
     handle_key_event(app, smoke_key(KeyCode::Char('e')), client).await?;
@@ -1149,6 +1207,14 @@ async fn run_interaction_smoke<C: TelegramClient + Clone + Send + Sync + 'static
             "End did not jump to the last message"
         ));
     }
+    handle_key_event(app, smoke_key(KeyCode::Down), client).await?;
+    if app.state.focused_panel != state::FocusedPanel::Messages
+        || !app.state.selected_message_is_last()
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "Down at the last message changed focus or selection"
+        ));
+    }
     handle_key_event(app, smoke_key(KeyCode::Home), client).await?;
     if app.state.selected_message_index != 0 || app.state.message_scroll_offset != 0 {
         return Err(color_eyre::eyre::eyre!(
@@ -1161,8 +1227,15 @@ async fn run_interaction_smoke<C: TelegramClient + Clone + Send + Sync + 'static
             "threaded mock chat did not expose topic tabs before topic-open smoke"
         ));
     }
-    handle_key_event(app, smoke_key(KeyCode::Enter), client).await?;
-    if app.state.messages.is_empty()
+    handle_key_event(app, smoke_key(KeyCode::Right), client).await?;
+    if app.state.selected_thread_topic_index != 1 {
+        return Err(color_eyre::eyre::eyre!(
+            "Right in messages did not open the next mock topic"
+        ));
+    }
+    handle_key_event(app, smoke_key(KeyCode::Left), client).await?;
+    if app.state.selected_thread_topic_index != 0
+        || app.state.messages.is_empty()
         || !app
             .state
             .messages
@@ -1170,7 +1243,13 @@ async fn run_interaction_smoke<C: TelegramClient + Clone + Send + Sync + 'static
             .all(|message| message.chat_id == 3 && message.thread_topic_id == Some(101))
     {
         return Err(color_eyre::eyre::eyre!(
-            "Enter in messages did not load the selected mock topic history"
+            "Left in messages did not return to the first mock topic"
+        ));
+    }
+    handle_key_event(app, smoke_key(KeyCode::Enter), client).await?;
+    if app.state.focused_panel != state::FocusedPanel::Input {
+        return Err(color_eyre::eyre::eyre!(
+            "Enter in messages did not focus input"
         ));
     }
 
@@ -3853,6 +3932,7 @@ async fn open_chat_at_with_optional_async_loader<
     chat_message_loader: &mut Option<&mut ChatMessageLoader<C>>,
     index: usize,
 ) -> Result<()> {
+    app.state.clear_chat_search();
     let Some(chat_id) = actions::begin_open_chat_at(&mut app.state, index) else {
         return Ok(());
     };
@@ -4195,14 +4275,15 @@ mod tests {
         apply_subscribe_updates_result, apply_update_with_read_ack, check_auth_ok_message,
         check_auth_unauthorized_message, check_config_message, check_config_session_status,
         classify_terminal_event, default_config_path_string, drain_ready_results,
-        ensure_session_parent_dir, handle_input_focused, handle_key_event_with_progress,
-        handle_mouse_event, load_checked_config, load_checked_config_with_session_parent,
-        login_2fa_hint_message, login_2fa_signed_in_message, login_code_sent_message,
-        login_failed_message, login_signed_in_message, message_submit_action_status,
-        older_message_key_navigation, open_chat_at_with_optional_async_loader, parse_args_from,
-        prepare_loop_step, preserve_prompt_input_line_spaces, require_prompt_line,
-        require_prompt_response, save_app_preferences, save_app_preferences_if_changed,
-        sleep_until_optional, smoke_ok_message, trim_prompt_input_line, validate_config,
+        ensure_session_parent_dir, handle_input_focused, handle_key_event,
+        handle_key_event_with_progress, handle_mouse_event, load_checked_config,
+        load_checked_config_with_session_parent, login_2fa_hint_message,
+        login_2fa_signed_in_message, login_code_sent_message, login_failed_message,
+        login_signed_in_message, message_submit_action_status, older_message_key_navigation,
+        open_chat_at_with_optional_async_loader, parse_args_from, prepare_loop_step,
+        preserve_prompt_input_line_spaces, require_prompt_line, require_prompt_response,
+        save_app_preferences, save_app_preferences_if_changed, sleep_until_optional,
+        smoke_ok_message, trim_prompt_input_line, validate_config,
     };
     use crate::app::App;
     use crate::config::telegram::{Config, TelegramConfig};
@@ -5367,6 +5448,70 @@ mod tests {
                 .is_err(),
             "no-op chat open should not spawn a message loader"
         );
+    }
+
+    #[tokio::test]
+    async fn keyboard_mouse_and_context_search_commits_all_clear_search() {
+        let mut keyboard_app = App::new();
+        keyboard_app.state.chats = vec![chat(1), chat(2)];
+        keyboard_app.state.focused_panel = FocusedPanel::Chats;
+        keyboard_app.state.begin_chat_search();
+        keyboard_app.state.push_chat_search_char('2');
+        let mut keyboard_client = MockTelegramClient::new();
+
+        handle_key_event(
+            &mut keyboard_app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut keyboard_client,
+        )
+        .await
+        .expect("keyboard search commit should succeed");
+        assert_eq!(keyboard_app.state.selected_chat_index, 1);
+        assert!(!keyboard_app.state.chat_search_active());
+
+        let mut mouse_app = App::new();
+        mouse_app.state.chats = vec![chat(1), chat(2)];
+        mouse_app.state.chats_area = Rect::new(0, 5, 30, 8);
+        mouse_app.state.focused_panel = FocusedPanel::Chats;
+        mouse_app.state.begin_chat_search();
+        mouse_app.state.push_chat_search_char('2');
+        let mut mouse_client = MockTelegramClient::new();
+
+        handle_mouse_event(
+            &mut mouse_app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut mouse_client,
+        )
+        .await
+        .expect("mouse search commit should succeed");
+        assert_eq!(mouse_app.state.selected_chat_index, 1);
+        assert!(!mouse_app.state.chat_search_active());
+
+        let mut menu_app = App::new();
+        menu_app.state.chats = vec![chat(1), chat(2)];
+        menu_app.state.focused_panel = FocusedPanel::Chats;
+        menu_app.state.begin_chat_search();
+        assert!(
+            menu_app
+                .state
+                .open_context_menu(ContextMenuTarget::Chat { chat_id: 2 }, 1, 1,)
+        );
+        let mut menu_client = MockTelegramClient::new();
+
+        handle_key_event(
+            &mut menu_app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut menu_client,
+        )
+        .await
+        .expect("context menu search commit should succeed");
+        assert_eq!(menu_app.state.selected_chat_index, 1);
+        assert!(!menu_app.state.chat_search_active());
     }
 
     #[tokio::test]

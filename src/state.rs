@@ -305,6 +305,7 @@ pub struct AppState {
     pub chat_scroll_offset: usize,
     pub chat_search_query: Option<String>,
     pub chat_search_scroll_offset: usize,
+    chat_search_selected_index: usize,
     pub selected_message_index: usize,
     pub message_scroll_offset: usize,
     pub focused_panel: FocusedPanel,
@@ -355,6 +356,7 @@ impl AppState {
             chat_scroll_offset: 0,
             chat_search_query: None,
             chat_search_scroll_offset: 0,
+            chat_search_selected_index: 0,
             selected_message_index: 0,
             message_scroll_offset: 0,
             focused_panel: FocusedPanel::Folders,
@@ -970,11 +972,15 @@ impl AppState {
     pub fn begin_chat_search(&mut self) {
         self.chat_search_query = Some(String::new());
         self.chat_search_scroll_offset = 0;
+        self.chat_search_selected_index =
+            self.selected_chat_index.min(last_index(self.chats.len()));
+        self.ensure_selected_chat_search_visible();
     }
 
     pub fn clear_chat_search(&mut self) {
         self.chat_search_query = None;
         self.chat_search_scroll_offset = 0;
+        self.chat_search_selected_index = 0;
         self.ensure_selected_chat_visible();
     }
 
@@ -1010,15 +1016,31 @@ impl AppState {
     }
 
     pub fn selected_chat_display_index(&self) -> Option<usize> {
-        self.chat_display_indices()
-            .iter()
-            .position(|&index| index == self.selected_chat_index)
+        if self.chat_search_active() {
+            let match_count = self.chat_display_indices().len();
+            return (match_count > 0)
+                .then_some(self.chat_search_selected_index.min(last_index(match_count)));
+        }
+        self.chats
+            .get(self.selected_chat_index)
+            .map(|_| self.selected_chat_index)
+    }
+
+    pub fn selected_chat_search_result_index(&self) -> Option<usize> {
+        if !self.chat_search_active() {
+            return None;
+        }
+        let indices = self.chat_display_indices();
+        indices
+            .get(
+                self.chat_search_selected_index
+                    .min(last_index(indices.len())),
+            )
+            .copied()
     }
 
     fn select_first_chat_search_match(&mut self) {
-        if let Some(index) = self.chat_display_indices().first().copied() {
-            self.selected_chat_index = index;
-        }
+        self.chat_search_selected_index = 0;
         self.ensure_selected_chat_search_visible();
     }
 
@@ -1036,18 +1058,14 @@ impl AppState {
 
         let capacity = self.chat_visible_capacity();
         let max_scroll_offset = indices.len().saturating_sub(capacity);
+        self.chat_search_selected_index = self
+            .chat_search_selected_index
+            .min(last_index(indices.len()));
         self.chat_search_scroll_offset = self.chat_search_scroll_offset.min(max_scroll_offset);
-        let Some(selected_display_index) = indices
-            .iter()
-            .position(|&index| index == self.selected_chat_index)
-        else {
-            return;
-        };
-
-        if selected_display_index < self.chat_search_scroll_offset {
-            self.chat_search_scroll_offset = selected_display_index;
-        } else if selected_display_index >= self.chat_search_scroll_offset + capacity {
-            self.chat_search_scroll_offset = selected_display_index + 1 - capacity;
+        if self.chat_search_selected_index < self.chat_search_scroll_offset {
+            self.chat_search_scroll_offset = self.chat_search_selected_index;
+        } else if self.chat_search_selected_index >= self.chat_search_scroll_offset + capacity {
+            self.chat_search_scroll_offset = self.chat_search_selected_index + 1 - capacity;
         }
     }
 
@@ -1056,12 +1074,10 @@ impl AppState {
         if indices.is_empty() {
             return;
         }
-        let position = indices
-            .iter()
-            .position(|&index| index == self.selected_chat_index)
-            .unwrap_or(0);
-        let next_position = (position + 1).min(indices.len() - 1);
-        self.selected_chat_index = indices[next_position];
+        self.chat_search_selected_index = self
+            .chat_search_selected_index
+            .saturating_add(1)
+            .min(indices.len() - 1);
         self.ensure_selected_chat_search_visible();
     }
 
@@ -1070,12 +1086,7 @@ impl AppState {
         if indices.is_empty() {
             return;
         }
-        let position = indices
-            .iter()
-            .position(|&index| index == self.selected_chat_index)
-            .unwrap_or(0);
-        let previous_position = position.saturating_sub(1);
-        self.selected_chat_index = indices[previous_position];
+        self.chat_search_selected_index = self.chat_search_selected_index.saturating_sub(1);
         self.ensure_selected_chat_search_visible();
     }
 
@@ -1839,6 +1850,7 @@ impl AppState {
     pub fn reset_chat_selection(&mut self) {
         self.selected_chat_index = 0;
         self.chat_scroll_offset = 0;
+        self.chat_search_selected_index = 0;
     }
 
     pub fn message_visible_capacity(&self) -> usize {
@@ -4203,6 +4215,9 @@ mod tests {
             chat(2, "Work Team"),
             chat(3, "Project Alpha"),
         ];
+        state.messages = vec![message(9)];
+        state.input_buffer = "draft".to_string();
+        state.conversation_load_status = ConversationLoadStatus::Loaded;
         state.begin_chat_search();
 
         state.push_chat_search_char('p');
@@ -4212,7 +4227,15 @@ mod tests {
         state.push_chat_search_char('o');
         state.push_chat_search_char('j');
         assert_eq!(state.chat_display_indices(), vec![2]);
-        assert_eq!(state.selected_chat_index, 2);
+        assert_eq!(state.selected_chat_index, 0);
+        assert_eq!(state.selected_chat_search_result_index(), Some(2));
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].id, 9);
+        assert_eq!(state.input_buffer, "draft");
+        assert_eq!(
+            state.conversation_load_status,
+            ConversationLoadStatus::Loaded
+        );
 
         state.pop_chat_search_char();
         state.pop_chat_search_char();
@@ -4220,6 +4243,7 @@ mod tests {
 
         state.chat_search_query = Some("wt".to_string());
         assert_eq!(state.chat_display_indices(), vec![1]);
+        assert_eq!(state.selected_chat_search_result_index(), Some(1));
     }
 
     #[test]
@@ -4232,7 +4256,9 @@ mod tests {
             state.select_next_chat_search_match();
         }
 
-        assert_eq!(state.selected_chat_index, 5);
+        assert_eq!(state.selected_chat_index, 0);
+        assert_eq!(state.chat_search_selected_index, 5);
+        assert_eq!(state.selected_chat_search_result_index(), Some(5));
         assert_eq!(state.selected_chat_display_index(), Some(5));
         assert_eq!(state.chat_search_scroll_offset, 4);
         assert_eq!(state.chat_scroll_offset, 0);
@@ -4240,7 +4266,20 @@ mod tests {
         state.clear_chat_search();
         assert!(!state.chat_search_active());
         assert_eq!(state.chat_search_scroll_offset, 0);
-        assert_eq!(state.chat_scroll_offset, 4);
+        assert_eq!(state.chat_scroll_offset, 0);
+    }
+
+    #[test]
+    fn empty_chat_search_starts_on_active_chat_without_changing_it() {
+        let mut state = state_with_many_chats();
+        state.select_chat(5);
+
+        state.begin_chat_search();
+
+        assert_eq!(state.selected_chat_index, 5);
+        assert_eq!(state.chat_search_selected_index, 5);
+        assert_eq!(state.selected_chat_search_result_index(), Some(5));
+        assert_eq!(state.chat_search_scroll_offset, 4);
     }
 
     #[test]

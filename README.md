@@ -101,7 +101,7 @@ The bottom help bar shows available actions for the current focus. Press `?` out
 Navigation:
 
 - `Tab` — cycle focus: folders, chats, messages, input.
-- Arrow keys — move selection or focus depending on the active panel.
+- Arrow keys — move selection; explicit Left/Right panel controls are shown in the help bar, and list boundaries stop instead of changing focus.
 - `PageUp` / `PageDown` / `Home` / `End` — move through messages.
 - `Up` or `PageUp` on the first loaded message — load older history.
 - `<` / `>` — resize chat/message split outside input.
@@ -111,13 +111,13 @@ Chat actions:
 
 - `/` — search loaded chats by name while the chat list is focused.
 - Type in chat search — filter loaded chats; substring and simple fuzzy/subsequence matches are supported.
-- `Up` / `Down` in chat search — move to and open another matching result.
-- `Enter` — open the selected search result and leave chat search.
+- `Up` / `Down` in chat search — browse matches without opening them.
+- `Enter` — open the highlighted search result and leave chat search.
 - `Esc` — clear chat search.
 
 Message actions:
 
-- `Enter` in input — send, save edit, or send reply when text is present.
+- `Enter` in messages — focus the input; `Enter` in input sends, saves an edit, or sends a reply when text is present.
 - `e` — edit selected own editable message.
 - `r` — reply to selected message.
 - `d` — delete selected own deletable message, or dismiss a failed local send.

@@ -22,13 +22,7 @@ pub fn handle_message_key(state: &mut AppState, key: KeyEvent) -> MessageKeyOutc
         KeyCode::PageUp => state.page_messages_up(),
         KeyCode::Home => state.select_first_message(),
         KeyCode::End => state.select_last_message(),
-        KeyCode::Down => {
-            if state.selected_message_is_last() {
-                state.focused_panel = FocusedPanel::Input;
-            } else {
-                state.select_next_message();
-            }
-        }
+        KeyCode::Down => state.select_next_message(),
         KeyCode::Up => state.select_prev_message(),
         KeyCode::Left if state.thread_topics.is_empty() => {
             state.focused_panel = FocusedPanel::Chats
@@ -42,9 +36,7 @@ pub fn handle_message_key(state: &mut AppState, key: KeyEvent) -> MessageKeyOutc
             state.select_next_thread_topic();
             return MessageKeyOutcome::OpenSelectedThreadTopic;
         }
-        KeyCode::Enter if !state.thread_topics.is_empty() => {
-            return MessageKeyOutcome::OpenSelectedThreadTopic;
-        }
+        KeyCode::Enter => state.focused_panel = FocusedPanel::Input,
         KeyCode::Char('[') => {
             state.select_prev_thread_topic();
             return MessageKeyOutcome::OpenSelectedThreadTopic;
@@ -98,7 +90,7 @@ mod tests {
     }
 
     #[test]
-    fn message_keys_move_selection_and_focus_input_at_bottom() {
+    fn message_keys_move_selection_and_stop_at_bottom() {
         let mut state = AppState::new();
         state.focused_panel = FocusedPanel::Messages;
         state.messages = vec![message(1), message(2)];
@@ -114,7 +106,8 @@ mod tests {
             handle_message_key(&mut state, key(KeyCode::Down)),
             MessageKeyOutcome::Handled
         );
-        assert_eq!(state.focused_panel, FocusedPanel::Input);
+        assert_eq!(state.focused_panel, FocusedPanel::Messages);
+        assert_eq!(state.selected_message_index, 1);
     }
 
     #[test]
@@ -185,20 +178,34 @@ mod tests {
 
         assert_eq!(
             handle_message_key(&mut state, key(KeyCode::Enter)),
+            MessageKeyOutcome::Handled
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Input);
+        assert_eq!(state.selected_thread_topic_index, 0);
+
+        state.focused_panel = FocusedPanel::Messages;
+        assert_eq!(
+            handle_message_key(&mut state, key(KeyCode::Char(']'))),
+            MessageKeyOutcome::OpenSelectedThreadTopic
+        );
+        assert_eq!(state.selected_thread_topic_index, 1);
+        assert_eq!(
+            handle_message_key(&mut state, key(KeyCode::Char('['))),
             MessageKeyOutcome::OpenSelectedThreadTopic
         );
         assert_eq!(state.selected_thread_topic_index, 0);
     }
 
     #[test]
-    fn message_keys_ignore_enter_when_no_thread_topics_are_loaded() {
+    fn message_enter_focuses_input_without_thread_topics() {
         let mut state = AppState::new();
         state.focused_panel = FocusedPanel::Messages;
 
         assert_eq!(
             handle_message_key(&mut state, key(KeyCode::Enter)),
-            MessageKeyOutcome::Ignored
+            MessageKeyOutcome::Handled
         );
+        assert_eq!(state.focused_panel, FocusedPanel::Input);
     }
 
     #[test]
