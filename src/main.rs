@@ -40,7 +40,10 @@ use std::collections::HashMap;
 use std::future::{pending, poll_fn};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 use std::{fs, io};
 use telegram::types::{Message, ThreadTopic, Update};
@@ -51,6 +54,7 @@ const LOADING_TELEGRAM_STATUS: &str = "Loading Telegram data…";
 const LOADING_OLDER_MESSAGES_STATUS: &str = "Loading older messages…";
 const LOADING_CHAT_MESSAGES_STATUS: &str = "Loading chat messages…";
 const LOADING_FOLDER_CHATS_STATUS: &str = "Loading folder chats…";
+const REFRESHING_LATEST_BEFORE_SEND_STATUS: &str = "Refreshing latest before send…";
 const TELEGRAM_STATE_REFRESHED_STATUS: &str = "Telegram state refreshed";
 const TELEGRAM_UPDATES_DISCONNECTED_ERROR: &str =
     "Telegram updates disconnected; retrying subscription";
@@ -1193,8 +1197,9 @@ async fn run_interaction_smoke<C: TelegramClient + Clone + Send + Sync + 'static
 
     app.state.focused_panel = state::FocusedPanel::Messages;
     app.state.selected_message_index = 1;
+    let expected_edit_id = app.state.selected_message().map(|message| message.id);
     handle_key_event(app, smoke_key(KeyCode::Char('e')), client).await?;
-    if app.state.editing_message_id != Some(2) || app.state.input_buffer == "team draft" {
+    if app.state.editing_message_id != expected_edit_id || app.state.input_buffer == "team draft" {
         return Err(color_eyre::eyre::eyre!(
             "edit mode did not replace the draft with selected message text"
         ));
@@ -1793,6 +1798,7 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
             mark_read_loader,
             media_preview_loader,
         );
+        release_gap_submit_if_ready(app, send_message_loader, reply_message_loader);
         if step.dirty {
             frames.mark_dirty(TokioInstant::now());
         }
@@ -1872,6 +1878,16 @@ fn prepare_loop_step<C: TelegramClient + Clone + Send + Sync + 'static>(
     mark_read_loader: &MarkChatReadLoader<C>,
     media_preview_loader: &MediaPreviewLoader<C>,
 ) -> PreparedLoopStep {
+    let blocked_terminal_event = app.state.gap_submit_pending()
+        && loop_state.staged_terminal_event.is_some()
+        || app.state.reply_submission_pending()
+            && matches!(
+                loop_state.staged_terminal_event,
+                Some(Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                }))
+            );
     let results_dirty = drain_ready_results(
         loop_state,
         app,
@@ -1883,9 +1899,15 @@ fn prepare_loop_step<C: TelegramClient + Clone + Send + Sync + 'static>(
         mark_read_loader,
         media_preview_loader,
     );
+    let terminal_event = if blocked_terminal_event {
+        loop_state.staged_terminal_event.take();
+        None
+    } else {
+        loop_state.staged_terminal_event.take()
+    };
     PreparedLoopStep {
-        dirty: app.state.check_notification_timeout() || results_dirty,
-        terminal_event: loop_state.staged_terminal_event.take(),
+        dirty: app.state.check_notification_timeout() || results_dirty || blocked_terminal_event,
+        terminal_event,
     }
 }
 
@@ -2650,10 +2672,17 @@ struct ChatMessageLoad {
     thread_topics: Option<Vec<ThreadTopic>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatMessageLoadPurpose {
+    OpenConversation,
+    RefreshNewerGap { generation: u64 },
+}
+
 struct ChatMessageLoadResult {
     request_id: u64,
     chat_id: i64,
     topic_id: Option<i32>,
+    purpose: ChatMessageLoadPurpose,
     result: std::result::Result<ChatMessageLoad, String>,
 }
 
@@ -2692,7 +2721,9 @@ struct EditMessageResult {
 }
 
 struct ReplyMessageResult {
+    request_id: u64,
     chat_id: i64,
+    thread_top_message_id: Option<i32>,
     message_id: i32,
     result: std::result::Result<Message, String>,
 }
@@ -2932,6 +2963,10 @@ where
     }
 
     fn spawn_latest_chat_messages(&mut self, chat_id: i64) {
+        self.spawn_latest_chat_messages_for(chat_id, ChatMessageLoadPurpose::OpenConversation);
+    }
+
+    fn spawn_latest_chat_messages_for(&mut self, chat_id: i64, purpose: ChatMessageLoadPurpose) {
         abort_running_task(
             &mut self.current_handle,
             "messages_load_abort",
@@ -2948,27 +2983,54 @@ where
         );
         self.current_handle = Some(tokio::spawn(async move {
             let result = match actions::fetch_latest_chat_messages(&client, chat_id).await {
-                Ok(messages) => {
-                    let thread_topics = actions::fetch_chat_thread_topics(&client, chat_id)
-                        .await
-                        .unwrap_or_default();
-                    Ok(ChatMessageLoad {
-                        messages,
-                        thread_topics: Some(thread_topics),
-                    })
+                Ok(chat_messages) => {
+                    match actions::fetch_chat_thread_topics(&client, chat_id).await {
+                        Ok(thread_topics) => {
+                            let topic_id = thread_topics.first().map(|topic| topic.id);
+                            let messages = match topic_id {
+                                Some(topic_id) => {
+                                    actions::fetch_thread_topic_messages(&client, chat_id, topic_id)
+                                        .await
+                                }
+                                None => Ok(chat_messages),
+                            };
+                            (
+                                topic_id,
+                                messages.map(|messages| ChatMessageLoad {
+                                    messages,
+                                    thread_topics: Some(thread_topics),
+                                }),
+                            )
+                        }
+                        Err(error) => (None, Err(error)),
+                    }
                 }
-                Err(error) => Err(error),
+                Err(error) => (None, Err(error)),
             };
             let _ = tx.send(ChatMessageLoadResult {
                 request_id,
                 chat_id,
-                topic_id: None,
-                result,
+                topic_id: result.0,
+                purpose,
+                result: result.1,
             });
         }));
     }
 
     fn spawn_thread_topic_messages(&mut self, chat_id: i64, topic_id: i32) {
+        self.spawn_thread_topic_messages_for(
+            chat_id,
+            topic_id,
+            ChatMessageLoadPurpose::OpenConversation,
+        );
+    }
+
+    fn spawn_thread_topic_messages_for(
+        &mut self,
+        chat_id: i64,
+        topic_id: i32,
+        purpose: ChatMessageLoadPurpose,
+    ) {
         abort_running_task(
             &mut self.current_handle,
             "messages_load_abort",
@@ -2994,9 +3056,24 @@ where
                 request_id,
                 chat_id,
                 topic_id: Some(topic_id),
+                purpose,
                 result,
             });
         }));
+    }
+
+    fn spawn_newer_gap_refresh(
+        &mut self,
+        chat_id: i64,
+        topic_id: Option<i32>,
+        generation: u64,
+    ) -> u64 {
+        let purpose = ChatMessageLoadPurpose::RefreshNewerGap { generation };
+        match topic_id {
+            Some(topic_id) => self.spawn_thread_topic_messages_for(chat_id, topic_id, purpose),
+            None => self.spawn_latest_chat_messages_for(chat_id, purpose),
+        }
+        self.latest_request_id
     }
 }
 
@@ -3096,6 +3173,7 @@ struct EditMessageLoader<C> {
 struct ReplyMessageLoader<C> {
     client: C,
     tx: UiSender<ReplyMessageResult>,
+    next_request_id: AtomicU64,
 }
 
 struct DownloadMediaLoader<C> {
@@ -3217,6 +3295,7 @@ where
         Self {
             client,
             tx: tx.into(),
+            next_request_id: AtomicU64::new(1),
         }
     }
 
@@ -3226,7 +3305,8 @@ where
         thread_top_message_id: Option<i32>,
         message_id: i32,
         content: String,
-    ) {
+    ) -> u64 {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let client = self.client.clone();
         let tx = self.tx.clone();
         diagnostics::event(
@@ -3243,11 +3323,14 @@ where
             )
             .await;
             let _ = tx.send(ReplyMessageResult {
+                request_id,
                 chat_id,
+                thread_top_message_id,
                 message_id,
                 result,
             });
         });
+        request_id
     }
 }
 
@@ -3431,22 +3514,44 @@ fn apply_subscribe_updates_result(
     }
 }
 
-fn initial_load_read_ack_chat_id(load: &InitialStateLoadResult) -> Option<i64> {
-    let load = load.result.as_ref().ok()?;
-    if load.messages.as_ref().ok()?.is_empty() {
-        return None;
-    }
-    let chat = load.chats.first()?;
-    (chat.unread_count > 0).then_some(chat.id)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadedReadAck {
+    Chat(i64),
+    Thread {
+        chat_id: i64,
+        topic_id: i32,
+        max_message_id: i32,
+    },
 }
 
-fn folder_chat_load_read_ack_chat_id(load: &FolderChatLoadResult) -> Option<i64> {
-    let load = load.result.as_ref().ok()?;
-    if load.messages.as_ref().ok()?.is_empty() {
+fn loaded_read_ack(
+    chats: &[telegram::types::Chat],
+    messages: &std::result::Result<Vec<Message>, String>,
+    thread_topics: &[ThreadTopic],
+) -> Option<LoadedReadAck> {
+    let messages = messages.as_ref().ok()?;
+    if messages.is_empty() {
         return None;
     }
-    let chat = load.chats.first()?;
-    (chat.unread_count > 0).then_some(chat.id)
+    let chat = chats.first()?;
+    if let Some(topic) = thread_topics.first() {
+        return (topic.unread_count > 0).then(|| LoadedReadAck::Thread {
+            chat_id: chat.id,
+            topic_id: topic.id,
+            max_message_id: messages.iter().map(|message| message.id).max().unwrap_or(0),
+        });
+    }
+    (chat.unread_count > 0).then_some(LoadedReadAck::Chat(chat.id))
+}
+
+fn initial_load_read_ack(load: &InitialStateLoadResult) -> Option<LoadedReadAck> {
+    let load = load.result.as_ref().ok()?;
+    loaded_read_ack(&load.chats, &load.messages, &load.thread_topics)
+}
+
+fn folder_chat_load_read_ack(load: &FolderChatLoadResult) -> Option<LoadedReadAck> {
+    let load = load.result.as_ref().ok()?;
+    loaded_read_ack(&load.chats, &load.messages, &load.thread_topics)
 }
 
 fn selected_chat_needs_read_ack(app: &App, chat_id: i64, messages: &[Message]) -> bool {
@@ -3467,12 +3572,22 @@ fn apply_initial_state_load_result<C>(
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
     diagnostics::event("initial_load_result", "received=true");
-    let read_ack_chat_id = initial_load_read_ack_chat_id(&load);
+    let read_ack = initial_load_read_ack(&load);
     actions::apply_initial_state_load_result(&mut app.state, load.result);
-    if let Some(chat_id) =
-        read_ack_chat_id.filter(|chat_id| app.state.selected_chat_id() == Some(*chat_id))
-    {
-        mark_read_loader.spawn_mark_chat_read(chat_id);
+    match read_ack {
+        Some(LoadedReadAck::Chat(chat_id)) if app.state.selected_chat_id() == Some(chat_id) => {
+            mark_read_loader.spawn_mark_chat_read(chat_id);
+        }
+        Some(LoadedReadAck::Thread {
+            chat_id,
+            topic_id,
+            max_message_id,
+        }) if app.state.selected_chat_id() == Some(chat_id)
+            && app.state.selected_thread_topic().map(|topic| topic.id) == Some(topic_id) =>
+        {
+            mark_read_loader.spawn_mark_thread_read(chat_id, topic_id, max_message_id);
+        }
+        _ => {}
     }
     diagnostics::event(
         "state_after_initial_load",
@@ -3492,7 +3607,21 @@ fn apply_send_message_result(app: &mut App, load: SendMessageResult) {
         "send_message_result",
         format!("temp_id={} chat_id={}", load.temp_id, load.chat_id),
     );
-    actions::apply_send_message_result(&mut app.state, load.temp_id, load.result);
+    let pending_topic_id = app
+        .state
+        .messages
+        .iter()
+        .find(|message| message.chat_id == load.chat_id && message.id == load.temp_id)
+        .map(|message| message.thread_topic_id);
+    let selected_topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
+    let pending_matches_scope = pending_topic_id.is_some_and(|pending_topic_id| {
+        selected_topic_id.is_none_or(|topic_id| pending_topic_id == Some(topic_id))
+    });
+    if app.state.selected_chat_id() == Some(load.chat_id) && pending_matches_scope {
+        actions::apply_send_message_result(&mut app.state, load.temp_id, load.result);
+    } else {
+        diagnostics::event("send_message_result_ignored", "reason=stale_context");
+    }
 }
 
 fn apply_delete_message_result(app: &mut App, load: DeleteMessageResult) {
@@ -3511,7 +3640,23 @@ fn apply_edit_message_result(app: &mut App, load: EditMessageResult) {
         "edit_message_result",
         format!("chat_id={} message_id={}", load.chat_id, load.message_id),
     );
-    actions::apply_edit_message_result(&mut app.state, load.message_id, load.content, load.result);
+    if app.state.selected_chat_id() == Some(load.chat_id)
+        && app.state.editing_message_id == Some(load.message_id)
+        && app
+            .state
+            .messages
+            .iter()
+            .any(|message| message.chat_id == load.chat_id && message.id == load.message_id)
+    {
+        actions::apply_edit_message_result(
+            &mut app.state,
+            load.message_id,
+            load.content,
+            load.result,
+        );
+    } else {
+        diagnostics::event("edit_message_result_ignored", "reason=stale_context");
+    }
 }
 
 fn apply_reply_message_result(app: &mut App, load: ReplyMessageResult) {
@@ -3519,7 +3664,21 @@ fn apply_reply_message_result(app: &mut App, load: ReplyMessageResult) {
         "reply_message_result",
         format!("chat_id={} message_id={}", load.chat_id, load.message_id),
     );
-    actions::apply_reply_message_result(&mut app.state, load.result);
+    if app.state.selected_chat_id() == Some(load.chat_id)
+        && app.state.reply_submission_matches(load.request_id)
+        && app.state.selected_thread_topic().map(|topic| topic.id) == load.thread_top_message_id
+        && app.state.replying_to_message_id == Some(load.message_id)
+        && app
+            .state
+            .has_message_identity(load.chat_id, load.message_id)
+    {
+        actions::apply_reply_message_result(&mut app.state, load.result);
+    } else {
+        if app.state.reply_submission_matches(load.request_id) {
+            app.state.finish_reply_submission();
+        }
+        diagnostics::event("reply_message_result_ignored", "reason=stale_context");
+    }
 }
 
 fn incoming_update_thread_read_ack(app: &App, update: &Update) -> Option<(i64, i32, i32)> {
@@ -3550,6 +3709,73 @@ fn apply_update_with_read_ack<C>(
     }
 }
 
+fn spawn_gap_submit<C>(
+    app: &mut App,
+    action: state::MessageSubmitAction,
+    send_message_loader: &SendMessageLoader<C>,
+    reply_message_loader: &ReplyMessageLoader<C>,
+) where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    match action {
+        state::MessageSubmitAction::Send {
+            chat_id,
+            thread_top_message_id,
+            content,
+        } => {
+            let pending = actions::begin_send_message(
+                &mut app.state,
+                chat_id,
+                thread_top_message_id,
+                content,
+            );
+            app.state.set_status(SENDING_MESSAGE_STATUS);
+            send_message_loader.spawn_send_message(pending);
+        }
+        state::MessageSubmitAction::Reply {
+            chat_id,
+            thread_top_message_id,
+            message_id,
+            content,
+        } => {
+            if !app.state.has_message_identity(chat_id, message_id) {
+                app.state.set_error(
+                    "Reply target is no longer in the latest message window".to_string(),
+                );
+                return;
+            }
+            if app.state.reply_submission_pending() {
+                return;
+            }
+            app.state.set_status(SENDING_REPLY_STATUS);
+            let request_id = reply_message_loader.spawn_reply_message(
+                chat_id,
+                thread_top_message_id,
+                message_id,
+                content,
+            );
+            app.state.begin_reply_submission(request_id);
+        }
+        state::MessageSubmitAction::Edit { .. } => {
+            diagnostics::event("gap_submit_ignored", "reason=unexpected_edit");
+        }
+    }
+}
+
+fn release_gap_submit_if_ready<C>(
+    app: &mut App,
+    send_message_loader: &SendMessageLoader<C>,
+    reply_message_loader: &ReplyMessageLoader<C>,
+) where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    if !app.state.newer_history_gap()
+        && let Some(action) = app.state.take_ready_gap_submit()
+    {
+        spawn_gap_submit(app, action, send_message_loader, reply_message_loader);
+    }
+}
+
 fn apply_chat_message_load_result<C>(
     app: &mut App,
     latest_request_id: u64,
@@ -3559,14 +3785,20 @@ fn apply_chat_message_load_result<C>(
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
-    if load.request_id != latest_request_id {
+    let request_id = load.request_id;
+    let gap_generation = match load.purpose {
+        ChatMessageLoadPurpose::OpenConversation => None,
+        ChatMessageLoadPurpose::RefreshNewerGap { generation } => Some(generation),
+    };
+    if request_id != latest_request_id {
         diagnostics::event(
             "messages_load_ignored",
             format!(
                 "reason=stale_request request_id={} latest_request_id={} chat_id={}",
-                load.request_id, latest_request_id, load.chat_id
+                request_id, latest_request_id, load.chat_id
             ),
         );
+        app.state.cancel_gap_submit_for_request(request_id);
         return false;
     }
 
@@ -3575,30 +3807,47 @@ where
             "messages_load_ignored",
             format!(
                 "reason=stale_chat request_id={} chat_id={} selected_chat_id={:?}",
-                load.request_id,
+                request_id,
                 load.chat_id,
                 app.state.selected_chat_id()
             ),
         );
+        app.state.cancel_gap_submit_for_request(request_id);
         return false;
     }
 
     let selected_topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
-    if selected_topic_id != load.topic_id {
+    let opening_first_topic = gap_generation.is_none()
+        && selected_topic_id.is_none()
+        && app.state.thread_topics.is_empty()
+        && load.topic_id.is_some();
+    if selected_topic_id != load.topic_id && !opening_first_topic {
         diagnostics::event(
             "messages_load_ignored",
             format!(
                 "reason=stale_topic request_id={} chat_id={} topic_id={:?} selected_topic_id={:?}",
-                load.request_id, load.chat_id, load.topic_id, selected_topic_id
+                request_id, load.chat_id, load.topic_id, selected_topic_id
             ),
         );
+        app.state.cancel_gap_submit_for_request(request_id);
         return false;
+    }
+
+    if gap_generation.is_some_and(|generation| generation != app.state.newer_history_generation()) {
+        app.state.cancel_gap_submit_for_request(request_id);
+        app.state
+            .set_error("Newer messages arrived during refresh; try again".to_string());
+        return true;
     }
 
     let chat_id = load.chat_id;
     let topic_id = load.topic_id;
     match load.result {
-        Ok(load) => {
+        Ok(mut load) => {
+            let latest_loaded_message_id = gap_generation
+                .is_some()
+                .then(|| load.messages.iter().map(|message| message.id).max())
+                .flatten();
             let thread_read_ack = topic_id.and_then(|topic_id| {
                 load.messages
                     .iter()
@@ -3608,21 +3857,42 @@ where
             });
             let should_mark_chat_read =
                 topic_id.is_none() && selected_chat_needs_read_ack(app, chat_id, &load.messages);
-            app.state.apply_loaded_selected_chat_messages(load.messages);
+            if gap_generation.is_none()
+                && let Some(thread_topics) = load.thread_topics.take()
+            {
+                app.state
+                    .apply_loaded_selected_chat_thread_topics(thread_topics);
+            }
+            if gap_generation.is_some() {
+                app.state
+                    .apply_refreshed_selected_chat_messages(load.messages);
+            } else {
+                app.state.apply_loaded_selected_chat_messages(load.messages);
+            }
             if let Some(thread_topics) = load.thread_topics {
                 app.state
                     .apply_loaded_selected_chat_thread_topics(thread_topics);
+            }
+            if let Some(message_id) = latest_loaded_message_id {
+                app.state.select_message_by_identity(chat_id, message_id);
             }
             if let Some((topic_id, max_message_id)) = thread_read_ack {
                 mark_read_loader.spawn_mark_thread_read(chat_id, topic_id, max_message_id);
             } else if should_mark_chat_read {
                 mark_read_loader.spawn_mark_chat_read(chat_id);
             }
+            app.state
+                .mark_gap_submit_ready(request_id, chat_id, topic_id);
             app.state.clear_status();
         }
         Err(error) => {
-            app.state.mark_conversation_load_failed();
-            app.state.set_error(error);
+            if gap_generation.is_some() {
+                app.state.cancel_gap_submit_for_request(request_id);
+                app.state.set_error(error);
+            } else {
+                app.state.mark_conversation_load_failed();
+                app.state.set_error(error);
+            }
         }
     }
     true
@@ -3665,12 +3935,22 @@ where
         return false;
     }
 
-    let read_ack_chat_id = folder_chat_load_read_ack_chat_id(&load);
+    let read_ack = folder_chat_load_read_ack(&load);
     actions::apply_folder_chat_load_result(&mut app.state, load.result);
-    if let Some(chat_id) =
-        read_ack_chat_id.filter(|chat_id| app.state.selected_chat_id() == Some(*chat_id))
-    {
-        mark_read_loader.spawn_mark_chat_read(chat_id);
+    match read_ack {
+        Some(LoadedReadAck::Chat(chat_id)) if app.state.selected_chat_id() == Some(chat_id) => {
+            mark_read_loader.spawn_mark_chat_read(chat_id);
+        }
+        Some(LoadedReadAck::Thread {
+            chat_id,
+            topic_id,
+            max_message_id,
+        }) if app.state.selected_chat_id() == Some(chat_id)
+            && app.state.selected_thread_topic().map(|topic| topic.id) == Some(topic_id) =>
+        {
+            mark_read_loader.spawn_mark_thread_read(chat_id, topic_id, max_message_id);
+        }
+        _ => {}
     }
     app.state.clear_status();
     true
@@ -4035,6 +4315,18 @@ async fn handle_key_event_with_progress<C: TelegramClient + Clone + Send + Sync 
             key.modifiers
         ),
     );
+    if app.state.gap_submit_pending()
+        || app.state.reply_submission_pending() && key.code == KeyCode::Enter
+    {
+        let status = if app.state.gap_submit_pending() {
+            REFRESHING_LATEST_BEFORE_SEND_STATUS
+        } else {
+            SENDING_REPLY_STATUS
+        };
+        app.state.set_status(status);
+        return Ok(());
+    }
+
     if app.state.context_menu().is_some() {
         let action = match key.code {
             KeyCode::Esc => {
@@ -4075,6 +4367,7 @@ async fn handle_key_event_with_progress<C: TelegramClient + Clone + Send + Sync 
             key,
             client,
             progress,
+            loaders.chat_message.as_deref_mut(),
             loaders.send_message,
             loaders.edit_message,
             loaders.reply_message,
@@ -4109,6 +4402,31 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
                 app.state.cancel_delete_confirmation();
             }
             confirm_keys::ConfirmKeyOutcome::Ignored => {}
+        }
+        return Ok(());
+    }
+
+    if newer_gap_refresh_requested(app, key) {
+        let Some(chat_id) = app.state.selected_chat_id() else {
+            return Ok(());
+        };
+        let topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
+        progress.show(app, LOADING_CHAT_MESSAGES_STATUS)?;
+        if let Some(loader) = loaders.chat_message.as_deref_mut() {
+            loader.spawn_newer_gap_refresh(chat_id, topic_id, app.state.newer_history_generation());
+        } else {
+            match fetch_newer_gap_messages(client, chat_id, topic_id).await {
+                Ok(load) => {
+                    app.state
+                        .apply_refreshed_selected_chat_messages(load.messages);
+                    if let Some(thread_topics) = load.thread_topics {
+                        app.state
+                            .apply_loaded_selected_chat_thread_topics(thread_topics);
+                    }
+                    app.state.clear_status();
+                }
+                Err(error) => app.state.set_error(error),
+            }
         }
         return Ok(());
     }
@@ -4240,6 +4558,42 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
     Ok(())
 }
 
+fn newer_gap_refresh_requested(app: &App, key: KeyEvent) -> bool {
+    if app.state.focused_panel != state::FocusedPanel::Messages || !app.state.newer_history_gap() {
+        return false;
+    }
+    key.code == KeyCode::End
+        || (app.state.selected_message_is_last()
+            && matches!(key.code, KeyCode::Down | KeyCode::PageDown))
+}
+
+async fn fetch_newer_gap_messages<C: TelegramClient>(
+    client: &C,
+    chat_id: i64,
+    topic_id: Option<i32>,
+) -> std::result::Result<ChatMessageLoad, String> {
+    if let Some(topic_id) = topic_id {
+        actions::fetch_thread_topic_messages(client, chat_id, topic_id)
+            .await
+            .map(|messages| ChatMessageLoad {
+                messages,
+                thread_topics: None,
+            })
+    } else {
+        match actions::fetch_latest_chat_messages(client, chat_id).await {
+            Ok(messages) => Ok(ChatMessageLoad {
+                messages,
+                thread_topics: Some(
+                    actions::fetch_chat_thread_topics(client, chat_id)
+                        .await
+                        .unwrap_or_default(),
+                ),
+            }),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 fn older_message_key_navigation(app: &App, key: KeyEvent) -> Option<OlderMessageNavigation> {
     if app.state.focused_panel != state::FocusedPanel::Messages
         || app.state.messages.is_empty()
@@ -4361,15 +4715,22 @@ async fn open_chat_at_with_optional_async_loader<
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_input_focused<C: TelegramClient + Clone + Send + Sync + 'static>(
     app: &mut App,
     key: KeyEvent,
     client: &mut C,
     progress: &mut UiProgress<'_>,
+    chat_message_loader: Option<&mut ChatMessageLoader<C>>,
     send_message_loader: Option<&SendMessageLoader<C>>,
     edit_message_loader: Option<&EditMessageLoader<C>>,
     reply_message_loader: Option<&ReplyMessageLoader<C>>,
 ) -> Result<()> {
+    if app.state.gap_submit_pending() {
+        app.state.set_status(REFRESHING_LATEST_BEFORE_SEND_STATUS);
+        return Ok(());
+    }
+
     let input_before = app.state.input_buffer.clone();
     let outcome = input_keys::handle_input_key(&mut app.state, key);
     if outcome != input_keys::InputKeyOutcome::Submit && input_before != app.state.input_buffer {
@@ -4392,6 +4753,51 @@ async fn handle_input_focused<C: TelegramClient + Clone + Send + Sync + 'static>
         let Some(action) = app.state.prepare_message_submit() else {
             return Ok(());
         };
+
+        let gap_submit_context = match &action {
+            state::MessageSubmitAction::Send {
+                chat_id,
+                thread_top_message_id,
+                ..
+            }
+            | state::MessageSubmitAction::Reply {
+                chat_id,
+                thread_top_message_id,
+                ..
+            } => Some((*chat_id, *thread_top_message_id)),
+            state::MessageSubmitAction::Edit { .. } => None,
+        };
+        if app.state.newer_history_gap()
+            && let Some((chat_id, topic_id)) = gap_submit_context
+        {
+            progress.show(app, REFRESHING_LATEST_BEFORE_SEND_STATUS)?;
+            if let Some(loader) = chat_message_loader {
+                let request_id = loader.spawn_newer_gap_refresh(
+                    chat_id,
+                    topic_id,
+                    app.state.newer_history_generation(),
+                );
+                app.state
+                    .queue_gap_submit(action, request_id, chat_id, topic_id);
+                return Ok(());
+            }
+
+            let latest = fetch_newer_gap_messages(client, chat_id, topic_id).await;
+            match latest {
+                Ok(latest) => {
+                    app.state
+                        .apply_refreshed_selected_chat_messages(latest.messages);
+                    if let Some(thread_topics) = latest.thread_topics {
+                        app.state
+                            .apply_loaded_selected_chat_thread_topics(thread_topics);
+                    }
+                }
+                Err(error) => {
+                    app.state.set_error(error);
+                    return Ok(());
+                }
+            }
+        }
 
         match action {
             state::MessageSubmitAction::Send {
@@ -4439,10 +4845,20 @@ async fn handle_input_focused<C: TelegramClient + Clone + Send + Sync + 'static>
                 message_id,
                 content,
             } => {
+                if app.state.reply_submission_pending() {
+                    return Ok(());
+                }
                 progress.show(app, SENDING_REPLY_STATUS)?;
                 if let Some(loader) = reply_message_loader {
-                    loader.spawn_reply_message(chat_id, thread_top_message_id, message_id, content);
+                    let request_id = loader.spawn_reply_message(
+                        chat_id,
+                        thread_top_message_id,
+                        message_id,
+                        content,
+                    );
+                    app.state.begin_reply_submission(request_id);
                 } else {
+                    app.state.begin_reply_submission(0);
                     actions::execute_message_submit_action(
                         &mut app.state,
                         client,
@@ -4590,6 +5006,11 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
     progress: &mut UiProgress<'_>,
     mut loaders: HandlerLoaders<'_, C>,
 ) -> Result<()> {
+    if app.state.gap_submit_pending() {
+        app.state.set_status(REFRESHING_LATEST_BEFORE_SEND_STATUS);
+        return Ok(());
+    }
+
     if app.state.delete_confirmation().is_some() {
         diagnostics::event("mouse_ignored", "reason=delete_confirmation");
         return Ok(());
@@ -4667,23 +5088,23 @@ mod tests {
         APP_COMMAND, CHECK_AUTH_OK_PREFIX, CHECK_CONFIG_AUTH_CONFLICT,
         CHECK_CONFIG_SESSION_EXISTS_STATUS, CHECK_CONFIG_SESSION_WILL_CREATE_STATUS,
         CLI_USAGE_EXIT_CODE, CONFIG_LOAD_HELP, CONFIG_PATH_ARGUMENT_REQUIRED, ChatMessageLoad,
-        ChatMessageLoadResult, ChatMessageLoader, DeleteMessageLoader, DeleteMessageResult,
-        EditMessageLoader, EditMessageResult, EventLoopState, FolderChatLoadResult,
-        FolderChatLoader, FrameScheduler, HandlerLoaders, InitialStateLoadResult,
-        InitialStateLoader, LOADING_CHAT_MESSAGES_STATUS, LOADING_TELEGRAM_STATUS,
-        LOG_PATH_ARGUMENT_REQUIRED, LOGIN_2FA_ENABLED_STATUS, LOGIN_2FA_HINT_PREFIX,
-        LOGIN_2FA_PROMPT, LOGIN_2FA_SIGNED_IN_PREFIX, LOGIN_CODE_PROMPT, LOGIN_CODE_SENT_PREFIX,
-        LOGIN_FAILED_PREFIX, LOGIN_HEADER, LOGIN_PHONE_PROMPT, LOGIN_REQUESTING_CODE_STATUS,
-        LOGIN_SESSION_SAVED_STATUS, LOGIN_SIGNED_IN_PREFIX, LOGIN_SIGNING_IN_STATUS,
-        LOGIN_START_PROMPT, MIN_FRAME_INTERVAL, MarkChatReadLoader, MediaPreviewLoader,
-        MediaPreviewResult, OlderMessageLoadResult, OlderMessageLoader, OlderMessageNavigation,
-        PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR, RECONCILIATION_FOCUS_STALE_AFTER,
-        RECONCILIATION_INTERVAL, ReconciliationLoader, ReconciliationResult, ReplyMessageLoader,
-        ReplyMessageResult, RunMode, SAVING_EDIT_STATUS, SENDING_MESSAGE_STATUS,
-        SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE, SMOKE_CHECK_AUTH_CONFLICT,
-        SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_OK_PREFIX, SendMessageLoader, SendMessageResult,
-        SubscribeUpdatesLoader, SubscribeUpdatesResult, TerminalAction, TokioInstant,
-        UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress, abort_running_task,
+        ChatMessageLoadPurpose, ChatMessageLoadResult, ChatMessageLoader, DeleteMessageLoader,
+        DeleteMessageResult, EditMessageLoader, EditMessageResult, EventLoopState,
+        FolderChatLoadResult, FolderChatLoader, FrameScheduler, HandlerLoaders,
+        InitialStateLoadResult, InitialStateLoader, LOADING_CHAT_MESSAGES_STATUS,
+        LOADING_TELEGRAM_STATUS, LOG_PATH_ARGUMENT_REQUIRED, LOGIN_2FA_ENABLED_STATUS,
+        LOGIN_2FA_HINT_PREFIX, LOGIN_2FA_PROMPT, LOGIN_2FA_SIGNED_IN_PREFIX, LOGIN_CODE_PROMPT,
+        LOGIN_CODE_SENT_PREFIX, LOGIN_FAILED_PREFIX, LOGIN_HEADER, LOGIN_PHONE_PROMPT,
+        LOGIN_REQUESTING_CODE_STATUS, LOGIN_SESSION_SAVED_STATUS, LOGIN_SIGNED_IN_PREFIX,
+        LOGIN_SIGNING_IN_STATUS, LOGIN_START_PROMPT, MIN_FRAME_INTERVAL, MarkChatReadLoader,
+        MediaPreviewLoader, MediaPreviewResult, OlderMessageLoadResult, OlderMessageLoader,
+        OlderMessageNavigation, PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR,
+        RECONCILIATION_FOCUS_STALE_AFTER, RECONCILIATION_INTERVAL, ReconciliationLoader,
+        ReconciliationResult, ReplyMessageLoader, ReplyMessageResult, RunMode, SAVING_EDIT_STATUS,
+        SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE,
+        SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_OK_PREFIX, SendMessageLoader,
+        SendMessageResult, SubscribeUpdatesLoader, SubscribeUpdatesResult, TerminalAction,
+        TokioInstant, UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress, abort_running_task,
         apply_chat_message_load_result, apply_delete_message_result, apply_edit_message_result,
         apply_folder_chat_load_result, apply_initial_state_load_result, apply_media_preview_result,
         apply_older_message_load_result, apply_reconciliation_result, apply_reply_message_result,
@@ -4692,19 +5113,20 @@ mod tests {
         check_config_session_status, classify_terminal_event, default_config_path_string,
         drain_ready_results, ensure_session_parent_dir, handle_input_focused, handle_key_event,
         handle_key_event_with_progress, handle_mouse_event, handle_received_update,
-        load_checked_config, load_checked_config_with_session_parent, login_2fa_hint_message,
-        login_2fa_signed_in_message, login_code_sent_message, login_failed_message,
-        login_signed_in_message, message_submit_action_status, older_message_key_navigation,
-        open_chat_at_with_optional_async_loader, parse_args_from, prepare_loop_step,
-        preserve_prompt_input_line_spaces, require_prompt_line, require_prompt_response,
-        save_app_preferences, save_app_preferences_if_changed, sleep_until_optional,
-        smoke_ok_message, trim_prompt_input_line, validate_config,
+        load_checked_config, load_checked_config_with_session_parent, loaded_read_ack,
+        login_2fa_hint_message, login_2fa_signed_in_message, login_code_sent_message,
+        login_failed_message, login_signed_in_message, message_submit_action_status,
+        older_message_key_navigation, open_chat_at_with_optional_async_loader, parse_args_from,
+        prepare_loop_step, preserve_prompt_input_line_spaces, release_gap_submit_if_ready,
+        require_prompt_line, require_prompt_response, save_app_preferences,
+        save_app_preferences_if_changed, sleep_until_optional, smoke_ok_message,
+        trim_prompt_input_line, validate_config,
     };
     use crate::app::App;
     use crate::config::telegram::{Config, TelegramConfig};
     use crate::state::{
         ContextMenuTarget, ConversationLoadStatus, DeleteConfirmation, FocusedPanel,
-        ReconciliationSnapshot,
+        MessageSubmitAction, ReconciliationSnapshot,
     };
     use crate::telegram::{
         MockTelegramClient, TelegramClient,
@@ -4803,6 +5225,27 @@ mod tests {
             is_closed: false,
             is_pinned: false,
         }
+    }
+
+    fn app_with_newer_gap() -> App {
+        let mut app = App::new();
+        app.state.chats = vec![chat(3)];
+        app.state.thread_topics = vec![thread_topic(101, 0)];
+        app.state.messages = (1..=500)
+            .map(|id| {
+                let mut message = message(id);
+                message.chat_id = 3;
+                message.thread_topic_id = Some(101);
+                message
+            })
+            .collect();
+        app.state.selected_message_index = 0;
+        let mut omitted = message(501);
+        omitted.chat_id = 3;
+        omitted.thread_topic_id = Some(101);
+        app.state.apply_update(Update::NewMessage(omitted));
+        assert!(app.state.newer_history_gap());
+        app
     }
 
     #[test]
@@ -5600,6 +6043,51 @@ mod tests {
         assert!(loop_state.staged_terminal_event.is_none());
     }
 
+    #[test]
+    fn loop_step_drops_input_staged_while_gap_submit_is_pending() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        loop_state.staged_terminal_event = Some(Event::Key(key));
+        let client = MockTelegramClient::new();
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation);
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+        let mut app = App::new();
+        app.state.queue_gap_submit(
+            MessageSubmitAction::Send {
+                chat_id: 3,
+                thread_top_message_id: None,
+                content: "once".to_string(),
+            },
+            1,
+            3,
+            None,
+        );
+
+        let step = prepare_loop_step(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        );
+
+        assert!(step.dirty);
+        assert!(step.terminal_event.is_none());
+        assert!(loop_state.staged_terminal_event.is_none());
+        assert!(app.state.gap_submit_pending());
+    }
+
     #[tokio::test]
     async fn selection_input_demands_exactly_one_lazy_preview() {
         let mut app = App::new();
@@ -5641,7 +6129,7 @@ mod tests {
     fn production_frame_and_shutdown_ownership_are_explicit() {
         let source = include_str!("main.rs");
         assert_eq!(source.matches(concat!("terminal", ".draw(")).count(), 2);
-        assert_eq!(source.matches(concat!("progress", ".show(")).count(), 9);
+        assert_eq!(source.matches(concat!("progress", ".show(")).count(), 11);
         let progress_show = source
             .split("fn show(&mut self")
             .nth(1)
@@ -6073,6 +6561,7 @@ mod tests {
                 request_id: 1,
                 chat_id: 1,
                 topic_id: None,
+                purpose: ChatMessageLoadPurpose::OpenConversation,
                 result: Ok(ChatMessageLoad {
                     messages: vec![read_message],
                     thread_topics: Some(Vec::new()),
@@ -6098,6 +6587,7 @@ mod tests {
                 request_id: 2,
                 chat_id: 1,
                 topic_id: None,
+                purpose: ChatMessageLoadPurpose::OpenConversation,
                 result: Ok(ChatMessageLoad {
                     messages: vec![unread_message],
                     thread_topics: Some(Vec::new()),
@@ -6155,6 +6645,7 @@ mod tests {
                 request_id: 3,
                 chat_id: 1,
                 topic_id: Some(102),
+                purpose: ChatMessageLoadPurpose::OpenConversation,
                 result: Ok(ChatMessageLoad {
                     messages: vec![first_message, latest_message],
                     thread_topics: None,
@@ -6289,6 +6780,7 @@ mod tests {
                 request_id: 1,
                 chat_id: 2,
                 topic_id: None,
+                purpose: ChatMessageLoadPurpose::OpenConversation,
                 result: Ok(ChatMessageLoad {
                     messages: vec![stale_message],
                     thread_topics: Some(vec![ThreadTopic {
@@ -6314,6 +6806,7 @@ mod tests {
                 request_id: 2,
                 chat_id: 2,
                 topic_id: None,
+                purpose: ChatMessageLoadPurpose::OpenConversation,
                 result: Ok(ChatMessageLoad {
                     messages: vec![current_message],
                     thread_topics: Some(vec![ThreadTopic {
@@ -6374,6 +6867,7 @@ mod tests {
                 request_id: 7,
                 chat_id: 1,
                 topic_id: Some(101),
+                purpose: ChatMessageLoadPurpose::OpenConversation,
                 result: Ok(ChatMessageLoad {
                     messages: vec![stale_topic_message],
                     thread_topics: None,
@@ -6455,6 +6949,58 @@ mod tests {
         assert!(app.state.status_message.is_none());
     }
 
+    #[test]
+    fn unresolved_message_scope_never_derives_chat_wide_read_ack() {
+        let chats = vec![chat(3)];
+        let messages = Err("topic lookup failed".to_string());
+
+        assert_eq!(loaded_read_ack(&chats, &messages, &[]), None);
+    }
+
+    #[tokio::test]
+    async fn forum_initial_load_marks_only_selected_thread_read() {
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
+            marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads: marked_threads.clone(),
+        });
+        let mut app = App::new();
+        let mut forum_chat = chat(3);
+        forum_chat.unread_count = 4;
+        let mut topic_message = message(103);
+        topic_message.chat_id = 3;
+        topic_message.thread_topic_id = Some(101);
+
+        apply_initial_state_load_result(
+            &mut app,
+            InitialStateLoadResult {
+                result: Ok(crate::actions::InitialStateLoad {
+                    folders: vec![all_folder(0)],
+                    chats: vec![forum_chat],
+                    messages: Ok(vec![topic_message]),
+                    thread_topics: vec![thread_topic(101, 2), thread_topic(102, 2)],
+                }),
+            },
+            &mark_read_loader,
+        );
+        tokio::task::yield_now().await;
+
+        assert!(
+            marked_chat_ids
+                .lock()
+                .expect("marked chat ids lock should not be poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            marked_threads
+                .lock()
+                .expect("marked threads lock should not be poisoned")
+                .as_slice(),
+            &[(3, 101, 103)]
+        );
+    }
+
     #[tokio::test]
     async fn async_initial_state_loader_sends_result_without_blocking_handler() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6490,8 +7036,14 @@ mod tests {
             .expect("background message load channel should stay open");
         assert_eq!(result.request_id, 1);
         assert_eq!(result.chat_id, 3);
+        assert_eq!(result.topic_id, Some(101));
         let load = result.result.expect("mock load should succeed");
-        assert_eq!(load.messages.len(), 3);
+        assert_eq!(load.messages.len(), 2);
+        assert!(
+            load.messages
+                .iter()
+                .all(|message| message.thread_topic_id == Some(101))
+        );
         let thread_topics = load
             .thread_topics
             .expect("latest load should include topics");
@@ -6516,6 +7068,194 @@ mod tests {
         assert_eq!(load.messages.len(), 1);
         assert_eq!(load.messages[0].id, 102);
         assert!(load.thread_topics.is_none());
+    }
+
+    #[tokio::test]
+    async fn newer_gap_end_refreshes_latest_without_clearing_first() {
+        let mut app = app_with_newer_gap();
+        app.state.focused_panel = FocusedPanel::Messages;
+        let mut client = MockTelegramClient::new();
+        let (chat_tx, mut chat_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut chat_loader = ChatMessageLoader::new(client.clone(), chat_tx);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let mut progress = UiProgress::Silent;
+
+        handle_key_event_with_progress(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            &mut client,
+            &mut progress,
+            HandlerLoaders {
+                chat_message: Some(&mut chat_loader),
+                ..HandlerLoaders::none()
+            },
+        )
+        .await
+        .expect("gap refresh key should succeed");
+        assert_eq!(app.state.messages.len(), 500);
+        assert!(app.state.newer_history_gap());
+
+        let result = chat_rx.recv().await.expect("gap refresh should respond");
+        assert!(matches!(
+            result.purpose,
+            ChatMessageLoadPurpose::RefreshNewerGap { .. }
+        ));
+        assert!(apply_chat_message_load_result(
+            &mut app,
+            chat_loader.latest_request_id(),
+            result,
+            &mark_read_loader,
+        ));
+        assert!(!app.state.newer_history_gap());
+        assert_eq!(app.state.messages.len(), 2);
+        assert!(app.state.selected_message_is_last());
+    }
+
+    #[tokio::test]
+    async fn send_with_newer_gap_waits_for_latest_then_submits() {
+        let mut app = app_with_newer_gap();
+        app.state.focused_panel = FocusedPanel::Input;
+        app.state.input_buffer = "after refresh".to_string();
+        let mut client = MockTelegramClient::new();
+        let (chat_tx, mut chat_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut chat_loader = ChatMessageLoader::new(client.clone(), chat_tx);
+        let send_loader = SendMessageLoader::new(client.clone(), send_tx);
+        let reply_loader = ReplyMessageLoader::new(client.clone(), reply_tx);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let mut progress = UiProgress::Silent;
+
+        handle_key_event_with_progress(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut client,
+            &mut progress,
+            HandlerLoaders {
+                chat_message: Some(&mut chat_loader),
+                send_message: Some(&send_loader),
+                reply_message: Some(&reply_loader),
+                ..HandlerLoaders::none()
+            },
+        )
+        .await
+        .expect("gap submit should queue");
+        assert!(app.state.gap_submit_pending());
+        assert_eq!(app.state.input_buffer, "after refresh");
+        assert!(send_rx.try_recv().is_err());
+
+        handle_key_event_with_progress(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut client,
+            &mut progress,
+            HandlerLoaders::none(),
+        )
+        .await
+        .expect("focus changes should stay blocked while refreshing");
+        assert_eq!(app.state.focused_panel, FocusedPanel::Input);
+
+        handle_input_focused(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+            &mut client,
+            &mut progress,
+            None,
+            Some(&send_loader),
+            None,
+            Some(&reply_loader),
+        )
+        .await
+        .expect("input should stay blocked while refreshing");
+        assert_eq!(app.state.input_buffer, "after refresh");
+
+        let result = chat_rx.recv().await.expect("gap refresh should respond");
+        assert!(apply_chat_message_load_result(
+            &mut app,
+            chat_loader.latest_request_id(),
+            result,
+            &mark_read_loader,
+        ));
+        release_gap_submit_if_ready(&mut app, &send_loader, &reply_loader);
+        let sent = send_rx
+            .recv()
+            .await
+            .expect("send should start after refresh");
+        assert_eq!(sent.chat_id, 3);
+        assert!(!app.state.gap_submit_pending());
+        assert!(!app.state.newer_history_gap());
+        assert!(app.state.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn failed_newer_gap_refresh_preserves_window_input_and_gap() {
+        let mut app = app_with_newer_gap();
+        app.state.input_buffer = "keep me".to_string();
+        let generation = app.state.newer_history_generation();
+        app.state.queue_gap_submit(
+            MessageSubmitAction::Send {
+                chat_id: 3,
+                thread_top_message_id: Some(101),
+                content: "keep me".to_string(),
+            },
+            1,
+            3,
+            Some(101),
+        );
+        let client = MockTelegramClient::new();
+        let mark_read_loader = MarkChatReadLoader::new(client);
+
+        assert!(apply_chat_message_load_result(
+            &mut app,
+            1,
+            ChatMessageLoadResult {
+                request_id: 1,
+                chat_id: 3,
+                topic_id: Some(101),
+                purpose: ChatMessageLoadPurpose::RefreshNewerGap { generation },
+                result: Err("refresh failed".to_string()),
+            },
+            &mark_read_loader,
+        ));
+        assert_eq!(app.state.messages.len(), 500);
+        assert_eq!(app.state.input_buffer, "keep me");
+        assert!(app.state.newer_history_gap());
+        assert!(!app.state.gap_submit_pending());
+        assert_eq!(app.state.error_message.as_deref(), Some("refresh failed"));
+    }
+
+    #[test]
+    fn newer_gap_refresh_rejects_updates_that_overtake_its_generation() {
+        let mut app = app_with_newer_gap();
+        let generation = app.state.newer_history_generation();
+        let mut overtaking = message(502);
+        overtaking.chat_id = 3;
+        overtaking.thread_topic_id = Some(101);
+        app.state.apply_update(Update::NewMessage(overtaking));
+        let client = MockTelegramClient::new();
+        let mark_read_loader = MarkChatReadLoader::new(client);
+
+        assert!(apply_chat_message_load_result(
+            &mut app,
+            1,
+            ChatMessageLoadResult {
+                request_id: 1,
+                chat_id: 3,
+                topic_id: Some(101),
+                purpose: ChatMessageLoadPurpose::RefreshNewerGap { generation },
+                result: Ok(ChatMessageLoad {
+                    messages: vec![message(501)],
+                    thread_topics: None,
+                }),
+            },
+            &mark_read_loader,
+        ));
+        assert!(app.state.newer_history_gap());
+        assert_eq!(app.state.messages.len(), 500);
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some("Newer messages arrived during refresh; try again")
+        );
     }
 
     #[tokio::test]
@@ -6633,6 +7373,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("typing should succeed");
@@ -6646,6 +7387,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
             &mut client,
             &mut progress,
+            None,
             None,
             None,
             None,
@@ -7021,8 +7763,11 @@ mod tests {
         let mut original = message(7);
         original.chat_id = 1;
         original.content = "old".to_string();
+        original.is_own = true;
+        original.can_edit = true;
         app.state.chats = vec![chat(1)];
         app.state.messages = vec![original];
+        app.state.request_edit_selected_message();
 
         apply_edit_message_result(
             &mut app,
@@ -7060,6 +7805,11 @@ mod tests {
     fn async_reply_message_result_appends_reply_row() {
         let mut app = App::new();
         app.state.chats = vec![chat(1)];
+        let mut target = message(7);
+        target.chat_id = 1;
+        app.state.messages = vec![target];
+        app.state.request_reply_to_selected_message();
+        app.state.begin_reply_submission(1);
         let mut reply = message(11);
         reply.chat_id = 1;
         reply.content = "reply".to_string();
@@ -7068,15 +7818,47 @@ mod tests {
         apply_reply_message_result(
             &mut app,
             ReplyMessageResult {
+                request_id: 1,
                 chat_id: 1,
+                thread_top_message_id: None,
                 message_id: 7,
                 result: Ok(reply),
             },
         );
 
-        assert_eq!(app.state.messages.len(), 1);
-        assert_eq!(app.state.messages[0].id, 11);
-        assert_eq!(app.state.messages[0].content, "reply");
+        assert_eq!(app.state.messages.len(), 2);
+        assert_eq!(app.state.messages[1].id, 11);
+        assert_eq!(app.state.messages[1].content, "reply");
+    }
+
+    #[test]
+    fn stale_reply_completion_releases_only_its_matching_owner() {
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        let mut first_target = message(7);
+        first_target.chat_id = 1;
+        let mut replacement_target = message(8);
+        replacement_target.chat_id = 1;
+        app.state.messages = vec![first_target, replacement_target];
+        app.state.replying_to_message_id = Some(8);
+        app.state.begin_reply_submission(1);
+        let mut reply = message(11);
+        reply.chat_id = 1;
+
+        apply_reply_message_result(
+            &mut app,
+            ReplyMessageResult {
+                request_id: 1,
+                chat_id: 1,
+                thread_top_message_id: None,
+                message_id: 7,
+                result: Ok(reply),
+            },
+        );
+
+        assert!(!app.state.reply_submission_pending());
+        assert_eq!(app.state.replying_to_message_id, Some(8));
+        assert!(app.state.messages.iter().all(|message| message.id != 11));
     }
 
     #[tokio::test]

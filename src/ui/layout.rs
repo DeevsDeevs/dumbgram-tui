@@ -372,8 +372,11 @@ fn help_bar_controls(app: &App) -> String {
             .selected_message()
             .is_some_and(|message| message.status == MessageStatus::Sending)
     {
-        join_help_controls(&[
-            "Sending: waiting for Telegram",
+        let mut controls = vec!["Sending: waiting for Telegram"];
+        if app.state.newer_history_gap() {
+            controls.push("End refresh latest");
+        }
+        controls.extend([
             "edit/delete/reply disabled",
             "Enter input",
             "Left chats",
@@ -381,22 +384,27 @@ fn help_bar_controls(app: &App) -> String {
             "q quit",
             "< > resize",
             HIDE_HELP_CONTROL_LABEL,
-        ])
+        ]);
+        join_help_controls(&controls)
     } else if app.state.focused_panel == FocusedPanel::Messages
         && app
             .state
             .selected_message()
             .is_some_and(|message| message.status == MessageStatus::Failed)
     {
-        join_help_controls(&[
-            "Failed send: d dismiss",
+        let mut controls = vec!["Failed send: d dismiss"];
+        if app.state.newer_history_gap() {
+            controls.push("End refresh latest");
+        }
+        controls.extend([
             "Enter input to retry",
             "Left chats",
             "Tab focus",
             "q quit",
             "< > resize",
             HIDE_HELP_CONTROL_LABEL,
-        ])
+        ]);
+        join_help_controls(&controls)
     } else if app.state.focused_panel == FocusedPanel::Messages {
         app.state
             .selected_message()
@@ -418,20 +426,23 @@ fn selected_message_help_controls(state: &AppState, message: &Message) -> String
     let has_messages = !state.messages.is_empty();
     let at_loaded_top = state.selected_message_index == 0 && has_messages;
     let at_loaded_bottom = state.selected_message_is_last() && has_messages;
-    let movement_label =
-        if at_loaded_top && at_loaded_bottom && state.selected_chat_older_history_exhausted() {
-            "Messages: no older history · Pg/Home/End move"
-        } else if at_loaded_top && state.selected_chat_older_history_exhausted() {
-            "Messages: no older history · Down/PgDn/Home/End move"
-        } else if at_loaded_top && at_loaded_bottom {
-            "Messages: Up/PgUp older · Pg/Home/End move"
-        } else if at_loaded_top {
-            "Messages: Up/PgUp older · Down/PgDn/Home/End move"
-        } else if at_loaded_bottom {
-            "Messages: Up/Pg/Home/End move"
-        } else {
-            "Messages: Up/Down/Pg/Home/End move"
-        };
+    let movement_label = if state.newer_history_gap() && at_loaded_bottom {
+        "Messages: End/Down/PgDn refresh latest · Up/Pg/Home move"
+    } else if state.newer_history_gap() {
+        "Messages: End refresh latest · Up/Down/Pg/Home move"
+    } else if at_loaded_top && at_loaded_bottom && state.selected_chat_older_history_exhausted() {
+        "Messages: no older history · Pg/Home/End move"
+    } else if at_loaded_top && state.selected_chat_older_history_exhausted() {
+        "Messages: no older history · Down/PgDn/Home/End move"
+    } else if at_loaded_top && at_loaded_bottom {
+        "Messages: Up/PgUp older · Pg/Home/End move"
+    } else if at_loaded_top {
+        "Messages: Up/PgUp older · Down/PgDn/Home/End move"
+    } else if at_loaded_bottom {
+        "Messages: Up/Pg/Home/End move"
+    } else {
+        "Messages: Up/Down/Pg/Home/End move"
+    };
     let mut controls = vec![movement_label, "Enter input"];
 
     if !state.thread_topics.is_empty() {
@@ -521,7 +532,7 @@ mod tests {
     use crate::app::App;
     use crate::state::{DeleteConfirmation, FocusedPanel};
     use crate::telegram::types::{
-        Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, all_folder,
+        Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, Update, all_folder,
     };
     use crate::ui::render_app_to_string_for_test;
     use chrono::Utc;
@@ -931,6 +942,32 @@ mod tests {
             help_bar_controls(&app),
             "Failed send: d dismiss · Enter input to retry · Left chats · Tab focus · q quit · < > resize · ? hide help"
         );
+    }
+
+    #[test]
+    fn local_send_help_keeps_newer_gap_refresh_discoverable() {
+        let mut app = App::new();
+        app.state.chats = vec![chat(10, "General")];
+        app.state.messages = (1..=500)
+            .map(|id| {
+                let mut message = message_with_status(MessageStatus::Sent);
+                message.id = id;
+                message
+            })
+            .collect();
+        app.state.selected_message_index = 0;
+        let mut omitted = message_with_status(MessageStatus::Sent);
+        omitted.id = 501;
+        app.state.apply_update(Update::NewMessage(omitted));
+        app.state
+            .apply_send_pending(-2, 10, None, "pending".to_string());
+        app.state.focused_panel = FocusedPanel::Messages;
+
+        assert!(help_bar_controls(&app).contains("End refresh latest"));
+
+        app.state.apply_send_failure(-2, "offline".to_string());
+        app.state.focused_panel = FocusedPanel::Messages;
+        assert!(help_bar_controls(&app).contains("End refresh latest"));
     }
 
     #[test]

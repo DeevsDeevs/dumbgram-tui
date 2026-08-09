@@ -22,6 +22,7 @@ pub(crate) const MESSAGE_EMPTY_NO_CHAT_LABEL: &str = "No chat selected";
 pub(crate) const MESSAGE_EMPTY_NO_MESSAGES_LABEL: &str = "No messages loaded";
 pub(crate) const MESSAGE_LOADING_LABEL: &str = "Loading messages…";
 pub(crate) const MESSAGE_LOAD_FAILED_LABEL: &str = "Messages failed to load";
+pub(crate) const NEWER_HISTORY_GAP_LABEL: &str = " · newer gap";
 pub(crate) const MESSAGE_METADATA_SEPARATOR: &str = " · ";
 pub(crate) const EDITED_METADATA_LABEL: &str = "edited";
 pub(crate) const REPLY_LINE_PREFIX: &str = "   ";
@@ -122,10 +123,16 @@ pub fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
     let position_label = selected_message_position(app);
     let topic_label = selected_thread_topic_label(app);
     let typing_label = selected_chat_typing_label(app);
+    let gap_label = if app.state.newer_history_gap() {
+        NEWER_HISTORY_GAP_LABEL
+    } else {
+        ""
+    };
     let title = message_panel_title(
         chat_name,
         &position_label,
         &topic_label,
+        gap_label,
         &typing_label,
         area.width,
     );
@@ -456,6 +463,7 @@ fn message_panel_title(
     chat_name: &str,
     position_label: &str,
     topic_label: &str,
+    gap_label: &str,
     typing_label: &str,
     area_width: u16,
 ) -> String {
@@ -464,7 +472,10 @@ fn message_panel_title(
         return String::new();
     }
 
-    let suffix = format!(" {}{}{}", position_label, topic_label, typing_label);
+    let suffix = format!(
+        " {}{}{}{}",
+        gap_label, position_label, topic_label, typing_label
+    );
     let chat_name_width = max_title_width
         .saturating_sub(display_width(&suffix) + 2)
         .max(1);
@@ -507,11 +518,11 @@ mod tests {
         DELETE_CONFIRMATION_POPUP_HEIGHT_PERCENT, DELETE_CONFIRMATION_POPUP_WIDTH_PERCENT,
         DELETE_CONFIRMATION_TEXT, DELETE_CONFIRMATION_TITLE, MESSAGE_EMPTY_NO_CHAT_LABEL,
         MESSAGE_EMPTY_NO_MESSAGES_LABEL, MESSAGE_LOAD_FAILED_LABEL, MESSAGE_LOADING_LABEL,
-        MESSAGE_TITLE_BORDER_RESERVED_COLUMNS, REPLY_LINE_PREFIX, REPLY_MARKER,
-        REPLY_MARKER_SEPARATOR, THREAD_TOPICS_PANEL_TITLE, display_width, message_content_spans,
-        message_empty_placeholder, message_lines, message_metadata, message_panel_title,
-        message_position_label, message_status_label, message_title_width, reply_content_width,
-        thread_topic_label, thread_topic_tab_label, typing_label,
+        MESSAGE_TITLE_BORDER_RESERVED_COLUMNS, NEWER_HISTORY_GAP_LABEL, REPLY_LINE_PREFIX,
+        REPLY_MARKER, REPLY_MARKER_SEPARATOR, THREAD_TOPICS_PANEL_TITLE, display_width,
+        message_content_spans, message_empty_placeholder, message_lines, message_metadata,
+        message_panel_title, message_position_label, message_status_label, message_title_width,
+        reply_content_width, thread_topic_label, thread_topic_tab_label, typing_label,
     };
     use crate::{
         state::ConversationLoadStatus,
@@ -696,6 +707,7 @@ mod tests {
             "3/12",
             "",
             "",
+            "",
             24,
         );
 
@@ -705,8 +717,23 @@ mod tests {
     }
 
     #[test]
+    fn message_title_keeps_newer_gap_marker_when_narrow() {
+        let title = message_panel_title(
+            "A long chat name",
+            "500/500",
+            " · #Long topic 3/9",
+            NEWER_HISTORY_GAP_LABEL,
+            " · typing",
+            18,
+        );
+
+        assert!(title.contains("newer"));
+        assert!(display_width(&title) <= 16);
+    }
+
+    #[test]
     fn message_title_uses_display_width_for_wide_chat_name() {
-        let title = message_panel_title("好好好 chat", "3/12", "", " · 好 typing", 18);
+        let title = message_panel_title("好好好 chat", "3/12", "", "", " · 好 typing", 18);
 
         assert!(title.contains("3/12"));
         assert!(display_width(&title) <= 16);

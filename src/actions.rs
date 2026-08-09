@@ -37,6 +37,8 @@ pub(crate) const RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 pub(crate) const RECONCILIATION_TIMEOUT: Duration = Duration::from_millis(25);
 pub(crate) const NO_OLDER_MESSAGES_STATUS: &str = "No older messages";
+pub(crate) const OLDER_MESSAGES_RETAINED_WINDOW_STATUS: &str =
+    "Older messages could not fit without moving the current view";
 pub(crate) const LOAD_MESSAGES_TIMED_OUT_STATUS: &str = "Load messages timed out";
 pub(crate) const LOAD_OLDER_MESSAGES_TIMED_OUT_STATUS: &str = "Load older messages timed out";
 pub(crate) const LOAD_CHATS_TIMED_OUT_STATUS: &str = "Load chats timed out";
@@ -465,12 +467,37 @@ pub async fn load_selected_chat_messages<C: TelegramClient>(
         state.clear_loaded_chat_messages();
         state.begin_conversation_load();
         match fetch_latest_chat_messages(client, chat_id).await {
-            Ok(messages) => {
-                state.apply_loaded_selected_chat_messages(messages);
-                if let Ok(thread_topics) = fetch_chat_thread_topics(client, chat_id).await {
-                    state.apply_loaded_selected_chat_thread_topics(thread_topics);
+            Ok(chat_messages) => {
+                let thread_topics = match fetch_chat_thread_topics(client, chat_id).await {
+                    Ok(thread_topics) => thread_topics,
+                    Err(error) => {
+                        state.mark_conversation_load_failed();
+                        state.set_error(error);
+                        return Ok(());
+                    }
+                };
+                let topic_id = thread_topics.first().map(|topic| topic.id);
+                let messages = match topic_id {
+                    Some(topic_id) => fetch_thread_topic_messages(client, chat_id, topic_id).await,
+                    None => Ok(chat_messages),
+                };
+                match messages {
+                    Ok(messages) => {
+                        let max_message_id = messages.iter().map(|message| message.id).max();
+                        state.apply_loaded_selected_chat_thread_topics(thread_topics);
+                        state.apply_loaded_selected_chat_messages(messages);
+                        if let (Some(topic_id), Some(max_message_id)) = (topic_id, max_message_id) {
+                            mark_thread_read_best_effort(client, chat_id, topic_id, max_message_id)
+                                .await;
+                        } else {
+                            mark_chat_read_best_effort(client, chat_id).await;
+                        }
+                    }
+                    Err(error) => {
+                        state.mark_conversation_load_failed();
+                        state.set_error(error);
+                    }
                 }
-                mark_chat_read_best_effort(client, chat_id).await;
             }
             Err(error) => {
                 state.mark_conversation_load_failed();
@@ -597,12 +624,14 @@ pub fn apply_older_chat_messages_result(
 ) -> usize {
     match result {
         Ok(messages) => {
-            let added = state.prepend_loaded_selected_chat_messages(messages);
-            if added == 0 {
+            let prepend = state.prepend_loaded_selected_chat_messages(messages);
+            if !prepend.had_unique_messages {
                 state.mark_selected_chat_older_history_exhausted();
                 state.set_status(NO_OLDER_MESSAGES_STATUS);
+            } else if prepend.added == 0 {
+                state.set_status(OLDER_MESSAGES_RETAINED_WINDOW_STATUS);
             }
-            added
+            prepend.added
         }
         Err(error) => {
             state.set_error(error);
@@ -804,6 +833,7 @@ pub fn apply_initial_state_load_result(
             state.chats = load.chats;
             state.cache_selected_folder_chats();
             state.reset_chat_selection();
+            state.apply_loaded_selected_chat_thread_topics(load.thread_topics);
             match load.messages {
                 Ok(messages) if state.chats.is_empty() => {
                     debug_assert!(messages.is_empty());
@@ -815,7 +845,6 @@ pub fn apply_initial_state_load_result(
                     state.set_error(error);
                 }
             }
-            state.apply_loaded_selected_chat_thread_topics(load.thread_topics);
         }
         Err(error) => {
             state.mark_conversation_load_failed();
@@ -889,10 +918,23 @@ pub async fn fetch_folder_chats_and_selected_messages<C: TelegramClient>(
     );
     let (messages, thread_topics) = match chats.first() {
         Some(chat) => {
-            let messages = fetch_latest_chat_messages(client, chat.id).await;
-            let thread_topics = fetch_chat_thread_topics(client, chat.id)
-                .await
-                .unwrap_or_default();
+            let chat_messages = fetch_latest_chat_messages(client, chat.id).await;
+            let thread_topics = match fetch_chat_thread_topics(client, chat.id).await {
+                Ok(thread_topics) => thread_topics,
+                Err(error) => {
+                    return Ok(FolderChatLoad {
+                        chats,
+                        messages: Err(error),
+                        thread_topics: Vec::new(),
+                    });
+                }
+            };
+            let messages = match (thread_topics.first(), chat_messages) {
+                (Some(topic), Ok(_)) => {
+                    fetch_thread_topic_messages(client, chat.id, topic.id).await
+                }
+                (_, chat_messages) => chat_messages,
+            };
             (messages, thread_topics)
         }
         None => (Ok(Vec::new()), Vec::new()),
@@ -929,6 +971,7 @@ pub fn apply_folder_chat_load_result(
             state.chats = load.chats;
             state.cache_selected_folder_chats();
             state.reset_chat_selection();
+            state.apply_loaded_selected_chat_thread_topics(load.thread_topics);
             match load.messages {
                 Ok(messages) if state.chats.is_empty() => {
                     debug_assert!(messages.is_empty());
@@ -940,7 +983,6 @@ pub fn apply_folder_chat_load_result(
                     state.set_error(error);
                 }
             }
-            state.apply_loaded_selected_chat_thread_topics(load.thread_topics);
         }
         Err(error) => {
             state.mark_conversation_load_failed();

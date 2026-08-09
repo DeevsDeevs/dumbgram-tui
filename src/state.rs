@@ -47,6 +47,7 @@ pub(crate) const FOLDER_VIEWPORT_RESERVED_COLUMNS: u16 = 4;
 pub(crate) const MESSAGE_ROW_HEIGHT: usize = 1;
 pub(crate) const REPLY_MESSAGE_ROW_HEIGHT: usize = 2;
 pub(crate) const TYPING_ACTION_COOLDOWN: Duration = Duration::from_secs(4);
+pub(crate) const MAX_REMOTE_MESSAGES: usize = 500;
 
 fn last_index(item_count: usize) -> usize {
     item_count.saturating_sub(1)
@@ -206,6 +207,22 @@ enum OlderHistoryKey {
     Topic { chat_id: i64, topic_id: i32 },
 }
 
+#[derive(Debug)]
+struct MessageWindowAnchors {
+    selected: Option<(i64, i32)>,
+    viewport_top: Option<(i64, i32)>,
+    protected: HashSet<(i64, i32)>,
+}
+
+#[derive(Debug)]
+struct PendingGapSubmit {
+    action: MessageSubmitAction,
+    request_id: u64,
+    chat_id: i64,
+    topic_id: Option<i32>,
+    ready: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeleteConfirmation {
     pub chat_id: i64,
@@ -319,6 +336,12 @@ pub enum ReconciliationApply {
     Stale,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrependMessagesResult {
+    pub added: usize,
+    pub had_unique_messages: bool,
+}
+
 pub struct AppState {
     pub folders: Vec<Folder>,
     pub chats: Vec<Chat>,
@@ -341,6 +364,10 @@ pub struct AppState {
     pub chat_drafts: HashMap<i64, String>,
     cached_folder_chats: HashMap<Option<i32>, Vec<Chat>>,
     older_history_exhausted: HashSet<OlderHistoryKey>,
+    newer_history_gap: bool,
+    newer_history_generation: u64,
+    pending_gap_submit: Option<PendingGapSubmit>,
+    reply_submission_request_id: Option<u64>,
     pub split_ratio: f32,
     pub split_drag_active: bool,
     split_drag_origin: Option<u16>,
@@ -392,6 +419,10 @@ impl AppState {
             chat_drafts: HashMap::new(),
             cached_folder_chats: HashMap::new(),
             older_history_exhausted: HashSet::new(),
+            newer_history_gap: false,
+            newer_history_generation: 0,
+            pending_gap_submit: None,
+            reply_submission_request_id: None,
             split_ratio: DEFAULT_SPLIT_RATIO,
             split_drag_active: false,
             split_drag_origin: None,
@@ -606,6 +637,12 @@ impl AppState {
     ) -> Option<(ContextMenuTarget, ContextMenuAction)> {
         let highlighted = self.context_menu()?.highlighted;
         self.take_context_menu_action(highlighted)
+    }
+
+    pub fn has_message_identity(&self, chat_id: i64, message_id: i32) -> bool {
+        self.messages
+            .iter()
+            .any(|message| message.chat_id == chat_id && message.id == message_id)
     }
 
     pub fn select_message_by_identity(&mut self, chat_id: i64, message_id: i32) -> bool {
@@ -1165,9 +1202,50 @@ impl AppState {
     }
 
     pub fn apply_loaded_selected_chat_messages(&mut self, messages: Vec<Message>) {
-        self.clear_selected_chat_older_history_exhausted();
+        self.apply_selected_chat_message_replacement(messages, false);
+    }
+
+    pub fn apply_refreshed_selected_chat_messages(&mut self, messages: Vec<Message>) {
+        self.apply_selected_chat_message_replacement(messages, true);
+    }
+
+    fn apply_selected_chat_message_replacement(
+        &mut self,
+        messages: Vec<Message>,
+        preserve_current_input: bool,
+    ) {
+        let current_input = preserve_current_input.then(|| {
+            (
+                self.input_buffer.clone(),
+                self.input_cursor,
+                self.input_scroll_offset,
+            )
+        });
+        self.clear_selected_scope_older_history_exhausted();
+        let selected_chat_id = self.selected_chat_id();
         let selected_topic_id = self.selected_thread_topic().map(|topic| topic.id);
+        let local_rows = self
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message.status,
+                    MessageStatus::Sending | MessageStatus::Failed
+                ) && Some(message.chat_id) == selected_chat_id
+                    && selected_topic_id
+                        .is_none_or(|topic_id| message.thread_topic_id == Some(topic_id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         self.messages = messages;
+        self.retain_newest_remote_messages();
+        for local in local_rows {
+            if !self.messages.iter().any(|message| message.id == local.id) {
+                self.messages.push(local);
+            }
+        }
+        self.newer_history_gap = false;
+        self.newer_history_generation = self.newer_history_generation.saturating_add(1);
         if self.messages.is_empty() {
             self.conversation_load_status = ConversationLoadStatus::Empty;
             self.reset_message_selection();
@@ -1180,7 +1258,14 @@ impl AppState {
             self.refresh_selected_chat_last_message_from_loaded_messages();
         }
         self.sync_folder_unread_counts_from_loaded_chats();
+        self.revalidate_reconciled_targets();
         self.restore_draft_for_selected_chat();
+        if let Some((input_buffer, input_cursor, input_scroll_offset)) = current_input {
+            self.input_buffer = input_buffer;
+            self.input_cursor = input_cursor.min(self.input_buffer.len());
+            self.input_scroll_offset = input_scroll_offset;
+            self.save_current_draft();
+        }
     }
 
     fn selected_older_history_key(&self) -> Option<OlderHistoryKey> {
@@ -1206,38 +1291,389 @@ impl AppState {
         }
     }
 
-    fn clear_selected_chat_older_history_exhausted(&mut self) {
-        if let Some(chat_id) = self.selected_chat_id() {
-            self.older_history_exhausted.retain(|key| match key {
-                OlderHistoryKey::Chat(key_chat_id) => *key_chat_id != chat_id,
-                OlderHistoryKey::Topic {
-                    chat_id: key_chat_id,
-                    ..
-                } => *key_chat_id != chat_id,
-            });
+    fn clear_selected_scope_older_history_exhausted(&mut self) {
+        if let Some(key) = self.selected_older_history_key() {
+            self.older_history_exhausted.remove(&key);
         }
+    }
+
+    pub fn newer_history_gap(&self) -> bool {
+        self.newer_history_gap
+    }
+
+    pub fn newer_history_generation(&self) -> u64 {
+        self.newer_history_generation
+    }
+
+    pub fn queue_gap_submit(
+        &mut self,
+        action: MessageSubmitAction,
+        request_id: u64,
+        chat_id: i64,
+        topic_id: Option<i32>,
+    ) {
+        self.pending_gap_submit = Some(PendingGapSubmit {
+            action,
+            request_id,
+            chat_id,
+            topic_id,
+            ready: false,
+        });
+    }
+
+    pub fn gap_submit_pending(&self) -> bool {
+        self.pending_gap_submit.is_some()
+    }
+
+    pub fn reply_submission_pending(&self) -> bool {
+        self.reply_submission_request_id.is_some()
+    }
+
+    pub fn begin_reply_submission(&mut self, request_id: u64) -> bool {
+        if self.reply_submission_request_id.is_some() {
+            false
+        } else {
+            self.reply_submission_request_id = Some(request_id);
+            true
+        }
+    }
+
+    pub fn reply_submission_matches(&self, request_id: u64) -> bool {
+        self.reply_submission_request_id == Some(request_id)
+    }
+
+    pub fn finish_reply_submission(&mut self) {
+        self.reply_submission_request_id = None;
+    }
+
+    pub fn mark_gap_submit_ready(&mut self, request_id: u64, chat_id: i64, topic_id: Option<i32>) {
+        if let Some(pending) = self.pending_gap_submit.as_mut()
+            && pending.request_id == request_id
+            && pending.chat_id == chat_id
+            && pending.topic_id == topic_id
+        {
+            pending.ready = true;
+        }
+    }
+
+    pub fn take_ready_gap_submit(&mut self) -> Option<MessageSubmitAction> {
+        self.pending_gap_submit
+            .as_ref()
+            .is_some_and(|pending| pending.ready)
+            .then(|| self.pending_gap_submit.take().map(|pending| pending.action))
+            .flatten()
+    }
+
+    pub fn cancel_gap_submit_for_request(&mut self, request_id: u64) {
+        if self
+            .pending_gap_submit
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.pending_gap_submit = None;
+        }
+    }
+
+    fn record_newer_history_gap(&mut self) {
+        self.newer_history_gap = true;
+        self.newer_history_generation = self.newer_history_generation.saturating_add(1);
+    }
+
+    fn is_remote_message(message: &Message) -> bool {
+        !matches!(
+            message.status,
+            MessageStatus::Sending | MessageStatus::Failed
+        )
+    }
+
+    fn message_identity(message: &Message) -> (i64, i32) {
+        (message.chat_id, message.id)
+    }
+
+    fn capture_message_window_anchors(&self) -> MessageWindowAnchors {
+        let selected = self.selected_message().map(Self::message_identity);
+        let viewport_top = self
+            .messages
+            .get(self.message_scroll_offset)
+            .map(Self::message_identity);
+        let mut protected = [selected, viewport_top]
+            .into_iter()
+            .flatten()
+            .collect::<HashSet<_>>();
+        if let Some(message_id) = self.editing_message_id.or(self.replying_to_message_id)
+            && let Some(chat_id) = self.selected_chat_id()
+        {
+            protected.insert((chat_id, message_id));
+        }
+        if let Some(confirmation) = self.delete_confirmation() {
+            protected.insert((confirmation.chat_id, confirmation.message_id));
+        }
+        if let Some(ContextMenuTarget::Message {
+            chat_id,
+            message_id,
+        }) = self.context_menu().map(|menu| menu.target)
+        {
+            protected.insert((chat_id, message_id));
+        }
+        MessageWindowAnchors {
+            selected,
+            viewport_top,
+            protected,
+        }
+    }
+
+    fn restore_message_window_anchors(&mut self, anchors: &MessageWindowAnchors) {
+        self.selected_message_index = anchors
+            .selected
+            .and_then(|identity| {
+                self.messages
+                    .iter()
+                    .position(|message| Self::message_identity(message) == identity)
+            })
+            .unwrap_or_else(|| {
+                self.selected_message_index
+                    .min(last_index(self.messages.len()))
+            });
+        self.message_scroll_offset = anchors
+            .viewport_top
+            .and_then(|identity| {
+                self.messages
+                    .iter()
+                    .position(|message| Self::message_identity(message) == identity)
+            })
+            .unwrap_or_else(|| {
+                self.message_scroll_offset
+                    .min(last_index(self.messages.len()))
+            });
+        if self.messages.is_empty() {
+            self.reset_message_selection();
+        }
+    }
+
+    fn remove_message_indices(&mut self, indices: &HashSet<usize>) {
+        let mut index = 0;
+        self.messages.retain(|_| {
+            let keep = !indices.contains(&index);
+            index += 1;
+            keep
+        });
+    }
+
+    fn remote_message_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|message| Self::is_remote_message(message))
+            .count()
+    }
+
+    fn retain_newest_remote_messages(&mut self) {
+        let excess = self
+            .remote_message_count()
+            .saturating_sub(MAX_REMOTE_MESSAGES);
+        if excess == 0 {
+            return;
+        }
+        let indices = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| Self::is_remote_message(message).then_some(index))
+            .take(excess)
+            .collect::<HashSet<_>>();
+        self.remove_message_indices(&indices);
+    }
+
+    fn compact_remote_tail_growth(
+        &mut self,
+        anchors: &MessageWindowAnchors,
+        newest_identity: (i64, i32),
+    ) -> bool {
+        let excess = self
+            .remote_message_count()
+            .saturating_sub(MAX_REMOTE_MESSAGES);
+        if excess == 0 {
+            return true;
+        }
+
+        let protected_start = anchors
+            .protected
+            .iter()
+            .filter_map(|identity| {
+                self.messages
+                    .iter()
+                    .position(|message| Self::message_identity(message) == *identity)
+            })
+            .min()
+            .unwrap_or(last_index(self.messages.len()));
+        let removable = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                (index < protected_start
+                    && Self::is_remote_message(message)
+                    && !anchors.protected.contains(&Self::message_identity(message)))
+                .then_some(index)
+            })
+            .take(excess)
+            .collect::<HashSet<_>>();
+        if removable.len() < excess {
+            if let Some(index) = self
+                .messages
+                .iter()
+                .rposition(|message| Self::message_identity(message) == newest_identity)
+            {
+                self.messages.remove(index);
+            }
+            self.record_newer_history_gap();
+            self.restore_message_window_anchors(anchors);
+            return false;
+        }
+
+        self.remove_message_indices(&removable);
+        self.clear_selected_scope_older_history_exhausted();
+        self.restore_message_window_anchors(anchors);
+        true
+    }
+
+    fn insert_remote_message_ordered(&mut self, message: Message) -> usize {
+        let insert_at = self
+            .messages
+            .iter()
+            .position(|existing| !Self::is_remote_message(existing) || existing.id > message.id)
+            .unwrap_or(self.messages.len());
+        self.messages.insert(insert_at, message);
+        insert_at
+    }
+
+    fn replace_anchor_identity(
+        anchors: &mut MessageWindowAnchors,
+        previous: (i64, i32),
+        replacement: (i64, i32),
+    ) {
+        if anchors.selected == Some(previous) {
+            anchors.selected = Some(replacement);
+        }
+        if anchors.viewport_top == Some(previous) {
+            anchors.viewport_top = Some(replacement);
+        }
+        if anchors.protected.remove(&previous) {
+            anchors.protected.insert(replacement);
+        }
+    }
+
+    fn upsert_confirmed_message(
+        &mut self,
+        message: Message,
+        replace_identity: Option<(i64, i32)>,
+    ) -> bool {
+        let identity = Self::message_identity(&message);
+        let mut anchors = self.capture_message_window_anchors();
+        if let Some(previous) = replace_identity {
+            Self::replace_anchor_identity(&mut anchors, previous, identity);
+        }
+        self.messages.retain(|existing| {
+            let existing_identity = Self::message_identity(existing);
+            existing_identity != identity && Some(existing_identity) != replace_identity
+        });
+        self.insert_remote_message_ordered(message);
+        self.restore_message_window_anchors(&anchors);
+        let retained = self.compact_remote_tail_growth(&anchors, identity);
+        self.restore_message_window_anchors(&anchors);
+        self.ensure_selected_message_visible();
+        retained
+    }
+
+    fn append_remote_message_with_retention(&mut self, message: Message) -> bool {
+        if self.newer_history_gap {
+            self.record_newer_history_gap();
+            return false;
+        }
+        let identity = Self::message_identity(&message);
+        let anchors = self.capture_message_window_anchors();
+        self.messages.push(message);
+        self.compact_remote_tail_growth(&anchors, identity)
     }
 
     pub fn prepend_loaded_selected_chat_messages(
         &mut self,
         mut older_messages: Vec<Message>,
-    ) -> usize {
+    ) -> PrependMessagesResult {
         older_messages.retain(|older| {
             !self
                 .messages
                 .iter()
                 .any(|current| current.chat_id == older.chat_id && current.id == older.id)
         });
-        let added = older_messages.len();
-        if added == 0 {
-            return 0;
+        if older_messages.is_empty() {
+            return PrependMessagesResult {
+                added: 0,
+                had_unique_messages: false,
+            };
         }
 
+        let anchors = self.capture_message_window_anchors();
+        let older_identities = older_messages
+            .iter()
+            .map(Self::message_identity)
+            .collect::<HashSet<_>>();
         self.messages.splice(0..0, older_messages);
-        self.selected_message_index += added;
-        self.message_scroll_offset += added;
+        let excess = self
+            .remote_message_count()
+            .saturating_sub(MAX_REMOTE_MESSAGES);
+        let protected_end = anchors
+            .protected
+            .iter()
+            .filter_map(|identity| {
+                self.messages
+                    .iter()
+                    .position(|message| Self::message_identity(message) == *identity)
+            })
+            .max()
+            .unwrap_or(0);
+        let mut removable = self
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(index, message)| {
+                (index > protected_end
+                    && Self::is_remote_message(message)
+                    && !anchors.protected.contains(&Self::message_identity(message)))
+                .then_some(index)
+            })
+            .take(excess)
+            .collect::<HashSet<_>>();
+        let removed_newer = !removable.is_empty();
+        let remaining = excess.saturating_sub(removable.len());
+        if remaining > 0 {
+            removable.extend(
+                self.messages
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, message)| {
+                        older_identities
+                            .contains(&Self::message_identity(message))
+                            .then_some(index)
+                    })
+                    .take(remaining),
+            );
+        }
+        self.remove_message_indices(&removable);
+        if removed_newer {
+            self.record_newer_history_gap();
+        }
+        self.restore_message_window_anchors(&anchors);
+        let added = self
+            .messages
+            .iter()
+            .filter(|message| older_identities.contains(&Self::message_identity(message)))
+            .count();
         self.ensure_selected_message_visible();
-        added
+        PrependMessagesResult {
+            added,
+            had_unique_messages: true,
+        }
     }
 
     pub fn apply_loaded_selected_chat_thread_topics(&mut self, thread_topics: Vec<ThreadTopic>) {
@@ -1298,6 +1734,9 @@ impl AppState {
 
     pub fn clear_loaded_chat_messages(&mut self) {
         self.messages.clear();
+        self.newer_history_gap = false;
+        self.pending_gap_submit = None;
+        self.reply_submission_request_id = None;
         self.thread_topics.clear();
         self.selected_thread_topic_index = 0;
         self.thread_topic_scroll_offset = 0;
@@ -1310,12 +1749,18 @@ impl AppState {
 
     pub fn begin_conversation_load(&mut self) {
         self.messages.clear();
+        self.newer_history_gap = false;
+        self.pending_gap_submit = None;
+        self.reply_submission_request_id = None;
         self.reset_message_selection();
         self.conversation_load_status = ConversationLoadStatus::Loading;
     }
 
     pub fn mark_conversation_load_failed(&mut self) {
         self.messages.clear();
+        self.newer_history_gap = false;
+        self.pending_gap_submit = None;
+        self.reply_submission_request_id = None;
         self.reset_message_selection();
         self.conversation_load_status = ConversationLoadStatus::Failed;
     }
@@ -1720,11 +2165,18 @@ impl AppState {
             self.messages = snapshot.messages;
             for local in local_rows {
                 if Some(local.chat_id) == snapshot.selected_chat_id
+                    && snapshot
+                        .selected_topic_id
+                        .is_none_or(|topic_id| local.thread_topic_id == Some(topic_id))
                     && !self.messages.iter().any(|current| current.id == local.id)
                 {
                     self.messages.push(local);
                 }
             }
+            self.retain_newest_remote_messages();
+            self.newer_history_gap = false;
+            self.newer_history_generation = self.newer_history_generation.saturating_add(1);
+            self.pending_gap_submit = None;
             self.selected_message_index = selected_message_id
                 .and_then(|message_id| {
                     self.messages
@@ -1738,7 +2190,7 @@ impl AppState {
             } else {
                 ConversationLoadStatus::Loaded
             };
-            self.clear_selected_chat_older_history_exhausted();
+            self.clear_selected_scope_older_history_exhausted();
         }
 
         self.typing_users.clear();
@@ -1894,7 +2346,7 @@ impl AppState {
                 }
 
                 if should_append_to_loaded_messages {
-                    self.messages.push(msg.clone());
+                    self.append_remote_message_with_retention(msg.clone());
                 }
 
                 let selected_topic_unread = selected_thread_topic_id
@@ -1957,6 +2409,7 @@ impl AppState {
                 chat_id,
                 message_id,
             } => {
+                let anchors = self.capture_message_window_anchors();
                 if chat_id == UNKNOWN_DELETE_UPDATE_CHAT_ID {
                     self.messages.retain(|m| m.id != message_id);
                 } else {
@@ -1972,9 +2425,7 @@ impl AppState {
                 }
                 self.clear_compose_for_deleted_message(chat_id, message_id);
 
-                if !self.messages.is_empty() && self.selected_message_index >= self.messages.len() {
-                    self.selected_message_index = self.messages.len() - 1;
-                }
+                self.restore_message_window_anchors(&anchors);
                 self.ensure_selected_message_visible();
                 if self.selected_chat_id().is_some_and(|selected_chat_id| {
                     delete_update_matches_chat(chat_id, selected_chat_id)
@@ -2423,6 +2874,7 @@ impl AppState {
     }
 
     pub fn clear_input_mode(&mut self) {
+        self.reply_submission_request_id = None;
         self.editing_message_id = None;
         self.replying_to_message_id = None;
         self.input_buffer.clear();
@@ -2486,6 +2938,9 @@ impl AppState {
     }
 
     fn refresh_selected_chat_last_message_from_loaded_messages(&mut self) {
+        if self.newer_history_gap {
+            return;
+        }
         let selected_chat_id = self.selected_chat_id();
         let last_message = selected_chat_id.and_then(|chat_id| {
             self.messages
@@ -2515,14 +2970,25 @@ impl AppState {
     }
 
     pub fn apply_reply_success(&mut self, message: Message) {
-        self.messages.push(message);
-        self.select_last_message();
+        let identity = Self::message_identity(&message);
+        if !self.newer_history_gap {
+            let retained = self.upsert_confirmed_message(message, None);
+            if retained {
+                self.selected_message_index = self
+                    .messages
+                    .iter()
+                    .position(|message| Self::message_identity(message) == identity)
+                    .unwrap_or_else(|| last_index(self.messages.len()));
+                self.ensure_selected_message_visible();
+            }
+        }
         self.refresh_selected_chat_last_message_from_loaded_messages();
         self.set_status(REPLY_SENT_STATUS);
         self.finish_compose_mode();
     }
 
     pub fn apply_reply_failure(&mut self, error: String) {
+        self.finish_reply_submission();
         self.set_error(reply_failed_error(error));
     }
 
@@ -2561,8 +3027,20 @@ impl AppState {
     pub fn apply_send_success(&mut self, temp_id: i32, sent_message: Message) {
         let chat_id = sent_message.chat_id;
         let sent_topic_id = sent_message.thread_topic_id;
-        if let Some(idx) = self.messages.iter().position(|m| m.id == temp_id) {
-            self.messages[idx] = sent_message;
+        if self
+            .messages
+            .iter()
+            .any(|message| message.id == temp_id && message.chat_id == chat_id)
+        {
+            if self.newer_history_gap {
+                let anchors = self.capture_message_window_anchors();
+                self.messages
+                    .retain(|message| !(message.id == temp_id && message.chat_id == chat_id));
+                self.restore_message_window_anchors(&anchors);
+                self.ensure_selected_message_visible();
+            } else {
+                self.upsert_confirmed_message(sent_message, Some((chat_id, temp_id)));
+            }
         }
         if self.selected_chat_id() == Some(chat_id) {
             let selected_topic_id = self.selected_thread_topic().map(|topic| topic.id);
@@ -2596,11 +3074,10 @@ impl AppState {
     }
 
     pub fn apply_delete_success(&mut self, confirmation: DeleteConfirmation) {
+        let anchors = self.capture_message_window_anchors();
         self.messages
             .retain(|m| !(m.id == confirmation.message_id && m.chat_id == confirmation.chat_id));
-        if self.selected_message_index >= self.messages.len() && !self.messages.is_empty() {
-            self.selected_message_index = self.messages.len() - 1;
-        }
+        self.restore_message_window_anchors(&anchors);
         self.ensure_selected_message_visible();
         self.refresh_selected_chat_last_message_from_loaded_messages();
         self.set_status(MESSAGE_DELETED_STATUS);
@@ -2709,9 +3186,9 @@ mod tests {
         CANNOT_REPLY_UNSENT_MESSAGE_ERROR, CHAT_LIST_ITEM_HEIGHT, ContextMenuAction,
         ContextMenuTarget, ConversationLoadStatus, DEFAULT_SPLIT_RATIO, DeleteConfirmation,
         FAILED_SEND_DISMISSED_STATUS, FOLDER_VIEWPORT_RESERVED_COLUMNS, FocusedPanel,
-        MAX_SPLIT_RATIO, MESSAGE_DELETED_STATUS, MESSAGE_EDITED_STATUS, MESSAGE_ROW_HEIGHT,
-        MIN_SPLIT_RATIO, MessageSubmitAction, NO_CHAT_SELECTED_ERROR, NOTIFICATION_LIFETIME,
-        PANEL_BORDER_RESERVED_COLUMNS, PANEL_BORDER_RESERVED_ROWS,
+        MAX_REMOTE_MESSAGES, MAX_SPLIT_RATIO, MESSAGE_DELETED_STATUS, MESSAGE_EDITED_STATUS,
+        MESSAGE_ROW_HEIGHT, MIN_SPLIT_RATIO, MessageSubmitAction, NO_CHAT_SELECTED_ERROR,
+        NOTIFICATION_LIFETIME, PANEL_BORDER_RESERVED_COLUMNS, PANEL_BORDER_RESERVED_ROWS,
         REMOTE_EDIT_WHILE_EDITING_STATUS, REPLY_MESSAGE_ROW_HEIGHT, REPLY_SENT_STATUS,
         ReconciliationApply, ReconciliationSnapshot, SPLIT_RATIO_STEP, TYPING_ACTION_COOLDOWN,
         delete_failed_error, delete_update_matches_chat, edit_failed_error, last_index,
@@ -5045,6 +5522,305 @@ mod tests {
         assert_eq!(state.focused_panel, FocusedPanel::Input);
         state.focus_next_panel();
         assert_eq!(state.focused_panel, FocusedPanel::Folders);
+    }
+
+    #[test]
+    fn latest_load_keeps_newest_remote_window_and_protected_local_rows() {
+        let mut state = state_with_chats();
+        let mut failed = message(-1);
+        failed.status = MessageStatus::Failed;
+        state.messages = vec![failed];
+        let remote = (1..=(MAX_REMOTE_MESSAGES as i32 + 20))
+            .map(message)
+            .collect::<Vec<_>>();
+
+        state.apply_loaded_selected_chat_messages(remote);
+
+        assert_eq!(state.remote_message_count(), MAX_REMOTE_MESSAGES);
+        assert_eq!(state.messages.len(), MAX_REMOTE_MESSAGES + 1);
+        assert_eq!(state.messages[0].id, 21);
+        assert_eq!(state.messages.last().map(|message| message.id), Some(-1));
+        assert!(!state.newer_history_gap());
+    }
+
+    #[test]
+    fn streaming_retention_preserves_reader_anchor_then_records_newer_gap() {
+        let mut state = state_with_chats();
+        state.messages = (1..=MAX_REMOTE_MESSAGES as i32).map(message).collect();
+        state.selected_message_index = MAX_REMOTE_MESSAGES - 1;
+        state.message_scroll_offset = MAX_REMOTE_MESSAGES - 10;
+
+        for id in (MAX_REMOTE_MESSAGES as i32 + 1)..=10_000 {
+            state.apply_update(Update::NewMessage(message(id)));
+        }
+
+        assert_eq!(state.remote_message_count(), MAX_REMOTE_MESSAGES);
+        assert_eq!(
+            state.selected_message().map(|message| message.id),
+            Some(500)
+        );
+        assert_eq!(
+            state
+                .messages
+                .get(state.message_scroll_offset)
+                .map(|message| message.id),
+            Some(491)
+        );
+        assert!(state.newer_history_gap());
+        assert_eq!(
+            state.chats[0].last_message.as_deref(),
+            Some("message 10000")
+        );
+    }
+
+    #[test]
+    fn older_prepend_trims_newer_edge_and_preserves_stable_anchors() {
+        let mut state = state_with_chats();
+        state.messages = (1_001..=1_500).map(message).collect();
+        state.selected_message_index = 0;
+        state.message_scroll_offset = 0;
+        let older = (981..=1_000).map(message).collect();
+
+        let prepend = state.prepend_loaded_selected_chat_messages(older);
+
+        assert_eq!(prepend.added, 20);
+        assert_eq!(state.remote_message_count(), MAX_REMOTE_MESSAGES);
+        assert_eq!(state.messages.first().map(|message| message.id), Some(981));
+        assert_eq!(state.messages.last().map(|message| message.id), Some(1_480));
+        assert_eq!(
+            state.selected_message().map(|message| message.id),
+            Some(1_001)
+        );
+        assert_eq!(
+            state
+                .messages
+                .get(state.message_scroll_offset)
+                .map(|message| message.id),
+            Some(1_001)
+        );
+        assert!(state.newer_history_gap());
+    }
+
+    #[test]
+    fn head_eviction_reopens_exact_scope_older_history() {
+        let mut state = state_with_chats();
+        state.messages = (1..=MAX_REMOTE_MESSAGES as i32).map(message).collect();
+        state.selected_message_index = MAX_REMOTE_MESSAGES - 1;
+        state.message_scroll_offset = MAX_REMOTE_MESSAGES - 10;
+        state.mark_selected_chat_older_history_exhausted();
+        assert!(state.selected_chat_older_history_exhausted());
+
+        state.apply_update(Update::NewMessage(message(501)));
+
+        assert!(!state.selected_chat_older_history_exhausted());
+        assert_eq!(state.messages.first().map(|message| message.id), Some(2));
+        assert!(!state.newer_history_gap());
+    }
+
+    #[test]
+    fn deletion_before_selection_preserves_selected_message_identity() {
+        let mut state = state_with_chats();
+        state.messages = vec![message(1), message(2), message(3)];
+        state.selected_message_index = 1;
+
+        state.apply_update(Update::DeleteMessage {
+            chat_id: 10,
+            message_id: 1,
+        });
+
+        assert_eq!(state.selected_message().map(|message| message.id), Some(2));
+    }
+
+    #[test]
+    fn following_the_tail_keeps_sliding_window_without_gap() {
+        let mut state = state_with_chats();
+        state.messages = (1..=MAX_REMOTE_MESSAGES as i32).map(message).collect();
+        state.select_last_message();
+        state.message_scroll_offset = MAX_REMOTE_MESSAGES - 10;
+
+        for id in (MAX_REMOTE_MESSAGES as i32 + 1)..=10_000 {
+            state.apply_update(Update::NewMessage(message(id)));
+            state.select_last_message();
+        }
+
+        assert!(!state.newer_history_gap());
+        assert_eq!(state.remote_message_count(), MAX_REMOTE_MESSAGES);
+        assert_eq!(
+            state.messages.first().map(|message| message.id),
+            Some(9_501)
+        );
+        assert_eq!(
+            state.messages.last().map(|message| message.id),
+            Some(10_000)
+        );
+    }
+
+    #[test]
+    fn refreshed_latest_preserves_unsaved_input() {
+        let mut state = state_with_chats();
+        state.messages = vec![message(1)];
+        state.input_buffer = "unsaved draft".to_string();
+        state.input_cursor = state.input_buffer.len();
+
+        state.apply_refreshed_selected_chat_messages(vec![message(2)]);
+
+        assert_eq!(state.input_buffer, "unsaved draft");
+        assert_eq!(state.input_cursor, "unsaved draft".len());
+        assert_eq!(state.messages[0].id, 2);
+    }
+
+    #[test]
+    fn reply_submission_has_single_in_flight_owner() {
+        let mut state = state_with_chats();
+
+        assert!(state.begin_reply_submission(1));
+        assert!(!state.begin_reply_submission(2));
+        state.apply_reply_failure("offline".to_string());
+        assert!(!state.reply_submission_pending());
+        assert!(state.begin_reply_submission(3));
+    }
+
+    #[test]
+    fn confirmed_bodies_are_omitted_when_gap_opens_in_flight() {
+        let mut state = state_with_chats();
+        state.messages = (1..=MAX_REMOTE_MESSAGES as i32).map(message).collect();
+        state.selected_message_index = 0;
+        state.apply_send_pending(-1, 10, None, "pending".to_string());
+        state.selected_message_index = 0;
+        state.apply_update(Update::NewMessage(message(501)));
+        assert!(state.newer_history_gap());
+
+        let mut sent = message(502);
+        sent.is_own = true;
+        state.apply_send_success(-1, sent.clone());
+        state.apply_reply_success(sent);
+
+        assert!(state.messages.iter().all(|message| message.id != -1));
+        assert!(state.messages.iter().all(|message| message.id != 502));
+        assert_eq!(state.remote_message_count(), MAX_REMOTE_MESSAGES);
+    }
+
+    #[test]
+    fn retention_rejection_does_not_claim_server_history_exhaustion() {
+        let mut state = state_with_chats();
+        state.messages = (1..=MAX_REMOTE_MESSAGES as i32).map(message).collect();
+        state.selected_message_index = 0;
+        state.message_scroll_offset = 0;
+        state.replying_to_message_id = Some(MAX_REMOTE_MESSAGES as i32);
+
+        let prepend = state.prepend_loaded_selected_chat_messages((-19..=0).map(message).collect());
+
+        assert_eq!(prepend.added, 0);
+        assert!(prepend.had_unique_messages);
+        assert!(!state.selected_chat_older_history_exhausted());
+        assert_eq!(state.remote_message_count(), MAX_REMOTE_MESSAGES);
+    }
+
+    #[test]
+    fn send_and_reply_completions_deduplicate_live_echoes() {
+        let mut send_state = state_with_chats();
+        send_state.messages = vec![message(1)];
+        send_state.apply_send_pending(-1, 10, None, "sent".to_string());
+        let mut echoed_send = message(2);
+        echoed_send.is_own = true;
+        send_state.apply_update(Update::NewMessage(echoed_send.clone()));
+        send_state.apply_send_success(-1, echoed_send);
+        assert_eq!(
+            send_state
+                .messages
+                .iter()
+                .filter(|message| message.id == 2)
+                .count(),
+            1
+        );
+        assert!(send_state.messages.iter().all(|message| message.id != -1));
+
+        let mut reply_state = state_with_chats();
+        reply_state.messages = vec![message(1)];
+        reply_state.request_reply_to_selected_message();
+        let mut echoed_reply = message(2);
+        echoed_reply.is_own = true;
+        reply_state.apply_update(Update::NewMessage(echoed_reply.clone()));
+        reply_state.apply_reply_success(echoed_reply);
+        assert_eq!(
+            reply_state
+                .messages
+                .iter()
+                .filter(|message| message.id == 2)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn loading_one_topic_keeps_sibling_topic_exhaustion() {
+        let mut state = state_with_chats();
+        state.thread_topics = vec![thread_topic(101, "One"), thread_topic(102, "Two")];
+        state.selected_thread_topic_index = 0;
+        state.mark_selected_chat_older_history_exhausted();
+        assert!(state.selected_chat_older_history_exhausted());
+
+        state.selected_thread_topic_index = 1;
+        state.apply_loaded_selected_chat_messages(vec![message(102)]);
+        state.selected_thread_topic_index = 0;
+
+        assert!(state.selected_chat_older_history_exhausted());
+    }
+
+    #[test]
+    fn reconciliation_preserve_keeps_gap_while_replacement_clears_it() {
+        let mut state = state_with_chats();
+        state.folders = vec![all_folder(0)];
+        state.messages = (1..=MAX_REMOTE_MESSAGES as i32).map(message).collect();
+        state.selected_message_index = 0;
+        state.message_scroll_offset = 0;
+        state.apply_update(Update::NewMessage(message(501)));
+        assert!(state.newer_history_gap());
+        let context = state.reconciliation_context();
+        let mut latest = message(700);
+        latest.chat_id = 10;
+
+        assert_eq!(
+            state.apply_reconciliation_snapshot(
+                context,
+                ReconciliationSnapshot {
+                    folders: vec![all_folder(0)],
+                    selected_folder_id: Some(0),
+                    chats: vec![chat(10, "Alice"), chat(20, "Bob")],
+                    chat_last_message_ids: Default::default(),
+                    selected_chat_id: Some(10),
+                    thread_topics: Vec::new(),
+                    selected_topic_id: None,
+                    messages: vec![latest.clone()],
+                },
+            ),
+            ReconciliationApply::Applied {
+                conversation_replaced: false
+            }
+        );
+        assert!(state.newer_history_gap());
+
+        state.select_last_message();
+        let replacement_context = state.reconciliation_context();
+        assert_eq!(
+            state.apply_reconciliation_snapshot(
+                replacement_context,
+                ReconciliationSnapshot {
+                    folders: vec![all_folder(0)],
+                    selected_folder_id: Some(0),
+                    chats: vec![chat(10, "Alice"), chat(20, "Bob")],
+                    chat_last_message_ids: Default::default(),
+                    selected_chat_id: Some(10),
+                    thread_topics: Vec::new(),
+                    selected_topic_id: None,
+                    messages: vec![latest],
+                },
+            ),
+            ReconciliationApply::Applied {
+                conversation_replaced: true
+            }
+        );
+        assert!(!state.newer_history_gap());
     }
 
     #[test]

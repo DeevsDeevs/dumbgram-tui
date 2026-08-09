@@ -15,7 +15,7 @@ A small terminal Telegram client written in Rust with Ratatui/Crossterm and Gram
 
 ## Current limits
 
-- Large accounts are loaded in bounded pages, but full chat pagination UI is still limited.
+- The selected chat/topic keeps at most 500 server-backed messages in memory. When older reading creates a newer-history gap, the UI marks it and End (or Down/PageDown at the retained tail) refreshes the latest page; smooth forward pagination through the omitted middle is not implemented.
 - Telegram folder names are best-effort from dialog filters/folder metadata; folder-rule editing is not implemented.
 - Photo/image messages are shown with text placeholders such as `[photo]`. In Ghostty/Kitty-compatible terminals, selected downloaded thumbnails are also displayed with the Kitty graphics protocol. Full media browser controls, multi-account support, and server-side search are not implemented.
 - Some Telegram delete updates do not include enough context to identify the chat precisely.
