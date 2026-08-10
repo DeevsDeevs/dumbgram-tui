@@ -8054,7 +8054,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_own_message_appends_without_unread_or_read_ack() {
+    async fn live_own_message_preserves_tail_follow_without_own_read_ack() {
         let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
         let marked_threads = Arc::new(Mutex::new(Vec::new()));
         let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
@@ -8075,8 +8075,25 @@ mod tests {
             app.state.messages.last().map(|message| message.id),
             Some(58)
         );
+        assert_eq!(
+            app.state.selected_message().map(|message| message.id),
+            Some(58)
+        );
         assert_eq!(app.state.chats[0].unread_count, 4);
         assert!(marked_chat_ids.lock().unwrap().is_empty());
+        assert!(marked_threads.lock().unwrap().is_empty());
+
+        let mut incoming = message(59);
+        incoming.chat_id = 1;
+        apply_update_with_read_ack(&mut app, Update::NewMessage(incoming), &mark_read_loader);
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            app.state.selected_message().map(|message| message.id),
+            Some(59)
+        );
+        assert_eq!(app.state.chats[0].unread_count, 0);
+        assert_eq!(*marked_chat_ids.lock().unwrap(), vec![1]);
         assert!(marked_threads.lock().unwrap().is_empty());
     }
 

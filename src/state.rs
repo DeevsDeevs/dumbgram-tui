@@ -1467,7 +1467,20 @@ impl AppState {
         if let Some(current_input) = current_input.as_deref() {
             recovery.capture_base(current_input, Some(&content));
         }
-        recovery.submissions.entry(submission_id).or_insert(content);
+        let equal_submission_id = recovery
+            .submissions
+            .iter()
+            .find_map(|(&id, existing)| (existing == &content).then_some(id));
+        match equal_submission_id {
+            Some(existing_id) if submission_id < existing_id => {
+                recovery.submissions.remove(&existing_id);
+                recovery.submissions.insert(submission_id, content);
+            }
+            Some(_) => {}
+            None => {
+                recovery.submissions.insert(submission_id, content);
+            }
+        }
         if selected {
             self.input_buffer = recovery.merged();
             self.set_input_cursor_to_end();
@@ -2467,8 +2480,10 @@ impl AppState {
                 let retained = should_append_to_loaded_messages
                     && self.append_remote_message_with_retention(msg.clone());
                 let presented = !msg.is_own && retained && was_following_tail;
-                if presented {
+                if retained && was_following_tail {
                     self.select_message_by_identity(msg.chat_id, msg.id);
+                }
+                if presented {
                     presented_incoming = Some(PresentedIncomingMessage {
                         chat_id: msg.chat_id,
                         topic_id: msg.thread_topic_id,
@@ -3707,6 +3722,41 @@ mod tests {
     }
 
     #[test]
+    fn retained_own_tail_update_keeps_following_incoming_presented() {
+        let mut state = AppState::new();
+        state.chats = vec![chat_with_unread(1, "Chat 1", 0, None)];
+        state.messages = vec![update_message(10, 1, "current tail", false)];
+        state.selected_message_index = 0;
+
+        let own = state.apply_update(Update::NewMessage(update_message(
+            11,
+            1,
+            "sent from phone",
+            true,
+        )));
+        assert_eq!(own, None);
+        assert_eq!(state.selected_message().map(|message| message.id), Some(11));
+        assert_eq!(state.chats[0].unread_count, 0);
+
+        let incoming = state.apply_update(Update::NewMessage(update_message(
+            12,
+            1,
+            "next incoming",
+            false,
+        )));
+        assert_eq!(
+            incoming,
+            Some(PresentedIncomingMessage {
+                chat_id: 1,
+                topic_id: None,
+                message_id: 12,
+            })
+        );
+        assert_eq!(state.selected_message().map(|message| message.id), Some(12));
+        assert_eq!(state.chats[0].unread_count, 0);
+    }
+
+    #[test]
     fn stale_incoming_message_for_active_chat_does_not_append_or_replace_preview() {
         let mut state = AppState::new();
         state.folders = vec![all_folder(0), folder(2, "Personal", 0)];
@@ -4278,6 +4328,29 @@ mod tests {
             state.input_buffer,
             "first failed\n\nsecond failed\n\nsibling draft"
         );
+    }
+
+    #[test]
+    fn equal_failed_content_keeps_earliest_submission_order_once() {
+        let mut state = AppState::new();
+        state.chats = vec![chat_with_unread(1, "Chat", 0, None)];
+        state.input_buffer = "newer text".to_string();
+        for submission_id in [10, 20, 30] {
+            state.register_mutation_submission(submission_id, 1, None);
+        }
+
+        state.recover_failed_submission(30, 1, None, "retry once".to_string());
+        state.recover_failed_submission(10, 1, None, "retry once".to_string());
+        state.recover_failed_submission(20, 1, None, "different failure".to_string());
+
+        let expected = "retry once\n\ndifferent failure\n\nnewer text";
+        assert_eq!(state.input_buffer, expected);
+        assert_eq!(state.input_buffer.matches("retry once").count(), 1);
+        assert_eq!(state.pending_mutation_submission_count(), 0);
+
+        state.save_current_draft();
+        state.restore_draft_for_selected_chat();
+        assert_eq!(state.input_buffer, expected);
     }
 
     #[test]
