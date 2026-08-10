@@ -2037,7 +2037,6 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
             mark_read_loader,
             media_preview_loader,
         );
-        release_gap_submit_if_ready(app, send_message_loader, reply_message_loader);
         if step.dirty {
             frames.mark_dirty(TokioInstant::now());
         }
@@ -2071,6 +2070,7 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
             break;
         }
 
+        release_gap_submit_if_ready(app, send_message_loader, reply_message_loader);
         draw_due_frame(terminal, app, theme, &mut frames)?;
 
         let service_deadline = loop_state.service_deadline();
@@ -2119,16 +2119,27 @@ fn prepare_loop_step<C: TelegramClient + Clone + Send + Sync + 'static>(
     mark_read_loader: &MarkChatReadLoader<C>,
     media_preview_loader: &MediaPreviewLoader<C>,
 ) -> PreparedLoopStep {
-    let blocked_terminal_event = app.state.gap_submit_pending()
-        && loop_state.staged_terminal_event.is_some()
-        || app.state.reply_submission_pending()
-            && matches!(
-                loop_state.staged_terminal_event,
-                Some(Event::Key(KeyEvent {
-                    code: KeyCode::Enter,
-                    ..
-                }))
-            );
+    let compose_cancel = loop_state
+        .staged_terminal_event
+        .as_ref()
+        .is_some_and(|event| compose_cancel_before_result_drain(app, event));
+    let blocked_terminal_event = loop_state
+        .staged_terminal_event
+        .as_ref()
+        .is_some_and(|event| {
+            app.state.gap_submit_pending() && !gap_submit_allows_terminal_event(app, event)
+                || (app.state.reply_submission_pending() || app.state.edit_submission_pending())
+                    && matches!(event, Event::Key(key) if input_key_mutates_text_or_submits(app.state.focused_panel, *key))
+        });
+    if blocked_terminal_event {
+        app.state.set_status(if app.state.gap_submit_pending() {
+            REFRESHING_LATEST_BEFORE_SEND_STATUS
+        } else if app.state.reply_submission_pending() {
+            SENDING_REPLY_STATUS
+        } else {
+            SAVING_EDIT_STATUS
+        });
+    }
     let results_dirty = drain_ready_results(
         loop_state,
         app,
@@ -2143,12 +2154,63 @@ fn prepare_loop_step<C: TelegramClient + Clone + Send + Sync + 'static>(
     let terminal_event = if blocked_terminal_event {
         loop_state.staged_terminal_event.take();
         None
+    } else if compose_cancel {
+        loop_state.staged_terminal_event.take();
+        if app.state.editing_message_id.is_some() || app.state.replying_to_message_id.is_some() {
+            app.state.cancel_compose_mode();
+        }
+        None
     } else {
         loop_state.staged_terminal_event.take()
     };
     PreparedLoopStep {
-        dirty: app.state.check_notification_timeout() || results_dirty || blocked_terminal_event,
+        dirty: app.state.check_notification_timeout()
+            || results_dirty
+            || blocked_terminal_event
+            || compose_cancel,
         terminal_event,
+    }
+}
+
+fn compose_cancel_before_result_drain(app: &App, event: &Event) -> bool {
+    !app.state.gap_submit_pending()
+        && app.state.context_menu().is_none()
+        && app.state.delete_confirmation().is_none()
+        && (app.state.reply_submission_pending() || app.state.edit_submission_pending())
+        && (app.state.editing_message_id.is_some() || app.state.replying_to_message_id.is_some())
+        && matches!(event, Event::Key(key) if key.kind == KeyEventKind::Press && is_cancel_key(*key))
+}
+
+fn is_cancel_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Esc
+        || matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn input_key_mutates_text_or_submits(focused_panel: state::FocusedPanel, key: KeyEvent) -> bool {
+    if focused_panel != state::FocusedPanel::Input {
+        return false;
+    }
+    match key.code {
+        KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete => true,
+        KeyCode::Char('d' | 'k' | 'u' | 'w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            true
+        }
+        KeyCode::Char(_) if !key.modifiers.contains(KeyModifiers::CONTROL) => true,
+        _ => false,
+    }
+}
+
+fn gap_submit_allows_terminal_event(app: &App, event: &Event) -> bool {
+    match event {
+        Event::Resize(_, _) | Event::FocusLost | Event::FocusGained => true,
+        Event::Mouse(mouse) => matches!(mouse.kind, MouseEventKind::Up(_)),
+        Event::Key(key) if is_cancel_key(*key) => true,
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        }) => app.state.focused_panel != state::FocusedPanel::Input,
+        _ => false,
     }
 }
 
@@ -4378,6 +4440,7 @@ fn apply_edit_message_result(app: &mut App, load: EditMessageResult) {
         Ok(()) => {
             let selected_topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
             if app.state.selected_chat_id() == Some(load.chat_id)
+                && app.state.edit_submission_matches(load.submission_id)
                 && selected_topic_id == load.topic_id
                 && app.state.editing_message_id == Some(load.message_id)
                 && app
@@ -4393,16 +4456,27 @@ fn apply_edit_message_result(app: &mut App, load: EditMessageResult) {
                     Ok(()),
                 );
             } else {
+                if app.state.edit_submission_matches(load.submission_id) {
+                    app.state.finish_edit_submission();
+                }
                 diagnostics::event("edit_message_result_ignored", "reason=stale_context");
+            }
+            if app.state.edit_submission_matches(load.submission_id) {
+                app.state.finish_edit_submission();
             }
             app.state.finish_mutation_submission(load.submission_id);
         }
         Err(error) => {
-            app.state.recover_failed_submission(
+            let owns_compose = app.state.edit_submission_matches(load.submission_id);
+            if owns_compose {
+                app.state.finish_edit_submission();
+            }
+            app.state.record_failed_submission(
                 load.submission_id,
                 load.chat_id,
                 load.topic_id,
                 load.content,
+                owns_compose,
             );
             app.state.set_error(state::edit_failed_error(error));
         }
@@ -4434,17 +4508,22 @@ fn apply_reply_message_result(app: &mut App, load: ReplyMessageResult) {
                 }
                 diagnostics::event("reply_message_result_ignored", "reason=stale_context");
             }
-            app.state.finish_mutation_submission(load.submission_id);
-        }
-        Err(error) => {
             if app.state.reply_submission_matches(load.submission_id) {
                 app.state.finish_reply_submission();
             }
-            app.state.recover_failed_submission(
+            app.state.finish_mutation_submission(load.submission_id);
+        }
+        Err(error) => {
+            let owns_compose = app.state.reply_submission_matches(load.submission_id);
+            if owns_compose {
+                app.state.finish_reply_submission();
+            }
+            app.state.record_failed_submission(
                 load.submission_id,
                 load.chat_id,
                 load.topic_id,
                 load.content,
+                owns_compose,
             );
             app.state.set_error(state::reply_failed_error(error));
         }
@@ -5154,15 +5233,27 @@ async fn handle_key_event_with_progress<C: TelegramClient + Clone + Send + Sync 
             key.modifiers
         ),
     );
-    if app.state.gap_submit_pending()
-        || app.state.reply_submission_pending() && key.code == KeyCode::Enter
+    if app.state.gap_submit_pending() {
+        if is_cancel_key(key) {
+            app.state.cancel_gap_submit();
+            app.state.clear_status();
+        } else if !(key.code == KeyCode::Char('q')
+            && key.modifiers == KeyModifiers::NONE
+            && app.state.focused_panel != state::FocusedPanel::Input)
+        {
+            app.state.set_status(REFRESHING_LATEST_BEFORE_SEND_STATUS);
+            return Ok(());
+        }
+    }
+    if (app.state.reply_submission_pending() || app.state.edit_submission_pending())
+        && input_key_mutates_text_or_submits(app.state.focused_panel, key)
     {
-        let status = if app.state.gap_submit_pending() {
-            REFRESHING_LATEST_BEFORE_SEND_STATUS
-        } else {
-            SENDING_REPLY_STATUS
-        };
-        app.state.set_status(status);
+        app.state
+            .set_status(if app.state.reply_submission_pending() {
+                SENDING_REPLY_STATUS
+            } else {
+                SAVING_EDIT_STATUS
+            });
         return Ok(());
     }
 
@@ -5190,6 +5281,26 @@ async fn handle_key_event_with_progress<C: TelegramClient + Clone + Send + Sync 
         if let Some((target, action)) = action {
             execute_context_menu_action(app, client, progress, &mut loaders, target, action)
                 .await?;
+        }
+        return Ok(());
+    }
+
+    if app.state.delete_confirmation().is_some() {
+        match confirm_keys::handle_confirm_key(key) {
+            confirm_keys::ConfirmKeyOutcome::Confirm => {
+                progress.show(app, DELETING_MESSAGE_STATUS)?;
+                if let Some(loader) = loaders.delete_message {
+                    if let Some(confirmation) = actions::begin_confirm_delete(&mut app.state) {
+                        loader.spawn_delete_message(confirmation);
+                    }
+                } else {
+                    actions::confirm_delete(&mut app.state, client).await?;
+                }
+            }
+            confirm_keys::ConfirmKeyOutcome::Cancel => {
+                app.state.cancel_delete_confirmation();
+            }
+            confirm_keys::ConfirmKeyOutcome::Ignored => {}
         }
         return Ok(());
     }
@@ -5225,26 +5336,6 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
     progress: &mut UiProgress<'_>,
     mut loaders: HandlerLoaders<'_, C>,
 ) -> Result<()> {
-    if app.state.delete_confirmation().is_some() {
-        match confirm_keys::handle_confirm_key(key) {
-            confirm_keys::ConfirmKeyOutcome::Confirm => {
-                progress.show(app, DELETING_MESSAGE_STATUS)?;
-                if let Some(loader) = loaders.delete_message {
-                    if let Some(confirmation) = actions::begin_confirm_delete(&mut app.state) {
-                        loader.spawn_delete_message(confirmation);
-                    }
-                } else {
-                    actions::confirm_delete(&mut app.state, client).await?;
-                }
-            }
-            confirm_keys::ConfirmKeyOutcome::Cancel => {
-                app.state.cancel_delete_confirmation();
-            }
-            confirm_keys::ConfirmKeyOutcome::Ignored => {}
-        }
-        return Ok(());
-    }
-
     if newer_gap_refresh_requested(app, key) {
         let Some(chat_id) = app.state.selected_chat_id() else {
             return Ok(());
@@ -5691,6 +5782,7 @@ async fn handle_input_focused<C: TelegramClient + Clone + Send + Sync + 'static>
                         loader.spawn_edit_message(chat_id, topic_id, message_id, content);
                     app.state
                         .register_mutation_submission(submission_id, chat_id, topic_id);
+                    app.state.begin_edit_submission(submission_id);
                 } else {
                     actions::execute_message_submit_action(
                         &mut app.state,
@@ -5879,7 +5971,7 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
     progress: &mut UiProgress<'_>,
     mut loaders: HandlerLoaders<'_, C>,
 ) -> Result<()> {
-    if app.state.gap_submit_pending() {
+    if app.state.gap_submit_pending() && !matches!(mouse_event.kind, MouseEventKind::Up(_)) {
         app.state.set_status(REFRESHING_LATEST_BEFORE_SEND_STATUS);
         return Ok(());
     }
@@ -7613,6 +7705,284 @@ mod tests {
         assert!(step.dirty);
         assert!(step.terminal_event.is_none());
         assert!(loop_state.staged_terminal_event.is_none());
+        assert!(app.state.gap_submit_pending());
+    }
+
+    #[test]
+    fn same_step_edit_success_consumes_compose_cancel_without_deleting_draft() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        loop_state.staged_terminal_event =
+            Some(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        let client = MockTelegramClient::new();
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation);
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        let mut editable = message(7);
+        editable.chat_id = 1;
+        editable.is_own = true;
+        editable.can_edit = true;
+        app.state.messages = vec![editable];
+        app.state.input_buffer = "underlying draft".to_string();
+        app.state.request_edit_selected_message();
+        app.state.begin_edit_submission(1);
+        senders
+            .edit_message
+            .send(EditMessageResult {
+                submission_id: 1,
+                chat_id: 1,
+                topic_id: None,
+                message_id: 7,
+                content: "saved edit".to_string(),
+                result: Ok(()),
+            })
+            .unwrap();
+
+        let step = prepare_loop_step(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        );
+
+        assert!(step.dirty);
+        assert!(step.terminal_event.is_none());
+        assert_eq!(app.state.input_buffer, "underlying draft");
+        assert!(!app.state.edit_submission_pending());
+        assert_eq!(app.state.messages[0].content, "saved edit");
+    }
+
+    #[test]
+    fn pre_drain_compose_cancel_respects_the_visible_ui_route() {
+        let cancel = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        let mut selected = message(7);
+        selected.chat_id = 1;
+        app.state.messages = vec![selected];
+        app.state.begin_edit_submission(1);
+        app.state.begin_chat_search();
+
+        assert!(!super::compose_cancel_before_result_drain(&app, &cancel));
+        assert!(app.state.chat_search_active());
+
+        app.state.editing_message_id = Some(7);
+        assert!(super::compose_cancel_before_result_drain(&app, &cancel));
+
+        assert!(app.state.open_context_menu(
+            ContextMenuTarget::Message {
+                chat_id: 1,
+                message_id: 7,
+            },
+            1,
+            1,
+        ));
+        assert!(!super::compose_cancel_before_result_drain(&app, &cancel));
+        assert!(app.state.context_menu().is_some());
+
+        app.state.close_context_menu();
+        app.state.set_delete_confirmation(DeleteConfirmation {
+            chat_id: 1,
+            message_id: 7,
+        });
+        assert!(!super::compose_cancel_before_result_drain(&app, &cancel));
+        app.state.cancel_delete_confirmation();
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let non_press = Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+                kind,
+            ));
+            assert!(!super::compose_cancel_before_result_drain(&app, &non_press));
+        }
+    }
+
+    #[test]
+    fn gap_submit_allows_only_required_responsive_terminal_events() {
+        let mut app = App::new();
+        app.state.focused_panel = FocusedPanel::Messages;
+        let cancel = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let quit = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        let release = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(super::gap_submit_allows_terminal_event(&app, &cancel));
+        assert!(super::gap_submit_allows_terminal_event(&app, &quit));
+        assert!(super::gap_submit_allows_terminal_event(
+            &app,
+            &Event::Resize(80, 24)
+        ));
+        assert!(super::gap_submit_allows_terminal_event(
+            &app,
+            &Event::FocusLost
+        ));
+        assert!(super::gap_submit_allows_terminal_event(
+            &app,
+            &Event::FocusGained
+        ));
+        assert!(super::gap_submit_allows_terminal_event(&app, &release));
+        assert!(!super::gap_submit_allows_terminal_event(
+            &app,
+            &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ));
+        assert!(super::input_key_mutates_text_or_submits(
+            FocusedPanel::Input,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        ));
+        assert!(super::input_key_mutates_text_or_submits(
+            FocusedPanel::Input,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ));
+        assert!(!super::input_key_mutates_text_or_submits(
+            FocusedPanel::Input,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        ));
+        assert!(!super::input_key_mutates_text_or_submits(
+            FocusedPanel::Messages,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        ));
+        assert!(!super::input_key_mutates_text_or_submits(
+            FocusedPanel::Messages,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+        ));
+        assert!(!super::gap_submit_allows_terminal_event(
+            &app,
+            &Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        ));
+    }
+
+    #[tokio::test]
+    async fn in_flight_compose_keeps_non_input_navigation_and_quit_responsive() {
+        let mut app = App::new();
+        app.state.chats = vec![chat(1), chat(2)];
+        app.state.chats[1].name = "Bob".to_string();
+        app.state.thread_topics = vec![
+            ThreadTopic {
+                id: 101,
+                title: "General".to_string(),
+                top_message_id: 1,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            },
+            ThreadTopic {
+                id: 102,
+                title: "Next".to_string(),
+                top_message_id: 2,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            },
+        ];
+        app.state.focused_panel = FocusedPanel::Messages;
+        app.state.begin_reply_submission(1);
+        let mut client = MockTelegramClient::new();
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+            &mut client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.state.selected_thread_topic_index, 1);
+
+        app.state.focused_panel = FocusedPanel::Chats;
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            &mut client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.state.selected_chat_index, 1);
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut client,
+        )
+        .await
+        .unwrap();
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn gap_submit_cancel_and_mouse_release_remain_responsive() {
+        let mut app = App::new();
+        app.state.focused_panel = FocusedPanel::Input;
+        app.state.queue_gap_submit(
+            MessageSubmitAction::Send {
+                chat_id: 3,
+                thread_top_message_id: None,
+                content: "cancel me".to_string(),
+            },
+            1,
+            3,
+            None,
+        );
+        app.state.mark_gap_submit_ready(1, 3, None);
+        let mut client = MockTelegramClient::new();
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut client,
+        )
+        .await
+        .unwrap();
+        assert!(!app.state.gap_submit_pending());
+        let (send_tx, mut send_rx) = mpsc::unbounded_channel();
+        let (reply_tx, _reply_rx) = mpsc::unbounded_channel();
+        let send_loader = SendMessageLoader::new(client.clone(), send_tx);
+        let reply_loader = ReplyMessageLoader::new(client.clone(), reply_tx);
+        release_gap_submit_if_ready(&mut app, &send_loader, &reply_loader);
+        assert!(send_rx.try_recv().is_err());
+
+        app.state.split_drag_active = true;
+        app.state.queue_gap_submit(
+            MessageSubmitAction::Send {
+                chat_id: 3,
+                thread_top_message_id: None,
+                content: "pending".to_string(),
+            },
+            2,
+            3,
+            None,
+        );
+        handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut client,
+        )
+        .await
+        .unwrap();
+        assert!(!app.state.split_drag_active);
         assert!(app.state.gap_submit_pending());
     }
 
@@ -9607,6 +9977,7 @@ mod tests {
         app.state.request_edit_selected_message();
 
         app.state.register_mutation_submission(1, 1, None);
+        app.state.begin_edit_submission(1);
         apply_edit_message_result(
             &mut app,
             EditMessageResult {
@@ -9622,6 +9993,36 @@ mod tests {
         assert_eq!(app.state.messages.len(), 1);
         assert_eq!(app.state.messages[0].content, "updated");
         assert!(app.state.messages[0].is_edited);
+    }
+
+    #[test]
+    fn stale_edit_completion_does_not_release_or_apply_over_newer_owner() {
+        let mut app = App::new();
+        let mut original = message(7);
+        original.chat_id = 1;
+        original.content = "old".to_string();
+        original.is_own = true;
+        original.can_edit = true;
+        app.state.chats = vec![chat(1)];
+        app.state.messages = vec![original];
+        app.state.request_edit_selected_message();
+        app.state.begin_edit_submission(2);
+
+        apply_edit_message_result(
+            &mut app,
+            EditMessageResult {
+                submission_id: 1,
+                chat_id: 1,
+                topic_id: None,
+                message_id: 7,
+                content: "stale".to_string(),
+                result: Ok(()),
+            },
+        );
+
+        assert!(app.state.edit_submission_matches(2));
+        assert_eq!(app.state.editing_message_id, Some(7));
+        assert_eq!(app.state.messages[0].content, "old");
     }
 
     #[tokio::test]
@@ -9919,6 +10320,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stale_reply_failure_does_not_release_newer_owner() {
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        let mut target = message(7);
+        target.chat_id = 1;
+        app.state.messages = vec![target];
+        app.state.request_reply_to_selected_message();
+        app.state.begin_reply_submission(2);
+        app.state.input_buffer = "newer reply".to_string();
+
+        apply_reply_message_result(
+            &mut app,
+            ReplyMessageResult {
+                submission_id: 1,
+                chat_id: 1,
+                topic_id: None,
+                message_id: 7,
+                content: "stale".to_string(),
+                result: Err("offline".to_string()),
+            },
+        );
+
+        assert!(app.state.reply_submission_matches(2));
+        assert_eq!(app.state.replying_to_message_id, Some(7));
+        assert_eq!(app.state.input_buffer, "newer reply");
+        assert!(app.state.messages.iter().all(|message| message.id != 11));
+    }
+
     #[tokio::test]
     async fn async_reply_message_loader_sends_result_without_blocking_handler() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -10135,6 +10565,38 @@ mod tests {
         assert_eq!(app.state.messages.len(), 1);
         assert_eq!(app.state.messages[0].id, 102);
         assert!(app.state.messages[0].content.contains("Deployments topic"));
+    }
+
+    #[tokio::test]
+    async fn delete_confirmation_cancel_precedes_in_flight_compose_cancel() {
+        let mut app = App::new();
+        let mut client = MockTelegramClient::new();
+        let mut selected = message(7);
+        selected.chat_id = 10;
+        selected.is_own = true;
+        selected.can_edit = true;
+        selected.can_delete = true;
+        app.state.chats = vec![chat(10)];
+        app.state.messages = vec![selected];
+        app.state.input_buffer = "draft".to_string();
+        app.state.request_edit_selected_message();
+        app.state.begin_edit_submission(1);
+        app.state.set_delete_confirmation(DeleteConfirmation {
+            chat_id: 10,
+            message_id: 7,
+        });
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut client,
+        )
+        .await
+        .expect("delete cancellation should be handled");
+
+        assert!(app.state.delete_confirmation().is_none());
+        assert_eq!(app.state.editing_message_id, Some(7));
+        assert!(app.state.edit_submission_pending());
     }
 
     #[tokio::test]

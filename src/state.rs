@@ -437,6 +437,7 @@ pub struct AppState {
     newer_history_generation: u64,
     pending_gap_submit: Option<PendingGapSubmit>,
     reply_submission_request_id: Option<u64>,
+    edit_submission_request_id: Option<u64>,
     pending_mutation_scopes: HashMap<u64, ConversationScope>,
     failed_submission_recovery: HashMap<ConversationScope, FailedSubmissionRecovery>,
     pub split_ratio: f32,
@@ -493,6 +494,7 @@ impl AppState {
             newer_history_generation: 0,
             pending_gap_submit: None,
             reply_submission_request_id: None,
+            edit_submission_request_id: None,
             pending_mutation_scopes: HashMap::new(),
             failed_submission_recovery: HashMap::new(),
             split_ratio: DEFAULT_SPLIT_RATIO,
@@ -582,11 +584,13 @@ impl AppState {
                     return Vec::new();
                 };
                 let actionable = Self::is_remote_actionable_message(message);
+                let compose_available =
+                    !self.reply_submission_pending() && !self.edit_submission_pending();
                 let mut actions = Vec::new();
-                if actionable {
+                if actionable && compose_available {
                     actions.push(ContextMenuAction::ReplyMessage);
                 }
-                if message.is_own && message.can_edit && actionable {
+                if message.is_own && message.can_edit && actionable && compose_available {
                     actions.push(ContextMenuAction::EditMessage);
                 }
                 if !message.content.trim().is_empty() {
@@ -1418,6 +1422,10 @@ impl AppState {
         self.pending_gap_submit.is_some()
     }
 
+    pub fn cancel_gap_submit(&mut self) -> bool {
+        self.pending_gap_submit.take().is_some()
+    }
+
     pub fn reply_submission_pending(&self) -> bool {
         self.reply_submission_request_id.is_some()
     }
@@ -1437,6 +1445,22 @@ impl AppState {
 
     pub fn finish_reply_submission(&mut self) {
         self.reply_submission_request_id = None;
+    }
+
+    pub fn begin_edit_submission(&mut self, request_id: u64) {
+        self.edit_submission_request_id = Some(request_id);
+    }
+
+    pub fn edit_submission_pending(&self) -> bool {
+        self.edit_submission_request_id.is_some()
+    }
+
+    pub fn edit_submission_matches(&self, request_id: u64) -> bool {
+        self.edit_submission_request_id == Some(request_id)
+    }
+
+    pub fn finish_edit_submission(&mut self) {
+        self.edit_submission_request_id = None;
     }
 
     fn selected_conversation_scope(&self) -> Option<ConversationScope> {
@@ -1467,13 +1491,24 @@ impl AppState {
         topic_id: Option<i32>,
         content: String,
     ) {
+        self.record_failed_submission(submission_id, chat_id, topic_id, content, true);
+    }
+
+    pub fn record_failed_submission(
+        &mut self,
+        submission_id: u64,
+        chat_id: i64,
+        topic_id: Option<i32>,
+        content: String,
+        reveal_if_selected: bool,
+    ) {
         let reported_scope = ConversationScope { chat_id, topic_id };
         let scope = self
             .pending_mutation_scopes
             .get(&submission_id)
             .copied()
             .unwrap_or(reported_scope);
-        let selected = self.selected_conversation_scope() == Some(scope);
+        let selected = reveal_if_selected && self.selected_conversation_scope() == Some(scope);
         let current_input = selected.then(|| self.input_buffer.clone());
         let recovery = self.failed_submission_recovery.entry(scope).or_default();
         if let Some(current_input) = current_input.as_deref() {
@@ -1896,7 +1931,6 @@ impl AppState {
         self.messages.clear();
         self.newer_history_gap = false;
         self.pending_gap_submit = None;
-        self.reply_submission_request_id = None;
         self.thread_topics.clear();
         self.selected_thread_topic_index = 0;
         self.thread_topic_scroll_offset = 0;
@@ -1911,7 +1945,6 @@ impl AppState {
         self.messages.clear();
         self.newer_history_gap = false;
         self.pending_gap_submit = None;
-        self.reply_submission_request_id = None;
         self.reset_message_selection();
         self.conversation_load_status = ConversationLoadStatus::Loading;
     }
@@ -1920,7 +1953,6 @@ impl AppState {
         self.messages.clear();
         self.newer_history_gap = false;
         self.pending_gap_submit = None;
-        self.reply_submission_request_id = None;
         self.reset_message_selection();
         self.conversation_load_status = ConversationLoadStatus::Failed;
     }
@@ -2885,6 +2917,9 @@ impl AppState {
     }
 
     pub fn request_edit_selected_message(&mut self) {
+        if self.reply_submission_pending() || self.edit_submission_pending() {
+            return;
+        }
         if let Some((message_id, content, can_edit)) = self.selected_message().map(|msg| {
             (
                 msg.id,
@@ -2902,6 +2937,9 @@ impl AppState {
     }
 
     pub fn request_reply_to_selected_message(&mut self) {
+        if self.reply_submission_pending() || self.edit_submission_pending() {
+            return;
+        }
         if let Some((message_id, can_reply)) = self
             .selected_message()
             .map(|msg| (msg.id, Self::is_remote_actionable_message(msg)))
@@ -3017,7 +3055,6 @@ impl AppState {
     }
 
     pub fn clear_input_mode(&mut self) {
-        self.reply_submission_request_id = None;
         self.editing_message_id = None;
         self.replying_to_message_id = None;
         self.input_buffer.clear();
@@ -3109,10 +3146,12 @@ impl AppState {
         }
         self.refresh_selected_chat_last_message_from_loaded_messages();
         self.set_status(MESSAGE_EDITED_STATUS);
+        self.finish_edit_submission();
         self.finish_compose_mode();
     }
 
     pub fn apply_edit_failure(&mut self, error: String) {
+        self.finish_edit_submission();
         self.set_error(edit_failed_error(error));
     }
 
@@ -3131,6 +3170,7 @@ impl AppState {
         }
         self.refresh_selected_chat_last_message_from_loaded_messages();
         self.set_status(REPLY_SENT_STATUS);
+        self.finish_reply_submission();
         self.finish_compose_mode();
     }
 
@@ -6087,6 +6127,55 @@ mod tests {
         state.apply_reply_failure("offline".to_string());
         assert!(!state.reply_submission_pending());
         assert!(state.begin_reply_submission(3));
+    }
+
+    #[test]
+    fn in_flight_compose_owner_rejects_new_keyboard_or_mouse_compose_mode() {
+        let mut state = state_with_chats();
+        let mut editable = message(1);
+        editable.is_own = true;
+        editable.can_edit = true;
+        state.messages = vec![editable];
+        state.request_reply_to_selected_message();
+        assert!(state.begin_reply_submission(1));
+
+        let actions = state.context_actions_for_target(ContextMenuTarget::Message {
+            chat_id: 10,
+            message_id: 1,
+        });
+        assert!(!actions.contains(&ContextMenuAction::ReplyMessage));
+        assert!(!actions.contains(&ContextMenuAction::EditMessage));
+        state.request_edit_selected_message();
+        assert_eq!(state.replying_to_message_id, Some(1));
+        assert_eq!(state.editing_message_id, None);
+        assert!(state.reply_submission_pending());
+
+        state.cancel_compose_mode();
+        assert!(state.reply_submission_pending());
+        state.request_edit_selected_message();
+        assert_eq!(state.editing_message_id, None);
+
+        state.finish_reply_submission();
+        state.request_edit_selected_message();
+        state.begin_edit_submission(2);
+        state.request_reply_to_selected_message();
+        assert_eq!(state.editing_message_id, Some(1));
+        assert_eq!(state.replying_to_message_id, None);
+        assert!(state.edit_submission_pending());
+    }
+
+    #[test]
+    fn edit_submission_releases_only_matching_owner() {
+        let mut state = state_with_chats();
+        state.begin_edit_submission(10);
+        assert!(state.edit_submission_pending());
+        assert!(!state.edit_submission_matches(9));
+        if state.edit_submission_matches(9) {
+            state.finish_edit_submission();
+        }
+        assert!(state.edit_submission_matches(10));
+        state.finish_edit_submission();
+        assert!(!state.edit_submission_pending());
     }
 
     #[test]
