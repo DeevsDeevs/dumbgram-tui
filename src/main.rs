@@ -62,6 +62,9 @@ const TELEGRAM_UPDATES_DISCONNECTED_ERROR: &str =
 const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const RECONCILIATION_RETRY_DELAY: Duration = Duration::from_secs(10);
 const RECONCILIATION_FOCUS_STALE_AFTER: Duration = Duration::from_secs(30);
+const OPENER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const OPENER_KILL_TIMEOUT: Duration = Duration::from_millis(500);
+static MUTATION_SUBMISSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const UPDATE_SUBSCRIPTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const LINK_OPENED_STATUS: &str = "Link opened";
 const MESSAGE_TEXT_COPIED_STATUS: &str = "Message text copied";
@@ -1782,6 +1785,7 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
     let reply_message_loader = ReplyMessageLoader::new(client.clone(), senders.reply_message);
     let download_media_loader = DownloadMediaLoader::new(client.clone(), senders.download_media);
     let mut media_preview_loader = MediaPreviewLoader::new(client.clone(), senders.media_preview);
+    let mut open_target_loader = OpenTargetLoader::new(senders.open_target);
     let mut reconciliation_loader =
         ReconciliationLoader::new(client.clone(), senders.reconciliation);
     let mut events = EventStream::new();
@@ -1805,9 +1809,11 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
         &reply_message_loader,
         &download_media_loader,
         &mut media_preview_loader,
+        &mut open_target_loader,
     )
     .await;
 
+    open_target_loader.shutdown().await;
     drop(events);
     diagnostics::event("terminal_event_stream_stopped", "before_restore=true");
     result
@@ -1833,6 +1839,7 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
     reply_message_loader: &ReplyMessageLoader<C>,
     download_media_loader: &DownloadMediaLoader<C>,
     media_preview_loader: &mut MediaPreviewLoader<C>,
+    open_target_loader: &mut OpenTargetLoader,
 ) -> Result<()> {
     let mut frames = FrameScheduler::new(true);
     draw_due_frame(terminal, app, theme, &mut frames)?;
@@ -1889,6 +1896,7 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
                 edit_message_loader,
                 reply_message_loader,
                 download_media_loader,
+                open_target_loader,
             )
             .await?
         {
@@ -1899,7 +1907,7 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
 
         if app.should_quit {
             diagnostics::event("run_loop_quit", "should_quit=true");
-            return Ok(());
+            break;
         }
 
         draw_due_frame(terminal, app, theme, &mut frames)?;
@@ -1930,6 +1938,7 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
             }
         }
     }
+    Ok(())
 }
 
 struct PreparedLoopStep {
@@ -1998,6 +2007,7 @@ async fn dispatch_terminal_event<C: TelegramClient + Clone + Send + Sync + 'stat
     edit_message_loader: &EditMessageLoader<C>,
     reply_message_loader: &ReplyMessageLoader<C>,
     download_media_loader: &DownloadMediaLoader<C>,
+    open_target_loader: &mut OpenTargetLoader,
 ) -> Result<bool> {
     match classify_terminal_event(event) {
         TerminalAction::Key(key) => {
@@ -2017,6 +2027,7 @@ async fn dispatch_terminal_event<C: TelegramClient + Clone + Send + Sync + 'stat
                     edit_message: Some(edit_message_loader),
                     reply_message: Some(reply_message_loader),
                     download_media: Some(download_media_loader),
+                    open_target: Some(open_target_loader),
                 },
             )
             .await?;
@@ -2040,6 +2051,7 @@ async fn dispatch_terminal_event<C: TelegramClient + Clone + Send + Sync + 'stat
                     edit_message: Some(edit_message_loader),
                     reply_message: Some(reply_message_loader),
                     download_media: Some(download_media_loader),
+                    open_target: Some(open_target_loader),
                 },
             )
             .await?;
@@ -2274,6 +2286,7 @@ struct EventLoopSenders {
     reply_message: UiSender<ReplyMessageResult>,
     download_media: UiSender<DownloadMediaResult>,
     media_preview: UiSender<MediaPreviewResult>,
+    open_target: UiSender<OpenTargetResult>,
     reconciliation: UiSender<ReconciliationResult>,
 }
 
@@ -2290,6 +2303,7 @@ struct EventLoopState {
     reply_message_rx: tokio::sync::mpsc::UnboundedReceiver<ReplyMessageResult>,
     download_media_rx: tokio::sync::mpsc::UnboundedReceiver<DownloadMediaResult>,
     media_preview_rx: tokio::sync::mpsc::UnboundedReceiver<MediaPreviewResult>,
+    open_target_rx: tokio::sync::mpsc::UnboundedReceiver<OpenTargetResult>,
     reconciliation_rx: tokio::sync::mpsc::UnboundedReceiver<ReconciliationResult>,
     update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Update>>,
     initial_state_pending: bool,
@@ -2323,6 +2337,7 @@ impl EventLoopState {
         let (reply_message, reply_message_rx) = ui_channel(&wake);
         let (download_media, download_media_rx) = ui_channel(&wake);
         let (media_preview, media_preview_rx) = ui_channel(&wake);
+        let (open_target, open_target_rx) = ui_channel(&wake);
         let (reconciliation, reconciliation_rx) = ui_channel(&wake);
 
         (
@@ -2339,6 +2354,7 @@ impl EventLoopState {
                 reply_message_rx,
                 download_media_rx,
                 media_preview_rx,
+                open_target_rx,
                 reconciliation_rx,
                 update_rx: None,
                 initial_state_pending: true,
@@ -2369,6 +2385,7 @@ impl EventLoopState {
                 reply_message,
                 download_media,
                 media_preview,
+                open_target,
                 reconciliation,
             },
         )
@@ -2608,6 +2625,10 @@ fn drain_ready_results<C: TelegramClient + Clone + Send + Sync + 'static>(
     }
     while let Ok(result) = loop_state.media_preview_rx.try_recv() {
         dirty |= apply_media_preview_result(app, media_preview_loader.latest_request_id(), result);
+    }
+    while let Ok(result) = loop_state.open_target_rx.try_recv() {
+        apply_open_target_result(app, result);
+        dirty = true;
     }
     dirty
 }
@@ -2985,8 +3006,11 @@ struct FolderChatLoadResult {
 }
 
 struct SendMessageResult {
+    submission_id: u64,
     temp_id: i32,
     chat_id: i64,
+    topic_id: Option<i32>,
+    content: String,
     result: std::result::Result<Message, String>,
 }
 
@@ -2996,17 +3020,20 @@ struct DeleteMessageResult {
 }
 
 struct EditMessageResult {
+    submission_id: u64,
     chat_id: i64,
+    topic_id: Option<i32>,
     message_id: i32,
     content: String,
     result: std::result::Result<(), String>,
 }
 
 struct ReplyMessageResult {
-    request_id: u64,
+    submission_id: u64,
     chat_id: i64,
-    thread_top_message_id: Option<i32>,
+    topic_id: Option<i32>,
     message_id: i32,
+    content: String,
     result: std::result::Result<Message, String>,
 }
 
@@ -3023,6 +3050,17 @@ struct MediaPreviewResult {
     result: std::result::Result<Option<PathBuf>, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenTargetKind {
+    Link,
+    File,
+}
+
+struct OpenTargetResult {
+    kind: OpenTargetKind,
+    result: std::result::Result<(), String>,
+}
+
 struct HandlerLoaders<'a, C> {
     chat_message: Option<&'a mut ChatMessageLoader<C>>,
     older_message: Option<&'a mut OlderMessageLoader<C>>,
@@ -3033,6 +3071,7 @@ struct HandlerLoaders<'a, C> {
     edit_message: Option<&'a EditMessageLoader<C>>,
     reply_message: Option<&'a ReplyMessageLoader<C>>,
     download_media: Option<&'a DownloadMediaLoader<C>>,
+    open_target: Option<&'a mut OpenTargetLoader>,
 }
 
 impl<C> HandlerLoaders<'_, C> {
@@ -3047,6 +3086,7 @@ impl<C> HandlerLoaders<'_, C> {
             edit_message: None,
             reply_message: None,
             download_media: None,
+            open_target: None,
         }
     }
 }
@@ -3506,7 +3546,6 @@ struct EditMessageLoader<C> {
 struct ReplyMessageLoader<C> {
     client: C,
     tx: UiSender<ReplyMessageResult>,
-    next_request_id: AtomicU64,
 }
 
 struct DownloadMediaLoader<C> {
@@ -3523,6 +3562,128 @@ struct MediaPreviewLoader<C> {
     current_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+struct PendingOpenTarget {
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+struct OpenTargetCompletionGuard {
+    tx: UiSender<OpenTargetResult>,
+    kind: OpenTargetKind,
+    reported: bool,
+}
+
+impl Drop for OpenTargetCompletionGuard {
+    fn drop(&mut self) {
+        if !self.reported {
+            let _ = self.tx.send(OpenTargetResult {
+                kind: self.kind,
+                result: Err("opener task failed before reporting completion".to_string()),
+            });
+        }
+    }
+}
+
+struct OpenTargetLoader {
+    tx: UiSender<OpenTargetResult>,
+    pending: Vec<PendingOpenTarget>,
+}
+
+impl OpenTargetLoader {
+    fn new(tx: UiSender<OpenTargetResult>) -> Self {
+        Self {
+            tx,
+            pending: Vec::new(),
+        }
+    }
+
+    fn spawn_link(&mut self, url: String) {
+        self.spawn_command(OpenTargetKind::Link, links::opener_command(&url));
+    }
+
+    fn spawn_file(&mut self, path: PathBuf) {
+        self.spawn_command(OpenTargetKind::File, file_opener::opener_command(&path));
+    }
+
+    fn spawn_command(&mut self, kind: OpenTargetKind, command: std::process::Command) {
+        let mut command = tokio::process::Command::from(command);
+        command.kill_on_drop(true);
+        match command.spawn() {
+            Ok(mut child) => {
+                let (cancel, cancelled) = tokio::sync::oneshot::channel();
+                self.track_operation(kind, Some(cancel), async move {
+                    tokio::select! {
+                        status = child.wait() => Some(match status {
+                            Ok(status) if status.success() => Ok(()),
+                            Ok(status) => Err(format!("opener exited with status {status}")),
+                            Err(error) => Err(error.to_string()),
+                        }),
+                        _ = cancelled => {
+                            let _ = tokio::time::timeout(OPENER_KILL_TIMEOUT, child.kill()).await;
+                            None
+                        }
+                    }
+                });
+            }
+            Err(error) => {
+                let _ = self.tx.send(OpenTargetResult {
+                    kind,
+                    result: Err(error.to_string()),
+                });
+            }
+        }
+    }
+
+    fn track_operation<F>(
+        &mut self,
+        kind: OpenTargetKind,
+        cancel: Option<tokio::sync::oneshot::Sender<()>>,
+        operation: F,
+    ) where
+        F: std::future::Future<Output = Option<std::result::Result<(), String>>> + Send + 'static,
+    {
+        self.pending.retain(|pending| !pending.handle.is_finished());
+        let tx = self.tx.clone();
+        let handle = tokio::spawn(async move {
+            let mut guard = OpenTargetCompletionGuard {
+                tx: tx.clone(),
+                kind,
+                reported: false,
+            };
+            if let Some(result) = operation.await {
+                let _ = tx.send(OpenTargetResult { kind, result });
+            }
+            guard.reported = true;
+        });
+        self.pending.push(PendingOpenTarget { cancel, handle });
+    }
+
+    async fn shutdown(&mut self) {
+        for pending in &mut self.pending {
+            if let Some(cancel) = pending.cancel.take() {
+                let _ = cancel.send(());
+            }
+        }
+        let deadline = TokioInstant::now() + OPENER_SHUTDOWN_TIMEOUT;
+        for mut pending in self.pending.drain(..) {
+            let remaining = deadline.saturating_duration_since(TokioInstant::now());
+            if remaining.is_zero()
+                || tokio::time::timeout(remaining, &mut pending.handle)
+                    .await
+                    .is_err()
+            {
+                pending.handle.abort();
+                let _ = pending.handle.await;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+}
+
 impl<C> SendMessageLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
@@ -3534,27 +3695,35 @@ where
         }
     }
 
-    fn spawn_send_message(&self, pending: actions::PendingSend) {
+    fn spawn_send_message(&self, pending: actions::PendingSend) -> u64 {
+        let submission_id = MUTATION_SUBMISSION_COUNTER.fetch_add(1, Ordering::Relaxed);
         let client = self.client.clone();
         let tx = self.tx.clone();
         diagnostics::event(
             "send_message_spawn",
-            format!("temp_id={} chat_id={}", pending.temp_id, pending.chat_id),
+            format!(
+                "submission_id={submission_id} temp_id={} chat_id={}",
+                pending.temp_id, pending.chat_id
+            ),
         );
         tokio::spawn(async move {
             let result = actions::send_message_result(
                 &client,
                 pending.chat_id,
                 pending.thread_top_message_id,
-                pending.content,
+                pending.content.clone(),
             )
             .await;
             let _ = tx.send(SendMessageResult {
+                submission_id,
                 temp_id: pending.temp_id,
                 chat_id: pending.chat_id,
+                topic_id: pending.thread_top_message_id,
+                content: pending.content,
                 result,
             });
         });
+        submission_id
     }
 }
 
@@ -3600,23 +3769,35 @@ where
         }
     }
 
-    fn spawn_edit_message(&self, chat_id: i64, message_id: i32, content: String) {
+    fn spawn_edit_message(
+        &self,
+        chat_id: i64,
+        topic_id: Option<i32>,
+        message_id: i32,
+        content: String,
+    ) -> u64 {
+        let submission_id = MUTATION_SUBMISSION_COUNTER.fetch_add(1, Ordering::Relaxed);
         let client = self.client.clone();
         let tx = self.tx.clone();
         diagnostics::event(
             "edit_message_spawn",
-            format!("chat_id={chat_id} message_id={message_id}"),
+            format!(
+                "submission_id={submission_id} chat_id={chat_id} topic_id={topic_id:?} message_id={message_id}"
+            ),
         );
         tokio::spawn(async move {
             let result =
                 actions::edit_message_result(&client, chat_id, message_id, content.clone()).await;
             let _ = tx.send(EditMessageResult {
+                submission_id,
                 chat_id,
+                topic_id,
                 message_id,
                 content,
                 result,
             });
         });
+        submission_id
     }
 }
 
@@ -3628,7 +3809,6 @@ where
         Self {
             client,
             tx: tx.into(),
-            next_request_id: AtomicU64::new(1),
         }
     }
 
@@ -3639,12 +3819,14 @@ where
         message_id: i32,
         content: String,
     ) -> u64 {
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let submission_id = MUTATION_SUBMISSION_COUNTER.fetch_add(1, Ordering::Relaxed);
         let client = self.client.clone();
         let tx = self.tx.clone();
         diagnostics::event(
             "reply_message_spawn",
-            format!("chat_id={chat_id} topic_id={thread_top_message_id:?} message_id={message_id}"),
+            format!(
+                "submission_id={submission_id} chat_id={chat_id} topic_id={thread_top_message_id:?} message_id={message_id}"
+            ),
         );
         tokio::spawn(async move {
             let result = actions::reply_message_result(
@@ -3652,18 +3834,19 @@ where
                 chat_id,
                 thread_top_message_id,
                 message_id,
-                content,
+                content.clone(),
             )
             .await;
             let _ = tx.send(ReplyMessageResult {
-                request_id,
+                submission_id,
                 chat_id,
-                thread_top_message_id,
+                topic_id: thread_top_message_id,
                 message_id,
+                content,
                 result,
             });
         });
-        request_id
+        submission_id
     }
 }
 
@@ -3966,20 +4149,40 @@ fn apply_initial_state_load_result<C>(
 fn apply_send_message_result(app: &mut App, load: SendMessageResult) {
     diagnostics::event(
         "send_message_result",
-        format!("temp_id={} chat_id={}", load.temp_id, load.chat_id),
+        format!(
+            "submission_id={} temp_id={} chat_id={} topic_id={:?}",
+            load.submission_id, load.temp_id, load.chat_id, load.topic_id
+        ),
     );
-    let pending_topic_id = app
-        .state
-        .messages
-        .iter()
-        .find(|message| message.chat_id == load.chat_id && message.id == load.temp_id)
-        .map(|message| message.thread_topic_id);
-    let selected_topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
-    let pending_matches_scope = pending_topic_id == Some(selected_topic_id);
-    if app.state.selected_chat_id() == Some(load.chat_id) && pending_matches_scope {
-        actions::apply_send_message_result(&mut app.state, load.temp_id, load.result);
-    } else {
-        diagnostics::event("send_message_result_ignored", "reason=stale_context");
+    match load.result {
+        Ok(message) => {
+            let pending_matches_scope = app.state.messages.iter().any(|pending| {
+                pending.chat_id == load.chat_id
+                    && pending.id == load.temp_id
+                    && pending.thread_topic_id == load.topic_id
+            });
+            let selected_topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
+            if app.state.selected_chat_id() == Some(load.chat_id)
+                && selected_topic_id == load.topic_id
+                && pending_matches_scope
+            {
+                actions::apply_send_message_result(&mut app.state, load.temp_id, Ok(message));
+            } else {
+                diagnostics::event("send_message_result_ignored", "reason=stale_context");
+            }
+            app.state.finish_mutation_submission(load.submission_id);
+        }
+        Err(error) => {
+            app.state
+                .mark_send_failed_row(load.chat_id, load.temp_id, &error);
+            app.state.recover_failed_submission(
+                load.submission_id,
+                load.chat_id,
+                load.topic_id,
+                load.content,
+            );
+            app.state.set_error(state::send_failed_error(error));
+        }
     }
 }
 
@@ -3997,46 +4200,85 @@ fn apply_delete_message_result(app: &mut App, load: DeleteMessageResult) {
 fn apply_edit_message_result(app: &mut App, load: EditMessageResult) {
     diagnostics::event(
         "edit_message_result",
-        format!("chat_id={} message_id={}", load.chat_id, load.message_id),
+        format!(
+            "submission_id={} chat_id={} topic_id={:?} message_id={}",
+            load.submission_id, load.chat_id, load.topic_id, load.message_id
+        ),
     );
-    if app.state.selected_chat_id() == Some(load.chat_id)
-        && app.state.editing_message_id == Some(load.message_id)
-        && app
-            .state
-            .messages
-            .iter()
-            .any(|message| message.chat_id == load.chat_id && message.id == load.message_id)
-    {
-        actions::apply_edit_message_result(
-            &mut app.state,
-            load.message_id,
-            load.content,
-            load.result,
-        );
-    } else {
-        diagnostics::event("edit_message_result_ignored", "reason=stale_context");
+    match load.result {
+        Ok(()) => {
+            let selected_topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
+            if app.state.selected_chat_id() == Some(load.chat_id)
+                && selected_topic_id == load.topic_id
+                && app.state.editing_message_id == Some(load.message_id)
+                && app
+                    .state
+                    .messages
+                    .iter()
+                    .any(|message| message.chat_id == load.chat_id && message.id == load.message_id)
+            {
+                actions::apply_edit_message_result(
+                    &mut app.state,
+                    load.message_id,
+                    load.content,
+                    Ok(()),
+                );
+            } else {
+                diagnostics::event("edit_message_result_ignored", "reason=stale_context");
+            }
+            app.state.finish_mutation_submission(load.submission_id);
+        }
+        Err(error) => {
+            app.state.recover_failed_submission(
+                load.submission_id,
+                load.chat_id,
+                load.topic_id,
+                load.content,
+            );
+            app.state.set_error(state::edit_failed_error(error));
+        }
     }
 }
 
 fn apply_reply_message_result(app: &mut App, load: ReplyMessageResult) {
     diagnostics::event(
         "reply_message_result",
-        format!("chat_id={} message_id={}", load.chat_id, load.message_id),
+        format!(
+            "submission_id={} chat_id={} topic_id={:?} message_id={}",
+            load.submission_id, load.chat_id, load.topic_id, load.message_id
+        ),
     );
-    if app.state.selected_chat_id() == Some(load.chat_id)
-        && app.state.reply_submission_matches(load.request_id)
-        && app.state.selected_thread_topic().map(|topic| topic.id) == load.thread_top_message_id
-        && app.state.replying_to_message_id == Some(load.message_id)
-        && app
-            .state
-            .has_message_identity(load.chat_id, load.message_id)
-    {
-        actions::apply_reply_message_result(&mut app.state, load.result);
-    } else {
-        if app.state.reply_submission_matches(load.request_id) {
-            app.state.finish_reply_submission();
+    match load.result {
+        Ok(message) => {
+            if app.state.selected_chat_id() == Some(load.chat_id)
+                && app.state.reply_submission_matches(load.submission_id)
+                && app.state.selected_thread_topic().map(|topic| topic.id) == load.topic_id
+                && app.state.replying_to_message_id == Some(load.message_id)
+                && app
+                    .state
+                    .has_message_identity(load.chat_id, load.message_id)
+            {
+                actions::apply_reply_message_result(&mut app.state, Ok(message));
+            } else {
+                if app.state.reply_submission_matches(load.submission_id) {
+                    app.state.finish_reply_submission();
+                }
+                diagnostics::event("reply_message_result_ignored", "reason=stale_context");
+            }
+            app.state.finish_mutation_submission(load.submission_id);
         }
-        diagnostics::event("reply_message_result_ignored", "reason=stale_context");
+        Err(error) => {
+            if app.state.reply_submission_matches(load.submission_id) {
+                app.state.finish_reply_submission();
+            }
+            app.state.recover_failed_submission(
+                load.submission_id,
+                load.chat_id,
+                load.topic_id,
+                load.content,
+            );
+            app.state.set_error(state::reply_failed_error(error));
+        }
     }
 }
 
@@ -4078,7 +4320,9 @@ fn spawn_gap_submit<C>(
                 content,
             );
             app.state.set_status(SENDING_MESSAGE_STATUS);
-            send_message_loader.spawn_send_message(pending);
+            let submission_id = send_message_loader.spawn_send_message(pending);
+            app.state
+                .register_mutation_submission(submission_id, chat_id, thread_top_message_id);
         }
         state::MessageSubmitAction::Reply {
             chat_id,
@@ -4096,13 +4340,15 @@ fn spawn_gap_submit<C>(
                 return;
             }
             app.state.set_status(SENDING_REPLY_STATUS);
-            let request_id = reply_message_loader.spawn_reply_message(
+            let submission_id = reply_message_loader.spawn_reply_message(
                 chat_id,
                 thread_top_message_id,
                 message_id,
                 content,
             );
-            app.state.begin_reply_submission(request_id);
+            app.state
+                .register_mutation_submission(submission_id, chat_id, thread_top_message_id);
+            app.state.begin_reply_submission(submission_id);
         }
         state::MessageSubmitAction::Edit { .. } => {
             diagnostics::event("gap_submit_ignored", "reason=unexpected_edit");
@@ -4264,6 +4510,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn apply_chat_message_load_result<C>(
     app: &mut App,
     latest_request_id: u64,
@@ -4348,6 +4595,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn apply_folder_chat_load_result<C>(
     app: &mut App,
     latest_request_id: u64,
@@ -4642,16 +4890,16 @@ fn apply_download_media_result(app: &mut App, download: DownloadMediaResult) {
     }
 }
 
-fn open_selected_downloaded_media(app: &mut App) {
-    let Some(path) = app.state.selected_message_download_path() else {
-        app.state.set_status(NO_DOWNLOADED_MEDIA_STATUS);
-        return;
-    };
-
-    diagnostics::event("downloaded_media_open", "target=file_opener");
-    match file_opener::open_path(path) {
-        Ok(()) => app.state.set_status(DOWNLOADED_MEDIA_OPENED_STATUS),
-        Err(error) => {
+fn apply_open_target_result(app: &mut App, opened: OpenTargetResult) {
+    match (opened.kind, opened.result) {
+        (OpenTargetKind::Link, Ok(())) => app.state.set_status(LINK_OPENED_STATUS),
+        (OpenTargetKind::File, Ok(())) => app.state.set_status(DOWNLOADED_MEDIA_OPENED_STATUS),
+        (OpenTargetKind::Link, Err(error)) => {
+            diagnostics::event("link_open_error", "error=true");
+            app.state
+                .set_error(format!("{OPEN_LINK_FAILED_PREFIX}: {error}"));
+        }
+        (OpenTargetKind::File, Err(error)) => {
             diagnostics::event("downloaded_media_open_error", "error=true");
             app.state
                 .set_error(format!("{OPEN_DOWNLOADED_MEDIA_FAILED_PREFIX}: {error}"));
@@ -4659,27 +4907,45 @@ fn open_selected_downloaded_media(app: &mut App) {
     }
 }
 
-fn open_selected_message_link(app: &mut App) {
+fn open_selected_downloaded_media(app: &mut App, loader: Option<&mut OpenTargetLoader>) {
+    let Some(path) = app
+        .state
+        .selected_message_download_path()
+        .map(Path::to_path_buf)
+    else {
+        app.state.set_status(NO_DOWNLOADED_MEDIA_STATUS);
+        return;
+    };
+
+    diagnostics::event("downloaded_media_open", "target=file_opener");
+    if let Some(loader) = loader {
+        loader.spawn_file(path);
+    } else {
+        app.state.set_error(format!(
+            "{OPEN_DOWNLOADED_MEDIA_FAILED_PREFIX}: opener unavailable"
+        ));
+    }
+}
+
+fn open_selected_message_link(app: &mut App, loader: Option<&mut OpenTargetLoader>) {
     if let Some(url) = app
         .state
         .selected_message()
         .and_then(|message| links::first_url(&message.content))
     {
-        open_message_link(app, &url);
+        open_message_link(app, &url, loader);
     } else {
         app.state.set_status(NO_LINK_IN_SELECTED_MESSAGE_STATUS);
     }
 }
 
-fn open_message_link(app: &mut App, url: &str) {
+fn open_message_link(app: &mut App, url: &str, loader: Option<&mut OpenTargetLoader>) {
     diagnostics::event("link_open", "target=browser");
-    match links::open_url(url) {
-        Ok(()) => app.state.set_status(LINK_OPENED_STATUS),
-        Err(error) => {
-            diagnostics::event("link_open_error", format!("error={error}"));
-            app.state
-                .set_error(format!("{OPEN_LINK_FAILED_PREFIX}: {error}"));
-        }
+    if let Some(loader) = loader {
+        loader.spawn_link(url.to_string());
+    } else {
+        app.state
+            .set_error(format!("{OPEN_LINK_FAILED_PREFIX}: opener unavailable"));
     }
 }
 
@@ -4867,7 +5133,7 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
             return Ok(());
         }
         message_keys::MessageKeyOutcome::OpenSelectedLink => {
-            open_selected_message_link(app);
+            open_selected_message_link(app, loaders.open_target.as_deref_mut());
             return Ok(());
         }
         message_keys::MessageKeyOutcome::CopySelectedText => {
@@ -4885,7 +5151,7 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
             return Ok(());
         }
         message_keys::MessageKeyOutcome::OpenDownloadedMedia => {
-            open_selected_downloaded_media(app);
+            open_selected_downloaded_media(app, loaders.open_target.as_deref_mut());
             return Ok(());
         }
         message_keys::MessageKeyOutcome::Ignored => {}
@@ -5234,7 +5500,12 @@ async fn handle_input_focused<C: TelegramClient + Clone + Send + Sync + 'static>
                 );
                 progress.show(app, SENDING_MESSAGE_STATUS)?;
                 if let Some(loader) = send_message_loader {
-                    loader.spawn_send_message(pending);
+                    let submission_id = loader.spawn_send_message(pending);
+                    app.state.register_mutation_submission(
+                        submission_id,
+                        chat_id,
+                        thread_top_message_id,
+                    );
                 } else {
                     actions::finish_send_message(&mut app.state, client, pending).await?;
                 }
@@ -5246,7 +5517,11 @@ async fn handle_input_focused<C: TelegramClient + Clone + Send + Sync + 'static>
             } => {
                 progress.show(app, SAVING_EDIT_STATUS)?;
                 if let Some(loader) = edit_message_loader {
-                    loader.spawn_edit_message(chat_id, message_id, content);
+                    let topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
+                    let submission_id =
+                        loader.spawn_edit_message(chat_id, topic_id, message_id, content);
+                    app.state
+                        .register_mutation_submission(submission_id, chat_id, topic_id);
                 } else {
                     actions::execute_message_submit_action(
                         &mut app.state,
@@ -5271,13 +5546,18 @@ async fn handle_input_focused<C: TelegramClient + Clone + Send + Sync + 'static>
                 }
                 progress.show(app, SENDING_REPLY_STATUS)?;
                 if let Some(loader) = reply_message_loader {
-                    let request_id = loader.spawn_reply_message(
+                    let submission_id = loader.spawn_reply_message(
                         chat_id,
                         thread_top_message_id,
                         message_id,
                         content,
                     );
-                    app.state.begin_reply_submission(request_id);
+                    app.state.register_mutation_submission(
+                        submission_id,
+                        chat_id,
+                        thread_top_message_id,
+                    );
+                    app.state.begin_reply_submission(submission_id);
                 } else {
                     app.state.begin_reply_submission(0);
                     actions::execute_message_submit_action(
@@ -5378,7 +5658,9 @@ async fn execute_context_menu_action<C: TelegramClient + Clone + Send + Sync + '
                 state::ContextMenuAction::CopyMessageText => {
                     copy_selected_message_text(app, progress)?
                 }
-                state::ContextMenuAction::OpenMessageLink => open_selected_message_link(app),
+                state::ContextMenuAction::OpenMessageLink => {
+                    open_selected_message_link(app, loaders.open_target.as_deref_mut())
+                }
                 state::ContextMenuAction::SaveMessageMedia => {
                     download_selected_media_with_optional_async_loader(
                         app,
@@ -5389,7 +5671,7 @@ async fn execute_context_menu_action<C: TelegramClient + Clone + Send + Sync + '
                     .await?;
                 }
                 state::ContextMenuAction::OpenDownloadedMedia => {
-                    open_selected_downloaded_media(app)
+                    open_selected_downloaded_media(app, loaders.open_target.as_deref_mut())
                 }
                 state::ContextMenuAction::DeleteMessage
                 | state::ContextMenuAction::DismissFailedSend => {
@@ -5445,7 +5727,9 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
 
     match mouse_events::handle_mouse_click(&mut app.state, mouse_event) {
         mouse_events::MouseClickOutcome::Handled | mouse_events::MouseClickOutcome::Ignored => {}
-        mouse_events::MouseClickOutcome::OpenLink(url) => open_message_link(app, &url),
+        mouse_events::MouseClickOutcome::OpenLink(url) => {
+            open_message_link(app, &url, loaders.open_target.as_deref_mut())
+        }
         mouse_events::MouseClickOutcome::ContextMenuAction(target, action) => {
             execute_context_menu_action(app, client, progress, &mut loaders, target, action).await?
         }
@@ -5523,16 +5807,17 @@ mod tests {
         LOGIN_REQUESTING_CODE_STATUS, LOGIN_SESSION_SAVED_STATUS, LOGIN_SIGNED_IN_PREFIX,
         LOGIN_SIGNING_IN_STATUS, LOGIN_START_PROMPT, MIN_FRAME_INTERVAL, MarkChatReadLoader,
         MediaPreviewLoader, MediaPreviewResult, OlderMessageLoadResult, OlderMessageLoader,
-        OlderMessageNavigation, PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR,
-        RECONCILIATION_FOCUS_STALE_AFTER, RECONCILIATION_INTERVAL, ReconciliationLoader,
-        ReconciliationResult, ReplyMessageLoader, ReplyMessageResult, RunMode, SAVING_EDIT_STATUS,
-        SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE,
-        SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_OK_PREFIX, SendMessageLoader,
-        SendMessageResult, SubscribeUpdatesLoader, SubscribeUpdatesResult, TerminalAction,
-        TerminalSetupOperations, TokioInstant, UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress,
-        abort_running_task, apply_chat_message_load_result, apply_delete_message_result,
-        apply_edit_message_result, apply_folder_chat_load_result, apply_initial_state_load_result,
-        apply_media_preview_result, apply_older_message_load_result, apply_reconciliation_result,
+        OlderMessageNavigation, OpenTargetKind, OpenTargetLoader, PROMPT_EMPTY_ERROR,
+        PROMPT_EOF_ERROR, RECONCILIATION_FOCUS_STALE_AFTER, RECONCILIATION_INTERVAL,
+        ReconciliationLoader, ReconciliationResult, ReplyMessageLoader, ReplyMessageResult,
+        RunMode, SAVING_EDIT_STATUS, SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS,
+        SETUP_ERROR_EXIT_CODE, SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT,
+        SMOKE_OK_PREFIX, SendMessageLoader, SendMessageResult, SubscribeUpdatesLoader,
+        SubscribeUpdatesResult, TerminalAction, TerminalSetupOperations, TokioInstant,
+        UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress, abort_running_task,
+        apply_chat_message_load_result, apply_delete_message_result, apply_edit_message_result,
+        apply_folder_chat_load_result, apply_initial_state_load_result, apply_media_preview_result,
+        apply_older_message_load_result, apply_open_target_result, apply_reconciliation_result,
         apply_reply_message_result, apply_send_message_result, apply_subscribe_updates_result,
         apply_update_with_read_ack, check_auth_ok_message, check_auth_unauthorized_message,
         check_config_message, check_config_session_status, classify_terminal_event,
@@ -5767,6 +6052,103 @@ mod tests {
         fn disable_raw_mode(&mut self) -> color_eyre::Result<()> {
             self.step("cleanup_raw")
         }
+    }
+
+    #[tokio::test]
+    async fn opener_results_wake_apply_and_report_spawn_nonzero_and_join_failures() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        let mut loader = OpenTargetLoader::new(senders.open_target);
+        let mut app = App::new();
+
+        loader.track_operation(OpenTargetKind::Link, None, async { Some(Ok(())) });
+        tokio::time::timeout(Duration::from_millis(100), loop_state.wake.notified())
+            .await
+            .expect("successful opener should wake the event loop");
+        apply_open_target_result(
+            &mut app,
+            loop_state
+                .open_target_rx
+                .recv()
+                .await
+                .expect("successful opener result should be queued"),
+        );
+        assert_eq!(app.state.status_message.as_deref(), Some("Link opened"));
+
+        loader.track_operation(OpenTargetKind::File, None, async {
+            Some(Err("opener exited with status 9".to_string()))
+        });
+        apply_open_target_result(
+            &mut app,
+            loop_state
+                .open_target_rx
+                .recv()
+                .await
+                .expect("nonzero opener result should be queued"),
+        );
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some("Open downloaded media failed: opener exited with status 9")
+        );
+
+        loader.spawn_command(
+            OpenTargetKind::Link,
+            std::process::Command::new("dumbgram-definitely-missing-opener"),
+        );
+        apply_open_target_result(
+            &mut app,
+            loop_state
+                .open_target_rx
+                .recv()
+                .await
+                .expect("spawn failure should be queued"),
+        );
+        assert!(
+            app.state
+                .error_message
+                .as_deref()
+                .is_some_and(|error| error.starts_with("Open link failed:"))
+        );
+
+        loader.track_operation(OpenTargetKind::Link, None, async {
+            panic!("injected opener task panic");
+            #[allow(unreachable_code)]
+            None
+        });
+        apply_open_target_result(
+            &mut app,
+            loop_state
+                .open_target_rx
+                .recv()
+                .await
+                .expect("join failure guard should queue an error"),
+        );
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some("Open link failed: opener task failed before reporting completion")
+        );
+        loader.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn opener_shutdown_cancels_pending_operation_with_a_bound() {
+        let (_loop_state, senders) = EventLoopState::new();
+        let mut loader = OpenTargetLoader::new(senders.open_target);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&cancelled);
+        let (cancel, cancellation) = tokio::sync::oneshot::channel();
+        loader.track_operation(OpenTargetKind::File, Some(cancel), async move {
+            let _ = cancellation.await;
+            observed.store(true, Ordering::SeqCst);
+            None
+        });
+        assert_eq!(loader.pending_count(), 1);
+
+        tokio::time::timeout(Duration::from_secs(2), loader.shutdown())
+            .await
+            .expect("opener shutdown should remain bounded");
+
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert_eq!(loader.pending_count(), 0);
     }
 
     #[test]
@@ -7672,6 +8054,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_own_message_appends_without_unread_or_read_ack() {
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
+            marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads: marked_threads.clone(),
+        });
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        app.state.chats[0].unread_count = 4;
+        let mut own = message(58);
+        own.chat_id = 1;
+        own.is_own = true;
+
+        apply_update_with_read_ack(&mut app, Update::NewMessage(own), &mark_read_loader);
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            app.state.messages.last().map(|message| message.id),
+            Some(58)
+        );
+        assert_eq!(app.state.chats[0].unread_count, 4);
+        assert!(marked_chat_ids.lock().unwrap().is_empty());
+        assert!(marked_threads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn live_incoming_while_reading_older_stays_unread_without_ack() {
         let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
         let marked_threads = Arc::new(Mutex::new(Vec::new()));
@@ -8897,11 +9306,15 @@ mod tests {
         sent.chat_id = 1;
         sent.content = "hello".to_string();
 
+        app.state.register_mutation_submission(1, 1, None);
         apply_send_message_result(
             &mut app,
             SendMessageResult {
+                submission_id: 1,
                 temp_id: pending.temp_id,
                 chat_id: 1,
+                topic_id: None,
+                content: "hello".to_string(),
                 result: Ok(sent),
             },
         );
@@ -8947,10 +9360,13 @@ mod tests {
         app.state.messages = vec![original];
         app.state.request_edit_selected_message();
 
+        app.state.register_mutation_submission(1, 1, None);
         apply_edit_message_result(
             &mut app,
             EditMessageResult {
+                submission_id: 1,
                 chat_id: 1,
+                topic_id: None,
                 message_id: 7,
                 content: "updated".to_string(),
                 result: Ok(()),
@@ -8967,7 +9383,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let loader = EditMessageLoader::new(MockTelegramClient::new(), tx);
 
-        loader.spawn_edit_message(1, 7, "updated".to_string());
+        loader.spawn_edit_message(1, None, 7, "updated".to_string());
 
         let result = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
@@ -8996,10 +9412,11 @@ mod tests {
         apply_reply_message_result(
             &mut app,
             ReplyMessageResult {
-                request_id: 1,
+                submission_id: 1,
                 chat_id: 1,
-                thread_top_message_id: None,
+                topic_id: None,
                 message_id: 7,
+                content: "reply".to_string(),
                 result: Ok(reply),
             },
         );
@@ -9026,10 +9443,11 @@ mod tests {
         apply_reply_message_result(
             &mut app,
             ReplyMessageResult {
-                request_id: 1,
+                submission_id: 1,
                 chat_id: 1,
-                thread_top_message_id: None,
+                topic_id: None,
                 message_id: 7,
+                content: "reply".to_string(),
                 result: Ok(reply),
             },
         );
@@ -9037,6 +9455,222 @@ mod tests {
         assert!(!app.state.reply_submission_pending());
         assert_eq!(app.state.replying_to_message_id, Some(8));
         assert!(app.state.messages.iter().all(|message| message.id != 11));
+    }
+
+    #[test]
+    fn navigation_away_mutation_failures_recover_in_submission_order_without_yank() {
+        let mut app = App::new();
+        app.state.chats = vec![chat(1), chat(2)];
+        app.state.selected_chat_index = 1;
+        app.state.input_buffer = "new conversation draft".to_string();
+        app.state.register_mutation_submission(1, 1, None);
+        app.state.register_mutation_submission(2, 1, None);
+        app.state.register_mutation_submission(3, 1, None);
+
+        apply_edit_message_result(
+            &mut app,
+            EditMessageResult {
+                submission_id: 3,
+                chat_id: 1,
+                topic_id: None,
+                message_id: 9,
+                content: "third edit".to_string(),
+                result: Err("edit offline".to_string()),
+            },
+        );
+        apply_reply_message_result(
+            &mut app,
+            ReplyMessageResult {
+                submission_id: 2,
+                chat_id: 1,
+                topic_id: None,
+                message_id: 8,
+                content: "second reply".to_string(),
+                result: Err("reply offline".to_string()),
+            },
+        );
+        apply_send_message_result(
+            &mut app,
+            SendMessageResult {
+                submission_id: 1,
+                temp_id: -1,
+                chat_id: 1,
+                topic_id: None,
+                content: "first send".to_string(),
+                result: Err("send offline".to_string()),
+            },
+        );
+
+        assert_eq!(app.state.selected_chat_id(), Some(2));
+        assert_eq!(app.state.input_buffer, "new conversation draft");
+        assert!(app.state.messages.is_empty());
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some("Send failed: send offline")
+        );
+
+        app.state.selected_chat_index = 0;
+        app.state.restore_draft_for_selected_chat();
+        assert_eq!(
+            app.state.input_buffer,
+            "first send\n\nsecond reply\n\nthird edit"
+        );
+    }
+
+    #[test]
+    fn background_mutation_successes_do_not_yank_selected_conversation() {
+        let mut app = App::new();
+        app.state.chats = vec![chat(1), chat(2)];
+        app.state.selected_chat_index = 1;
+        let mut visible = message(20);
+        visible.chat_id = 2;
+        app.state.messages = vec![visible];
+        app.state.input_buffer = "selected draft".to_string();
+        for submission_id in 1..=3 {
+            app.state
+                .register_mutation_submission(submission_id, 1, None);
+        }
+        let mut sent = message(30);
+        sent.chat_id = 1;
+        sent.is_own = true;
+        let reply = sent.clone();
+
+        apply_send_message_result(
+            &mut app,
+            SendMessageResult {
+                submission_id: 1,
+                temp_id: -1,
+                chat_id: 1,
+                topic_id: None,
+                content: "send".to_string(),
+                result: Ok(sent),
+            },
+        );
+        apply_edit_message_result(
+            &mut app,
+            EditMessageResult {
+                submission_id: 2,
+                chat_id: 1,
+                topic_id: None,
+                message_id: 9,
+                content: "edit".to_string(),
+                result: Ok(()),
+            },
+        );
+        apply_reply_message_result(
+            &mut app,
+            ReplyMessageResult {
+                submission_id: 3,
+                chat_id: 1,
+                topic_id: None,
+                message_id: 8,
+                content: "reply".to_string(),
+                result: Ok(reply),
+            },
+        );
+
+        assert_eq!(app.state.selected_chat_id(), Some(2));
+        assert_eq!(app.state.messages.len(), 1);
+        assert_eq!(app.state.messages[0].id, 20);
+        assert_eq!(app.state.input_buffer, "selected draft");
+    }
+
+    #[test]
+    fn sibling_topic_mutation_failures_wait_for_the_exact_origin_scope() {
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        app.state.thread_topics = vec![thread_topic(101, 0), thread_topic(102, 0)];
+        app.state.selected_thread_topic_index = 1;
+        app.state.input_buffer = "sibling topic draft".to_string();
+        for submission_id in 1..=3 {
+            app.state
+                .register_mutation_submission(submission_id, 1, Some(101));
+        }
+
+        apply_edit_message_result(
+            &mut app,
+            EditMessageResult {
+                submission_id: 3,
+                chat_id: 1,
+                topic_id: Some(101),
+                message_id: 9,
+                content: "topic edit".to_string(),
+                result: Err("offline".to_string()),
+            },
+        );
+        apply_reply_message_result(
+            &mut app,
+            ReplyMessageResult {
+                submission_id: 2,
+                chat_id: 1,
+                topic_id: Some(101),
+                message_id: 8,
+                content: "topic reply".to_string(),
+                result: Err("offline".to_string()),
+            },
+        );
+        apply_send_message_result(
+            &mut app,
+            SendMessageResult {
+                submission_id: 1,
+                temp_id: -1,
+                chat_id: 1,
+                topic_id: Some(101),
+                content: "topic send".to_string(),
+                result: Err("offline".to_string()),
+            },
+        );
+
+        assert_eq!(app.state.input_buffer, "sibling topic draft");
+        app.state.selected_thread_topic_index = 0;
+        app.state.restore_draft_for_selected_chat();
+        assert_eq!(
+            app.state.input_buffer,
+            "topic send\n\ntopic reply\n\ntopic edit"
+        );
+    }
+
+    #[test]
+    fn current_scope_failures_preserve_newer_input_and_release_reply_owner() {
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        app.state
+            .apply_send_pending(-10, 1, None, "failed send".to_string());
+        app.state.input_buffer = "newer input".to_string();
+        app.state.register_mutation_submission(10, 1, None);
+
+        apply_send_message_result(
+            &mut app,
+            SendMessageResult {
+                submission_id: 10,
+                temp_id: -10,
+                chat_id: 1,
+                topic_id: None,
+                content: "failed send".to_string(),
+                result: Err("offline".to_string()),
+            },
+        );
+        assert_eq!(app.state.input_buffer, "failed send\n\nnewer input");
+        assert_eq!(app.state.messages[0].status, MessageStatus::Failed);
+
+        app.state.register_mutation_submission(11, 1, None);
+        app.state.begin_reply_submission(11);
+        apply_reply_message_result(
+            &mut app,
+            ReplyMessageResult {
+                submission_id: 11,
+                chat_id: 1,
+                topic_id: None,
+                message_id: 999,
+                content: "failed reply".to_string(),
+                result: Err("offline".to_string()),
+            },
+        );
+        assert!(!app.state.reply_submission_pending());
+        assert_eq!(
+            app.state.input_buffer,
+            "failed send\n\nfailed reply\n\nnewer input"
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,5 @@
 #[cfg(test)]
 use crate::text::display_width;
-use color_eyre::{Result, eyre::eyre};
 use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,31 +59,27 @@ pub(crate) fn link_at_display_column(text: &str, column: usize) -> Option<String
     })
 }
 
-pub(crate) fn open_url(url: &str) -> Result<()> {
-    let status = opener_command(url).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(eyre!("browser command exited with status {status}"))
-    }
-}
-
 #[cfg(target_os = "macos")]
-fn opener_command(url: &str) -> Command {
+pub(crate) fn opener_command(url: &str) -> Command {
     let mut command = Command::new("open");
     command.arg(url);
     command
 }
 
 #[cfg(target_os = "windows")]
-fn opener_command(url: &str) -> Command {
-    let mut command = Command::new("cmd");
-    command.args(["/C", "start", "", url]);
+pub(crate) fn opener_command(url: &str) -> Command {
+    windows_opener_command(url)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) fn windows_opener_command(url: &str) -> Command {
+    let mut command = Command::new("rundll32.exe");
+    command.args(["url.dll,FileProtocolHandler", url]);
     command
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn opener_command(url: &str) -> Command {
+pub(crate) fn opener_command(url: &str) -> Command {
     let mut command = Command::new("xdg-open");
     command.arg(url);
     command
@@ -109,7 +104,7 @@ fn trim_url_end(text: &str, start: usize, mut end: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_url, link_at_display_column, links_in_text};
+    use super::{first_url, link_at_display_column, links_in_text, windows_opener_command};
 
     #[test]
     fn links_in_text_finds_http_and_https_urls() {
@@ -137,5 +132,19 @@ mod tests {
             link_at_display_column(text, 3),
             Some("https://example.org".to_string())
         );
+    }
+
+    #[test]
+    fn windows_opener_is_shell_free_and_preserves_url_as_one_argument() {
+        let target = "http://example.invalid/&calc.exe";
+        let command = windows_opener_command(target);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), "rundll32.exe");
+        assert_eq!(args, ["url.dll,FileProtocolHandler", target]);
+        assert!(!args.iter().any(|arg| matches!(arg.as_str(), "cmd" | "/C")));
     }
 }

@@ -1816,11 +1816,7 @@ impl TelegramClient for GrammersClient {
                                         ),
                                     );
                                     cache_sender_name_from_message(&user_name_cache, &msg);
-                                    if !msg.outgoing() {
-                                        vec![Update::NewMessage(convert_message(msg, None))]
-                                    } else {
-                                        Vec::new()
-                                    }
+                                    vec![Update::NewMessage(convert_message(msg, None))]
                                 }
                                 grammers_client::Update::MessageEdited(msg) => {
                                     cache_sender_name_from_message(&user_name_cache, &msg);

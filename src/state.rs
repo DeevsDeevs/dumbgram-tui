@@ -8,7 +8,7 @@ use crate::text::{display_width, wrap_display_lines_limited};
 use chrono::Utc;
 use ratatui::layout::Rect;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -214,6 +214,54 @@ struct MessageWindowAnchors {
     protected: HashSet<(i64, i32)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ConversationScope {
+    chat_id: i64,
+    topic_id: Option<i32>,
+}
+
+#[derive(Debug, Default)]
+struct FailedSubmissionRecovery {
+    submissions: BTreeMap<u64, String>,
+    base: Option<String>,
+}
+
+impl FailedSubmissionRecovery {
+    fn prefix(&self) -> String {
+        self.submissions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn capture_base(&mut self, current: &str, incoming: Option<&str>) {
+        let prefix = self.prefix();
+        self.base = Some(if prefix.is_empty() {
+            if incoming == Some(current) {
+                String::new()
+            } else {
+                current.to_string()
+            }
+        } else if current == prefix {
+            String::new()
+        } else if let Some(base) = current.strip_prefix(&format!("{prefix}\n\n")) {
+            base.to_string()
+        } else {
+            current.to_string()
+        });
+    }
+
+    fn merged(&self) -> String {
+        let prefix = self.prefix();
+        match self.base.as_deref().filter(|base| !base.is_empty()) {
+            Some(base) if !prefix.is_empty() => format!("{prefix}\n\n{base}"),
+            Some(base) => base.to_string(),
+            None => prefix,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PendingGapSubmit {
     action: MessageSubmitAction,
@@ -375,6 +423,8 @@ pub struct AppState {
     newer_history_generation: u64,
     pending_gap_submit: Option<PendingGapSubmit>,
     reply_submission_request_id: Option<u64>,
+    pending_mutation_scopes: HashMap<u64, ConversationScope>,
+    failed_submission_recovery: HashMap<ConversationScope, FailedSubmissionRecovery>,
     pub split_ratio: f32,
     pub split_drag_active: bool,
     split_drag_origin: Option<u16>,
@@ -430,6 +480,8 @@ impl AppState {
             newer_history_generation: 0,
             pending_gap_submit: None,
             reply_submission_request_id: None,
+            pending_mutation_scopes: HashMap::new(),
+            failed_submission_recovery: HashMap::new(),
             split_ratio: DEFAULT_SPLIT_RATIO,
             split_drag_active: false,
             split_drag_origin: None,
@@ -1375,6 +1427,60 @@ impl AppState {
         self.reply_submission_request_id = None;
     }
 
+    fn selected_conversation_scope(&self) -> Option<ConversationScope> {
+        Some(ConversationScope {
+            chat_id: self.selected_chat_id()?,
+            topic_id: self.selected_thread_topic().map(|topic| topic.id),
+        })
+    }
+
+    pub fn register_mutation_submission(
+        &mut self,
+        submission_id: u64,
+        chat_id: i64,
+        topic_id: Option<i32>,
+    ) {
+        self.pending_mutation_scopes
+            .insert(submission_id, ConversationScope { chat_id, topic_id });
+    }
+
+    pub fn finish_mutation_submission(&mut self, submission_id: u64) {
+        self.pending_mutation_scopes.remove(&submission_id);
+    }
+
+    pub fn recover_failed_submission(
+        &mut self,
+        submission_id: u64,
+        chat_id: i64,
+        topic_id: Option<i32>,
+        content: String,
+    ) {
+        let reported_scope = ConversationScope { chat_id, topic_id };
+        let scope = self
+            .pending_mutation_scopes
+            .get(&submission_id)
+            .copied()
+            .unwrap_or(reported_scope);
+        let selected = self.selected_conversation_scope() == Some(scope);
+        let current_input = selected.then(|| self.input_buffer.clone());
+        let recovery = self.failed_submission_recovery.entry(scope).or_default();
+        if let Some(current_input) = current_input.as_deref() {
+            recovery.capture_base(current_input, Some(&content));
+        }
+        recovery.submissions.entry(submission_id).or_insert(content);
+        if selected {
+            self.input_buffer = recovery.merged();
+            self.set_input_cursor_to_end();
+            self.focused_panel = FocusedPanel::Input;
+        }
+        self.pending_mutation_scopes.remove(&submission_id);
+    }
+
+    #[cfg(test)]
+    fn pending_mutation_submission_count(&self) -> usize {
+        self.pending_mutation_scopes.len()
+    }
+
     pub fn mark_gap_submit_ready(&mut self, request_id: u64, chat_id: i64, topic_id: Option<i32>) {
         if let Some(pending) = self.pending_gap_submit.as_mut()
             && pending.request_id == request_id
@@ -2065,12 +2171,19 @@ impl AppState {
             return;
         }
 
-        if let Some(chat_id) = self.selected_chat_id() {
-            if self.input_buffer.is_empty() {
-                self.chat_drafts.remove(&chat_id);
-            } else {
-                self.chat_drafts.insert(chat_id, self.input_buffer.clone());
-            }
+        let Some(scope) = self.selected_conversation_scope() else {
+            return;
+        };
+        let draft = if let Some(recovery) = self.failed_submission_recovery.get_mut(&scope) {
+            recovery.capture_base(&self.input_buffer, None);
+            recovery.base.clone().unwrap_or_default()
+        } else {
+            self.input_buffer.clone()
+        };
+        if draft.is_empty() {
+            self.chat_drafts.remove(&scope.chat_id);
+        } else {
+            self.chat_drafts.insert(scope.chat_id, draft);
         }
     }
 
@@ -2083,12 +2196,26 @@ impl AppState {
             .selected_chat_id()
             .and_then(|chat_id| self.chat_drafts.get(&chat_id).cloned())
             .unwrap_or_default();
+        if let Some(scope) = self.selected_conversation_scope()
+            && let Some(recovery) = self.failed_submission_recovery.get_mut(&scope)
+        {
+            let matches_recovered_submission = recovery
+                .submissions
+                .values()
+                .any(|content| content == &self.input_buffer);
+            recovery.capture_base(
+                &self.input_buffer,
+                matches_recovered_submission.then_some(self.input_buffer.as_str()),
+            );
+            self.input_buffer = recovery.merged();
+        }
         self.set_input_cursor_to_end();
     }
 
     pub fn discard_draft_for_selected_chat(&mut self) {
-        if let Some(chat_id) = self.selected_chat_id() {
-            self.chat_drafts.remove(&chat_id);
+        if let Some(scope) = self.selected_conversation_scope() {
+            self.chat_drafts.remove(&scope.chat_id);
+            self.failed_submission_recovery.remove(&scope);
         }
     }
 
@@ -2919,26 +3046,30 @@ impl AppState {
         };
 
         let content = self.input_buffer.clone();
-        if let Some(message_id) = self.editing_message_id {
-            Some(MessageSubmitAction::Edit {
+        let topic_id = self.selected_thread_topic().map(|topic| topic.id);
+        let action = if let Some(message_id) = self.editing_message_id {
+            MessageSubmitAction::Edit {
                 chat_id,
                 message_id,
                 content,
-            })
+            }
         } else if let Some(message_id) = self.replying_to_message_id {
-            Some(MessageSubmitAction::Reply {
+            MessageSubmitAction::Reply {
                 chat_id,
-                thread_top_message_id: self.selected_thread_topic().map(|topic| topic.id),
+                thread_top_message_id: topic_id,
                 message_id,
                 content,
-            })
+            }
         } else {
-            Some(MessageSubmitAction::Send {
+            MessageSubmitAction::Send {
                 chat_id,
-                thread_top_message_id: self.selected_thread_topic().map(|topic| topic.id),
+                thread_top_message_id: topic_id,
                 content,
-            })
-        }
+            }
+        };
+        self.failed_submission_recovery
+            .remove(&ConversationScope { chat_id, topic_id });
+        Some(action)
     }
 
     fn refresh_selected_chat_last_message_from_loaded_messages(&mut self) {
@@ -3056,21 +3187,34 @@ impl AppState {
         self.clear_status();
     }
 
-    pub fn apply_send_failure(&mut self, temp_id: i32, error: String) {
-        let failed_content = if let Some(msg) = self.messages.iter_mut().find(|m| m.id == temp_id) {
+    pub fn mark_send_failed_row(&mut self, chat_id: i64, temp_id: i32, error: &str) {
+        if let Some(msg) = self
+            .messages
+            .iter_mut()
+            .find(|message| message.chat_id == chat_id && message.id == temp_id)
+        {
             msg.status = MessageStatus::Failed;
             msg.can_edit = false;
             msg.can_delete = false;
-            msg.error = Some(error.clone());
-            Some(msg.content.clone())
-        } else {
-            None
-        };
+            msg.error = Some(error.to_string());
+        }
+    }
 
-        if let Some(content) = failed_content {
-            self.input_buffer = content;
-            self.set_input_cursor_to_end();
-            self.focused_panel = FocusedPanel::Input;
+    pub fn apply_send_failure(&mut self, temp_id: i32, error: String) {
+        let failed = self
+            .messages
+            .iter()
+            .find(|message| message.id == temp_id)
+            .map(|message| {
+                (
+                    message.chat_id,
+                    message.thread_topic_id,
+                    message.content.clone(),
+                )
+            });
+        if let Some((chat_id, topic_id, content)) = failed {
+            self.mark_send_failed_row(chat_id, temp_id, &error);
+            self.recover_failed_submission(0, chat_id, topic_id, content);
             self.save_current_draft();
         }
         self.set_error(send_failed_error(error));
@@ -3541,6 +3685,28 @@ mod tests {
     }
 
     #[test]
+    fn own_message_across_newer_gap_updates_preview_without_body_or_unread() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(9)];
+        state.chats = vec![chat_with_unread(1, "Chat 1", 4, None)];
+        state.messages = vec![update_message(10, 1, "older", false)];
+        state.newer_history_gap = true;
+        let own = update_message(30, 1, "sent from phone", true);
+
+        let presented = state.apply_update(Update::NewMessage(own));
+
+        assert_eq!(presented, None);
+        assert!(!state.messages.iter().any(|message| message.id == 30));
+        assert_eq!(
+            state.chats[0].last_message.as_deref(),
+            Some("sent from phone")
+        );
+        assert_eq!(state.chats[0].unread_count, 4);
+        assert_eq!(state.folders[0].unread_count, 9);
+        assert!(state.newer_history_gap());
+    }
+
+    #[test]
     fn stale_incoming_message_for_active_chat_does_not_append_or_replace_preview() {
         let mut state = AppState::new();
         state.folders = vec![all_folder(0), folder(2, "Personal", 0)];
@@ -3778,6 +3944,29 @@ mod tests {
         assert_eq!(state.folders[1].unread_count, 99);
         assert!(state.messages.is_empty());
         assert_eq!(state.chats[1].last_message.as_deref(), Some("background"));
+    }
+
+    #[test]
+    fn background_own_message_updates_preview_without_unread_or_selection_yank() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(99)];
+        state.chats = vec![
+            chat_with_unread(1, "Chat 1", 0, None),
+            chat_with_unread(2, "Chat 2", 4, None),
+        ];
+        state.selected_chat_index = 0;
+        let own = update_message(12, 2, "sent from phone", true);
+
+        assert_eq!(state.apply_update(Update::NewMessage(own)), None);
+
+        assert_eq!(state.selected_chat_id(), Some(1));
+        assert!(state.messages.is_empty());
+        assert_eq!(state.chats[1].unread_count, 4);
+        assert_eq!(
+            state.chats[1].last_message.as_deref(),
+            Some("sent from phone")
+        );
+        assert_eq!(state.folders[0].unread_count, 99);
     }
 
     #[test]
@@ -4049,6 +4238,60 @@ mod tests {
         state.discard_draft_for_selected_chat();
         state.restore_draft_for_selected_chat();
         assert_eq!(state.input_buffer, "");
+    }
+
+    #[test]
+    fn failed_submission_recovery_is_scope_exact_and_submission_ordered() {
+        let mut state = AppState::new();
+        state.chats = vec![chat_with_unread(1, "Forum", 0, None)];
+        state.thread_topics = vec![
+            thread_topic(101, "General"),
+            thread_topic(102, "Deployments"),
+        ];
+        state.selected_thread_topic_index = 1;
+        state.input_buffer = "sibling draft".to_string();
+        state.save_current_draft();
+        state.register_mutation_submission(1, 1, Some(101));
+        state.register_mutation_submission(2, 1, Some(101));
+
+        state.recover_failed_submission(2, 1, Some(101), "second failed".to_string());
+        state.recover_failed_submission(1, 1, Some(101), "first failed".to_string());
+
+        assert_eq!(state.input_buffer, "sibling draft");
+        assert_eq!(state.pending_mutation_submission_count(), 0);
+
+        state.selected_thread_topic_index = 0;
+        state.restore_draft_for_selected_chat();
+        assert_eq!(
+            state.input_buffer,
+            "first failed\n\nsecond failed\n\nsibling draft"
+        );
+
+        state.save_current_draft();
+        state.selected_thread_topic_index = 1;
+        state.restore_draft_for_selected_chat();
+        assert_eq!(state.input_buffer, "sibling draft");
+
+        state.selected_thread_topic_index = 0;
+        state.restore_draft_for_selected_chat();
+        assert_eq!(
+            state.input_buffer,
+            "first failed\n\nsecond failed\n\nsibling draft"
+        );
+    }
+
+    #[test]
+    fn current_scope_failure_preserves_newer_input_without_duplication() {
+        let mut state = AppState::new();
+        state.chats = vec![chat_with_unread(1, "Chat", 0, None)];
+        state.input_buffer = "newer text".to_string();
+        state.register_mutation_submission(7, 1, None);
+
+        state.recover_failed_submission(7, 1, None, "failed text".to_string());
+        state.recover_failed_submission(7, 1, None, "failed text".to_string());
+
+        assert_eq!(state.input_buffer, "failed text\n\nnewer text");
+        assert_eq!(state.pending_mutation_submission_count(), 0);
     }
 
     #[test]
@@ -5809,6 +6052,37 @@ mod tests {
         reply_state.apply_reply_success(echoed_reply);
         assert_eq!(
             reply_state
+                .messages
+                .iter()
+                .filter(|message| message.id == 2)
+                .count(),
+            1
+        );
+
+        let mut completion_first_send = state_with_chats();
+        completion_first_send.messages = vec![message(1)];
+        completion_first_send.apply_send_pending(-1, 10, None, "sent".to_string());
+        let mut sent = message(2);
+        sent.is_own = true;
+        completion_first_send.apply_send_success(-1, sent.clone());
+        completion_first_send.apply_update(Update::NewMessage(sent));
+        assert_eq!(
+            completion_first_send
+                .messages
+                .iter()
+                .filter(|message| message.id == 2)
+                .count(),
+            1
+        );
+
+        let mut completion_first_reply = state_with_chats();
+        completion_first_reply.messages = vec![message(1)];
+        let mut reply = message(2);
+        reply.is_own = true;
+        completion_first_reply.apply_reply_success(reply.clone());
+        completion_first_reply.apply_update(Update::NewMessage(reply));
+        assert_eq!(
+            completion_first_reply
                 .messages
                 .iter()
                 .filter(|message| message.id == 2)
