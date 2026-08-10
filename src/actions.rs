@@ -154,32 +154,16 @@ pub async fn confirm_delete<C: TelegramClient>(state: &mut AppState, client: &mu
     Ok(())
 }
 
-pub async fn mark_chat_read_best_effort<C: TelegramClient>(client: &C, chat_id: i64) {
-    diagnostics::event("mark_chat_read_start", format!("chat_id={chat_id}"));
-    let started = Instant::now();
+pub async fn mark_chat_read_result<C: TelegramClient>(
+    client: &C,
+    chat_id: i64,
+) -> std::result::Result<(), String> {
     match tokio::time::timeout(MARK_CHAT_READ_TIMEOUT, client.mark_chat_read(chat_id)).await {
-        Ok(Ok(())) => diagnostics::event(
-            "mark_chat_read_finish",
-            format!(
-                "chat_id={chat_id} elapsed_ms={}",
-                started.elapsed().as_millis()
-            ),
-        ),
-        Ok(Err(error)) => diagnostics::event(
-            "mark_chat_read_error",
-            format!(
-                "chat_id={chat_id} elapsed_ms={} error={error}",
-                started.elapsed().as_millis()
-            ),
-        ),
-        Err(_) => diagnostics::event(
-            "mark_chat_read_timeout",
-            format!(
-                "chat_id={chat_id} elapsed_ms={} timeout_ms={}",
-                started.elapsed().as_millis(),
-                MARK_CHAT_READ_TIMEOUT.as_millis()
-            ),
-        ),
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(_) => Err(format!(
+            "timed out after {} ms",
+            MARK_CHAT_READ_TIMEOUT.as_millis()
+        )),
     }
 }
 
@@ -1535,6 +1519,7 @@ mod tests {
     struct MarkReadClient {
         marked_chat_ids: Mutex<Vec<i64>>,
         bounded_chat_reads: Mutex<Vec<(i64, i32)>>,
+        delay_mark_chat_read: bool,
     }
 
     impl TelegramClient for MarkReadClient {
@@ -1566,6 +1551,9 @@ mod tests {
         }
 
         async fn mark_chat_read(&self, chat_id: i64) -> Result<()> {
+            if self.delay_mark_chat_read {
+                tokio::time::sleep(super::MARK_CHAT_READ_TIMEOUT + Duration::from_millis(5)).await;
+            }
             self.marked_chat_ids
                 .lock()
                 .expect("marked chat ids lock should not be poisoned")
@@ -2876,10 +2864,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_mark_chat_read_result_is_bounded() {
+        let client = MarkReadClient {
+            marked_chat_ids: Mutex::new(Vec::new()),
+            bounded_chat_reads: Mutex::new(Vec::new()),
+            delay_mark_chat_read: true,
+        };
+
+        let error = super::mark_chat_read_result(&client, 42)
+            .await
+            .expect_err("slow manual mark-read should time out");
+
+        assert!(error.starts_with("timed out after "), "{error}");
+        assert!(client.marked_chat_ids.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn fetch_latest_chat_messages_does_not_mark_chat_read_before_apply() {
         let client = MarkReadClient {
             marked_chat_ids: Mutex::new(Vec::new()),
             bounded_chat_reads: Mutex::new(Vec::new()),
+            delay_mark_chat_read: false,
         };
 
         let messages = fetch_latest_chat_messages(&client, 42)
@@ -2910,6 +2915,7 @@ mod tests {
         let mut client = MarkReadClient {
             marked_chat_ids: Mutex::new(Vec::new()),
             bounded_chat_reads: Mutex::new(Vec::new()),
+            delay_mark_chat_read: false,
         };
 
         action_should_succeed(load_selected_chat_messages(&mut state, &mut client).await);

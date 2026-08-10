@@ -27,6 +27,7 @@ pub(crate) const EDIT_FAILED_PREFIX: &str = "Edit failed";
 pub(crate) const REPLY_FAILED_PREFIX: &str = "Reply failed";
 pub(crate) const SEND_FAILED_PREFIX: &str = "Send failed";
 pub(crate) const DELETE_FAILED_PREFIX: &str = "Delete failed";
+pub(crate) const MARK_READ_FAILED_PREFIX: &str = "Mark read failed";
 pub(crate) const CANNOT_EDIT_MESSAGE_ERROR: &str = "Cannot edit this message";
 pub(crate) const CANNOT_REPLY_UNSENT_MESSAGE_ERROR: &str = "Cannot reply to unsent message";
 pub(crate) const CANNOT_DELETE_MESSAGE_ERROR: &str = "Cannot delete this message";
@@ -141,6 +142,10 @@ pub(crate) fn delete_failed_error(error: impl std::fmt::Display) -> String {
     action_failed_error(DELETE_FAILED_PREFIX, error)
 }
 
+pub(crate) fn mark_read_failed_error(error: impl std::fmt::Display) -> String {
+    action_failed_error(MARK_READ_FAILED_PREFIX, error)
+}
+
 fn delete_update_matches_chat(update_chat_id: i64, chat_id: i64) -> bool {
     update_chat_id == UNKNOWN_DELETE_UPDATE_CHAT_ID || update_chat_id == chat_id
 }
@@ -219,6 +224,12 @@ struct MessageWindowAnchors {
 struct ConversationScope {
     chat_id: i64,
     topic_id: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManualMarkReadOwner {
+    request_id: u64,
+    reconcile_after_request_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -440,6 +451,7 @@ pub struct AppState {
     edit_submission_request_id: Option<u64>,
     pending_mutation_scopes: HashMap<u64, ConversationScope>,
     failed_submission_recovery: HashMap<ConversationScope, FailedSubmissionRecovery>,
+    manual_mark_read_owners: HashMap<i64, ManualMarkReadOwner>,
     pub split_ratio: f32,
     pub split_drag_active: bool,
     split_drag_origin: Option<u16>,
@@ -497,6 +509,7 @@ impl AppState {
             edit_submission_request_id: None,
             pending_mutation_scopes: HashMap::new(),
             failed_submission_recovery: HashMap::new(),
+            manual_mark_read_owners: HashMap::new(),
             split_ratio: DEFAULT_SPLIT_RATIO,
             split_drag_active: false,
             split_drag_origin: None,
@@ -566,7 +579,7 @@ impl AppState {
                     return Vec::new();
                 };
                 let mut actions = vec![ContextMenuAction::OpenChat];
-                if chat.unread_count > 0 {
+                if chat.unread_count > 0 && !self.manual_mark_read_pending(chat_id) {
                     actions.push(ContextMenuAction::MarkChatRead);
                 }
                 actions.push(ContextMenuAction::CopyChatName);
@@ -736,12 +749,70 @@ impl AppState {
         true
     }
 
-    pub fn mark_chat_read_locally(&mut self, chat_id: i64) -> bool {
-        let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == chat_id) else {
+    pub fn begin_manual_mark_read(&mut self, chat_id: i64, request_id: u64) -> bool {
+        if self.manual_mark_read_pending(chat_id) {
+            return false;
+        }
+        self.manual_mark_read_owners.insert(
+            chat_id,
+            ManualMarkReadOwner {
+                request_id,
+                reconcile_after_request_id: None,
+            },
+        );
+        true
+    }
+
+    pub fn manual_mark_read_pending(&self, chat_id: i64) -> bool {
+        self.manual_mark_read_owners.contains_key(&chat_id)
+    }
+
+    pub fn accept_manual_mark_read_success(
+        &mut self,
+        chat_id: i64,
+        request_id: u64,
+        reconcile_after_request_id: u64,
+    ) -> bool {
+        let Some(owner) = self.manual_mark_read_owners.get_mut(&chat_id) else {
             return false;
         };
-        chat.unread_count = 0;
+        if owner.request_id != request_id || owner.reconcile_after_request_id.is_some() {
+            return false;
+        }
+        owner.reconcile_after_request_id = Some(reconcile_after_request_id);
         true
+    }
+
+    pub fn finish_manual_mark_read_failure(&mut self, chat_id: i64, request_id: u64) -> bool {
+        let matches = self
+            .manual_mark_read_owners
+            .get(&chat_id)
+            .is_some_and(|owner| {
+                owner.request_id == request_id && owner.reconcile_after_request_id.is_none()
+            });
+        if matches {
+            self.manual_mark_read_owners.remove(&chat_id);
+        }
+        matches
+    }
+
+    pub fn finish_manual_mark_read_snapshot(
+        &mut self,
+        chat_id: i64,
+        reconciliation_request_id: u64,
+    ) -> bool {
+        let matches = self
+            .manual_mark_read_owners
+            .get(&chat_id)
+            .is_some_and(|owner| {
+                owner
+                    .reconcile_after_request_id
+                    .is_some_and(|required| reconciliation_request_id >= required)
+            });
+        if matches {
+            self.manual_mark_read_owners.remove(&chat_id);
+        }
+        matches
     }
 
     pub fn scroll_chats(&mut self, delta: isize) {
@@ -5921,6 +5992,40 @@ mod tests {
         assert!(state.context_menu().is_none());
         assert!(!state.open_context_menu(target, 1, 1));
         assert!(state.delete_confirmation().is_some());
+    }
+
+    #[test]
+    fn manual_mark_read_owners_are_per_chat_phase_and_snapshot_exact() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(9)];
+        state.chats = vec![
+            chat_with_unread(7, "Alice", 3, Some(1)),
+            chat_with_unread(8, "Bob", 2, Some(1)),
+        ];
+        let target = ContextMenuTarget::Chat { chat_id: 7 };
+
+        assert!(state.begin_manual_mark_read(7, 1));
+        assert!(!state.begin_manual_mark_read(7, 2));
+        assert!(state.begin_manual_mark_read(8, 3));
+        assert!(
+            !state
+                .context_actions_for_target(target)
+                .contains(&ContextMenuAction::MarkChatRead)
+        );
+
+        assert!(state.accept_manual_mark_read_success(7, 1, 10));
+        assert!(!state.accept_manual_mark_read_success(7, 1, 11));
+        assert!(!state.finish_manual_mark_read_failure(7, 1));
+        assert!(!state.finish_manual_mark_read_snapshot(7, 9));
+        assert!(state.manual_mark_read_pending(7));
+        assert!(state.finish_manual_mark_read_snapshot(7, 10));
+        assert!(!state.manual_mark_read_pending(7));
+
+        assert!(!state.finish_manual_mark_read_failure(8, 2));
+        assert!(state.finish_manual_mark_read_failure(8, 3));
+        assert!(!state.manual_mark_read_pending(8));
+        assert_eq!(state.chats[0].unread_count, 3);
+        assert_eq!(state.folders[0].unread_count, 9);
     }
 
     #[test]
