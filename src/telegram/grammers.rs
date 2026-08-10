@@ -6,7 +6,10 @@ use grammers_client::{
 };
 use grammers_session::{PackedChat, Session};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -22,6 +25,8 @@ use crate::diagnostics;
 const CHAT_NOT_FOUND_IN_CACHE_PREFIX: &str = "Chat not found in cache";
 const CHAT_CACHE_LOCK_FAILED: &str = "Chat cache lock failed";
 const UPDATE_ERROR_PREFIX: &str = "Update error";
+static MEDIA_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 const TELEGRAM_RECONNECT_POLICY: FixedReconnect = FixedReconnect {
     attempts: 5,
     delay: Duration::from_secs(2),
@@ -64,12 +69,12 @@ pub struct GrammersClient {
     user_name_cache: Arc<Mutex<UserNameCache>>,
     dialog_filter_cache: Arc<Mutex<DialogFilterCache>>,
     outbox_read_max_id_cache: Arc<Mutex<OutboxReadMaxIdCache>>,
-    session_path: String,
+    session_path: PathBuf,
     media_cache_dir: PathBuf,
 }
 
 impl GrammersClient {
-    pub async fn new(api_id: i32, api_hash: String, session_path: &str) -> Result<Self> {
+    pub async fn new(api_id: i32, api_hash: String, session_path: &Path) -> Result<Self> {
         let session = Session::load_file_or_create(session_path)?;
 
         let client = Client::connect(Config {
@@ -86,8 +91,8 @@ impl GrammersClient {
             user_name_cache: Arc::new(Mutex::new(HashMap::new())),
             dialog_filter_cache: Arc::new(Mutex::new(HashMap::new())),
             outbox_read_max_id_cache: Arc::new(Mutex::new(HashMap::new())),
-            session_path: session_path.to_string(),
-            media_cache_dir: media_cache_dir(session_path),
+            session_path: session_path.to_path_buf(),
+            media_cache_dir: media_cache_dir(session_path)?,
         })
     }
 
@@ -501,15 +506,91 @@ fn convert_message(
     }
 }
 
-fn media_cache_dir(session_path: &str) -> PathBuf {
-    let session_stem = Path::new(session_path)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or("session");
-    std::env::temp_dir()
-        .join("dumbgram-tui-media")
-        .join(session_stem)
+fn canonical_session_identity(session_path: &Path) -> io::Result<PathBuf> {
+    if session_path.exists() {
+        return session_path.canonicalize();
+    }
+    let file_name = session_path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "session path has no file name")
+    })?;
+    let parent = session_path.parent().unwrap_or_else(|| Path::new("."));
+    Ok(parent.canonicalize()?.join(file_name))
+}
+
+#[cfg(unix)]
+fn ensure_trusted_cache_parent(parent: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    for ancestor in parent.ancestors() {
+        let metadata = std::fs::metadata(ancestor)?;
+        if !metadata.is_dir() || metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "media cache parent is writable by untrusted users: {}",
+                    ancestor.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_trusted_cache_parent(_parent: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
+fn ensure_private_cache_dir(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "media cache path is not a regular directory",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::create_dir(path)?,
+        Err(error) => return Err(error),
+    }
+    set_private_permissions(path, 0o700)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "media cache path changed during setup",
+        ));
+    }
+    Ok(())
+}
+
+fn media_cache_dir(session_path: &Path) -> io::Result<PathBuf> {
+    let session_identity = canonical_session_identity(session_path)?;
+    let parent = session_identity
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "session path has no parent"))?;
+    ensure_trusted_cache_parent(parent)?;
+    let mut cache_name = session_identity
+        .file_name()
+        .map(OsString::from)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "session path has no file name")
+        })?;
+    cache_name.push(".dumbgram-media-cache");
+    let cache_dir = parent.join(cache_name);
+    ensure_private_cache_dir(&cache_dir)?;
+    Ok(cache_dir)
 }
 
 fn message_media(media: Option<&grammers_client::types::Media>) -> Option<MessageMedia> {
@@ -553,7 +634,82 @@ fn media_thumbnail_cache_path(cache_dir: &Path, chat_id: i64, message_id: i32) -
 
 fn cached_media_thumbnail_path(cache_dir: &Path, chat_id: i64, message_id: i32) -> Option<PathBuf> {
     let path = media_thumbnail_cache_path(cache_dir, chat_id, message_id);
-    path.is_file().then_some(path)
+    std::fs::symlink_metadata(&path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file() && !metadata.file_type().is_symlink())?;
+    set_private_permissions(&path, 0o600).ok()?;
+    Some(path)
+}
+
+fn create_private_download_dir_with(
+    cache_dir: &Path,
+    mut next_id: impl FnMut() -> u64,
+) -> io::Result<PathBuf> {
+    for _ in 0..100 {
+        let candidate = cache_dir.join(format!(".download-{}-{}", std::process::id(), next_id()));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                if let Err(error) = set_private_permissions(&candidate, 0o700) {
+                    let _ = std::fs::remove_dir(&candidate);
+                    return Err(error);
+                }
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a private media download directory",
+    ))
+}
+
+fn create_private_download_dir(cache_dir: &Path) -> io::Result<PathBuf> {
+    create_private_download_dir_with(cache_dir, || {
+        MEDIA_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    })
+}
+
+fn cleanup_private_download(temp_dir: &Path, temp_file: &Path) {
+    if std::fs::remove_file(temp_file).is_err() {
+        let _ = std::fs::remove_dir(temp_file);
+    }
+    let _ = std::fs::remove_dir(temp_dir);
+}
+
+fn complete_private_download(
+    temp_dir: &Path,
+    temp_file: &Path,
+    final_path: &Path,
+    download_result: io::Result<()>,
+) -> io::Result<PathBuf> {
+    let result = download_result.and_then(|()| {
+        publish_downloaded_thumbnail(temp_file, final_path)?;
+        Ok(final_path.to_path_buf())
+    });
+    cleanup_private_download(temp_dir, temp_file);
+    result
+}
+
+fn publish_downloaded_thumbnail(temp_file: &Path, final_path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(temp_file)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "downloaded thumbnail is not a regular file",
+        ));
+    }
+    set_private_permissions(temp_file, 0o600)?;
+    std::fs::rename(temp_file, final_path)?;
+    let published = std::fs::symlink_metadata(final_path)?;
+    if !published.file_type().is_file() || published.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "published thumbnail is not a regular file",
+        ));
+    }
+    Ok(())
 }
 
 async fn download_media_thumbnail(
@@ -571,12 +727,15 @@ async fn download_media_thumbnail(
         return Ok(Some(path));
     }
 
-    std::fs::create_dir_all(cache_dir)?;
+    ensure_private_cache_dir(cache_dir)?;
     let path = media_thumbnail_cache_path(cache_dir, chat_id, message_id);
-    client
-        .download_media(&Downloadable::PhotoSize(thumbnail), &path)
-        .await?;
-    Ok(Some(path))
+    let temp_dir = create_private_download_dir(cache_dir)?;
+    let temp_file = temp_dir.join("thumbnail");
+    let download_result = client
+        .download_media(&Downloadable::PhotoSize(thumbnail), &temp_file)
+        .await
+        .map(|_| ());
+    complete_private_download(&temp_dir, &temp_file, &path, download_result).map(Some)
 }
 
 fn media_download_file_name(
@@ -1743,12 +1902,13 @@ mod tests {
     use super::{
         BoundedChatReadRequest, CHAT_CACHE_LOCK_FAILED, CHAT_NOT_FOUND_IN_CACHE_PREFIX,
         DialogPageParts, UPDATE_ERROR_PREFIX, bounded_chat_read_request,
-        cached_media_thumbnail_path, chat_cache_lock_failed_message,
-        chat_matches_filter_categories, chat_not_found_in_cache_message, delete_message_updates,
-        delete_update_chat_id, dialog_chats_from_page_parts, dumbgram_init_params,
-        folders_from_dialog_filters, input_peers_contain_chat, message_sender_name,
-        message_status_for_read_state, message_thread_topic_id, read_outbox_update_from_raw,
-        thread_topic_from_tl, typing_status_update_from_raw,
+        cached_media_thumbnail_path, canonical_session_identity, chat_cache_lock_failed_message,
+        chat_matches_filter_categories, chat_not_found_in_cache_message, complete_private_download,
+        create_private_download_dir_with, delete_message_updates, delete_update_chat_id,
+        dialog_chats_from_page_parts, dumbgram_init_params, folders_from_dialog_filters,
+        input_peers_contain_chat, media_cache_dir, message_sender_name,
+        message_status_for_read_state, message_thread_topic_id, publish_downloaded_thumbnail,
+        read_outbox_update_from_raw, thread_topic_from_tl, typing_status_update_from_raw,
         typing_status_update_from_raw_with_user_names, update_error_message,
     };
     use crate::telegram::types::{
@@ -1793,27 +1953,260 @@ mod tests {
         assert!(thread_topic_from_tl(tl::types::ForumTopicDeleted { id: 99 }.into()).is_none());
     }
 
-    #[test]
-    fn cached_media_thumbnail_path_requires_existing_file() {
+    fn private_test_dir(label: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("test clock should be after epoch")
             .as_nanos();
-        let cache_dir = std::env::temp_dir().join(format!(
-            "dumbgram-thumbnail-cache-test-{}-{unique}",
-            std::process::id()
-        ));
-        let expected = cache_dir.join("chat-7-message-11-thumb.jpg");
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HOME").expect("test home directory should be available"),
+        )
+        .join(format!(".dumbgram-{label}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("private test directory should be created");
+        super::set_private_permissions(&root, 0o700)
+            .expect("private test directory permissions should be set");
+        root
+    }
 
-        assert_eq!(cached_media_thumbnail_path(&cache_dir, 7, 11), None);
-        std::fs::create_dir_all(&cache_dir).expect("test cache directory should be created");
-        std::fs::write(&expected, b"cached thumbnail").expect("test thumbnail should be written");
+    fn relative_to_current(path: &std::path::Path) -> std::path::PathBuf {
+        let current = std::env::current_dir()
+            .expect("test current directory should be available")
+            .canonicalize()
+            .expect("test current directory should be canonicalized");
+        let target = path
+            .canonicalize()
+            .expect("test target should be canonicalized");
+        let current_components = current.components().collect::<Vec<_>>();
+        let target_components = target.components().collect::<Vec<_>>();
+        let shared = current_components
+            .iter()
+            .zip(&target_components)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let mut relative = std::path::PathBuf::new();
+        for _ in shared..current_components.len() {
+            relative.push("..");
+        }
+        for component in &target_components[shared..] {
+            relative.push(component.as_os_str());
+        }
+        relative
+    }
+
+    #[test]
+    fn media_cache_uses_canonical_session_identity() {
+        let root = private_test_dir("cache-identity");
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        super::set_private_permissions(&first, 0o700).unwrap();
+        super::set_private_permissions(&second, 0o700).unwrap();
+        let first_session = first.join("session.dat");
+        let second_session = second.join("session.dat");
+        std::fs::write(&first_session, b"first").unwrap();
+        std::fs::write(&second_session, b"second").unwrap();
+
+        let first_cache = media_cache_dir(&first_session).unwrap();
+        let second_cache = media_cache_dir(&second_session).unwrap();
+        assert_ne!(first_cache, second_cache);
         assert_eq!(
-            cached_media_thumbnail_path(&cache_dir, 7, 11),
-            Some(expected)
+            canonical_session_identity(&relative_to_current(&first_session)).unwrap(),
+            first_session.canonicalize().unwrap()
         );
 
-        std::fs::remove_dir_all(cache_dir).expect("test cache directory should be removed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let alias = root.join("session-alias.dat");
+            symlink(&first_session, &alias).unwrap();
+            assert_eq!(media_cache_dir(&alias).unwrap(), first_cache);
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn media_cache_preserves_non_utf8_identity_and_rejects_unsafe_or_symlink_roots() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = private_test_dir("cache-safety");
+        let non_utf8 = root.join(std::ffi::OsString::from_vec(vec![b'a', 0xff]));
+        std::fs::create_dir(&non_utf8).unwrap();
+        super::set_private_permissions(&non_utf8, 0o700).unwrap();
+        let session = non_utf8.join(std::ffi::OsString::from_vec(vec![b's', 0xfe]));
+        let distinct_session = non_utf8.join(std::ffi::OsString::from_vec(vec![b's', 0xfd]));
+        std::fs::write(&session, b"session").unwrap();
+        std::fs::write(&distinct_session, b"session").unwrap();
+        let cache = media_cache_dir(&session).unwrap();
+        assert_eq!(cache.parent(), Some(non_utf8.as_path()));
+        assert_ne!(cache, media_cache_dir(&distinct_session).unwrap());
+
+        std::fs::remove_dir(&cache).unwrap();
+        let target = root.join("cache-target");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &cache).unwrap();
+        assert!(media_cache_dir(&session).is_err());
+        std::fs::remove_file(&cache).unwrap();
+        std::fs::write(&cache, b"not a directory").unwrap();
+        assert!(media_cache_dir(&session).is_err());
+        std::fs::remove_file(&cache).unwrap();
+
+        let unsafe_parent = root.join("unsafe");
+        std::fs::create_dir(&unsafe_parent).unwrap();
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(media_cache_dir(&unsafe_parent.join("session.dat")).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_thumbnail_publication_retries_and_rejects_symlinks() {
+        let root = private_test_dir("cache-publish");
+        let session = root.join("session.dat");
+        std::fs::write(&session, b"session").unwrap();
+        let cache = media_cache_dir(&session).unwrap();
+        let first_id = 7;
+        let second_id = 8;
+        std::fs::create_dir(cache.join(format!(".download-{}-{first_id}", std::process::id())))
+            .unwrap();
+        let mut ids = [first_id, second_id].into_iter();
+        let temp_dir = create_private_download_dir_with(&cache, || ids.next().unwrap()).unwrap();
+        assert!(temp_dir.ends_with(format!(".download-{}-{second_id}", std::process::id())));
+        let temp_file = temp_dir.join("thumbnail");
+        std::fs::write(&temp_file, b"private thumbnail").unwrap();
+        let final_path = cache.join("chat-7-message-11-thumb.jpg");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(root.join("unrelated"), &final_path).unwrap();
+        }
+
+        publish_downloaded_thumbnail(&temp_file, &final_path).unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"private thumbnail");
+        assert_eq!(
+            cached_media_thumbnail_path(&cache, 7, 11),
+            Some(final_path.clone())
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+            std::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                cached_media_thumbnail_path(&cache, 7, 11),
+                Some(final_path.clone())
+            );
+            assert_eq!(std::fs::metadata(&cache).unwrap().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::metadata(&temp_dir).unwrap().mode() & 0o777, 0o700);
+            assert_eq!(
+                std::fs::metadata(&final_path).unwrap().mode() & 0o777,
+                0o600
+            );
+            let symlink_entry = cache.join("chat-7-message-12-thumb.jpg");
+            symlink(&final_path, &symlink_entry).unwrap();
+            assert_eq!(cached_media_thumbnail_path(&cache, 7, 12), None);
+        }
+
+        super::cleanup_private_download(&temp_dir, &temp_file);
+        assert!(!temp_dir.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_thumbnail_failures_and_concurrent_publication_leave_no_temporary_artifacts() {
+        let root = private_test_dir("cache-cleanup");
+        let session = root.join("session.dat");
+        std::fs::write(&session, b"session").unwrap();
+        let cache = media_cache_dir(&session).unwrap();
+
+        for (id, error_kind) in [
+            (20, std::io::ErrorKind::ConnectionAborted),
+            (21, std::io::ErrorKind::PermissionDenied),
+        ] {
+            let temp_dir = create_private_download_dir_with(&cache, || id).unwrap();
+            let temp_file = temp_dir.join("thumbnail");
+            std::fs::write(&temp_file, b"incomplete").unwrap();
+            let final_path = cache.join(format!("failure-{id}"));
+            let result = complete_private_download(
+                &temp_dir,
+                &temp_file,
+                &final_path,
+                Err(std::io::Error::new(error_kind, "injected failure")),
+            );
+            assert_eq!(result.unwrap_err().kind(), error_kind);
+            assert!(!temp_dir.exists());
+            assert!(!temp_file.exists());
+        }
+
+        let validation_dir = create_private_download_dir_with(&cache, || 22).unwrap();
+        let validation_file = validation_dir.join("thumbnail");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("missing"), &validation_file).unwrap();
+        #[cfg(not(unix))]
+        std::fs::create_dir(&validation_file).unwrap();
+        assert!(
+            complete_private_download(
+                &validation_dir,
+                &validation_file,
+                &cache.join("validation-failure"),
+                Ok(())
+            )
+            .is_err()
+        );
+        assert!(!validation_dir.exists());
+
+        let rename_dir = create_private_download_dir_with(&cache, || 23).unwrap();
+        let rename_file = rename_dir.join("thumbnail");
+        std::fs::write(&rename_file, b"rename").unwrap();
+        let rename_target = cache.join("rename-failure");
+        std::fs::create_dir(&rename_target).unwrap();
+        assert!(
+            complete_private_download(&rename_dir, &rename_file, &rename_target, Ok(())).is_err()
+        );
+        assert!(!rename_dir.exists());
+
+        let final_path = cache.join("concurrent");
+        let publications = [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .enumerate()
+            .map(|(offset, content)| {
+                let temp_dir =
+                    create_private_download_dir_with(&cache, || 30 + offset as u64).unwrap();
+                let temp_file = temp_dir.join("thumbnail");
+                std::fs::write(&temp_file, content).unwrap();
+                (temp_dir, temp_file)
+            })
+            .collect::<Vec<_>>();
+        let threads = publications
+            .into_iter()
+            .map(|(temp_dir, temp_file)| {
+                let final_path = final_path.clone();
+                std::thread::spawn(move || {
+                    complete_private_download(&temp_dir, &temp_file, &final_path, Ok(()))
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("publication thread should not panic"))
+            .collect::<Vec<_>>();
+        assert!(results.iter().any(Result::is_ok));
+        let metadata = std::fs::symlink_metadata(&final_path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert!(std::fs::read_dir(&cache).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".download-")
+        }));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

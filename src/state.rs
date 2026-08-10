@@ -673,7 +673,6 @@ impl AppState {
             return false;
         };
         chat.unread_count = 0;
-        self.sync_folder_unread_counts_from_loaded_chats();
         true
     }
 
@@ -1288,7 +1287,6 @@ impl AppState {
         if selected_topic_id.is_none() {
             self.refresh_selected_chat_last_message_from_loaded_messages();
         }
-        self.sync_folder_unread_counts_from_loaded_chats();
         self.revalidate_reconciled_targets();
         self.restore_draft_for_selected_chat();
         if let Some((input_buffer, input_cursor, input_scroll_offset)) = current_input {
@@ -2266,24 +2264,11 @@ impl AppState {
         if cleared == 0 {
             return;
         }
-        let chat_folder_id = selected_chat.folder_id;
         selected_chat.unread_count = if selected_topic_id.is_some() {
             selected_chat.unread_count.saturating_sub(cleared)
         } else {
             0
         };
-        let selected_folder_id = self
-            .folders
-            .get(self.selected_folder_index)
-            .map(|folder| folder.id);
-        for folder in &mut self.folders {
-            if is_all_folder(folder)
-                || selected_folder_id == Some(folder.id)
-                || chat_folder_id == Some(folder.id)
-            {
-                folder.unread_count = folder.unread_count.saturating_sub(cleared);
-            }
-        }
     }
 
     fn revalidate_reconciled_targets(&mut self) {
@@ -2312,33 +2297,6 @@ impl AppState {
             && self.context_actions_for_target(target).is_empty()
         {
             self.modal = None;
-        }
-    }
-
-    pub fn sync_folder_unread_counts_from_loaded_chats(&mut self) {
-        let selected_folder = self
-            .folders
-            .get(self.selected_folder_index)
-            .map(|folder| (folder.id, is_all_folder(folder)));
-        let Some((selected_folder_id, is_all_selected)) = selected_folder else {
-            return;
-        };
-
-        for folder in &mut self.folders {
-            let should_update = is_all_selected || folder.id == selected_folder_id;
-            if !should_update {
-                continue;
-            }
-
-            folder.unread_count = if is_all_folder(folder) {
-                self.chats.iter().map(|chat| chat.unread_count).sum()
-            } else {
-                self.chats
-                    .iter()
-                    .filter(|chat| chat.folder_id == Some(folder.id))
-                    .map(|chat| chat.unread_count)
-                    .sum()
-            };
         }
     }
 
@@ -2424,7 +2382,6 @@ impl AppState {
                     } else if !msg.is_own {
                         chat.unread_count += 1;
                     }
-                    self.sync_folder_unread_counts_from_loaded_chats();
                 }
             }
             Update::EditMessage {
@@ -3096,7 +3053,6 @@ impl AppState {
             }
         }
         self.refresh_selected_chat_last_message_from_loaded_messages();
-        self.sync_folder_unread_counts_from_loaded_chats();
         self.clear_status();
     }
 
@@ -3536,8 +3492,8 @@ mod tests {
             })
         );
         assert_eq!(state.chats[0].unread_count, 0);
-        assert_eq!(state.folders[0].unread_count, 0);
-        assert_eq!(state.folders[1].unread_count, 0);
+        assert_eq!(state.folders[0].unread_count, 99);
+        assert_eq!(state.folders[1].unread_count, 99);
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].content, "open chat");
         assert_eq!(state.chats[0].last_message.as_deref(), Some("open chat"));
@@ -3747,7 +3703,7 @@ mod tests {
         state.apply_loaded_selected_chat_messages(vec![topic_message]);
 
         assert_eq!(state.chats[0].unread_count, 3);
-        assert_eq!(state.folders[0].unread_count, 3);
+        assert_eq!(state.folders[0].unread_count, 7);
         assert_eq!(
             state.chats[0].last_message.as_deref(),
             Some("server-wide preview")
@@ -3818,8 +3774,8 @@ mod tests {
 
         assert_eq!(state.chats[0].unread_count, 0);
         assert_eq!(state.chats[1].unread_count, 5);
-        assert_eq!(state.folders[0].unread_count, 5);
-        assert_eq!(state.folders[1].unread_count, 5);
+        assert_eq!(state.folders[0].unread_count, 99);
+        assert_eq!(state.folders[1].unread_count, 99);
         assert!(state.messages.is_empty());
         assert_eq!(state.chats[1].last_message.as_deref(), Some("background"));
     }
@@ -4633,7 +4589,7 @@ mod tests {
         assert_eq!(state.messages[0].status, MessageStatus::Sent);
         assert_eq!(state.chats[0].last_message.as_deref(), Some("plain send"));
         assert_eq!(state.chats[0].unread_count, 0);
-        assert_eq!(state.folders[0].unread_count, 0);
+        assert_eq!(state.folders[0].unread_count, 2);
         assert!(state.status_message.is_none());
     }
 
@@ -4656,7 +4612,7 @@ mod tests {
         state.apply_send_success(-1, sent_message);
 
         assert_eq!(state.chats[0].unread_count, 3);
-        assert_eq!(state.folders[0].unread_count, 3);
+        assert_eq!(state.folders[0].unread_count, 5);
         assert_eq!(state.thread_topics[0].unread_count, 0);
         assert_eq!(state.thread_topics[1].unread_count, 3);
     }
@@ -4941,22 +4897,6 @@ mod tests {
     }
 
     #[test]
-    fn sync_folder_unread_counts_does_not_update_all_for_telegram_folder_one() {
-        let mut state = AppState::new();
-        state.folders = vec![all_folder(99), folder(1, "Archived", 99)];
-        state.selected_folder_index = 1;
-        state.chats = vec![
-            chat_with_unread(10, "Archived A", 1, Some(1)),
-            chat_with_unread(20, "Archived B", 2, Some(1)),
-        ];
-
-        state.sync_folder_unread_counts_from_loaded_chats();
-
-        assert_eq!(state.folders[0].unread_count, 99);
-        assert_eq!(state.folders[1].unread_count, 3);
-    }
-
-    #[test]
     fn apply_loaded_selected_chat_messages_selects_latest_unread_and_restores_draft() {
         let mut state = AppState::new();
         state.folders = vec![all_folder(99), folder(2, "Personal", 99)];
@@ -4977,8 +4917,8 @@ mod tests {
         assert_eq!(state.message_scroll_offset, 1);
         assert_eq!(state.chats[0].unread_count, 0);
         assert_eq!(state.chats[0].last_message.as_deref(), Some("loaded"));
-        assert_eq!(state.folders[0].unread_count, 0);
-        assert_eq!(state.folders[1].unread_count, 0);
+        assert_eq!(state.folders[0].unread_count, 99);
+        assert_eq!(state.folders[1].unread_count, 99);
         assert_eq!(state.input_buffer, "saved draft");
     }
 
@@ -5071,39 +5011,6 @@ mod tests {
         assert_eq!(state.selected_message_index, 0);
         assert_eq!(state.message_scroll_offset, 0);
         assert_eq!(state.input_buffer, "");
-    }
-
-    #[test]
-    fn sync_folder_unread_counts_updates_all_loaded_folders_when_all_selected() {
-        let mut state = AppState::new();
-        state.folders = vec![all_folder(99), folder(2, "Personal", 99)];
-        state.selected_folder_index = 0;
-        state.chats = vec![
-            chat_with_unread(10, "Alice", 2, Some(2)),
-            chat_with_unread(20, "Bob", 3, Some(2)),
-            chat_with_unread(30, "Loose", 4, None),
-        ];
-
-        state.sync_folder_unread_counts_from_loaded_chats();
-
-        assert_eq!(state.folders[0].unread_count, 9);
-        assert_eq!(state.folders[1].unread_count, 5);
-    }
-
-    #[test]
-    fn sync_folder_unread_counts_only_updates_selected_folder_for_filtered_view() {
-        let mut state = AppState::new();
-        state.folders = vec![all_folder(99), folder(2, "Personal", 99)];
-        state.selected_folder_index = 1;
-        state.chats = vec![
-            chat_with_unread(10, "Alice", 1, Some(2)),
-            chat_with_unread(20, "Bob", 2, Some(2)),
-        ];
-
-        state.sync_folder_unread_counts_from_loaded_chats();
-
-        assert_eq!(state.folders[0].unread_count, 99);
-        assert_eq!(state.folders[1].unread_count, 3);
     }
 
     #[test]

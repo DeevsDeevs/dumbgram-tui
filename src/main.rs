@@ -351,13 +351,12 @@ fn ensure_session_parent_dir(session_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load_checked_config_with_session_parent(config_path: &str) -> Result<(config::Config, String)> {
+fn load_checked_config_with_session_parent(config_path: &str) -> Result<(config::Config, PathBuf)> {
     let config = load_checked_config(config_path)?;
     let session_path = config
         .telegram
         .session_path_for_config(Path::new(config_path));
     ensure_session_parent_dir(&session_path)?;
-    let session_path = session_path.to_string_lossy().into_owned();
 
     Ok((config, session_path))
 }
@@ -394,8 +393,8 @@ fn check_config(config_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_auth_ok_message(session_path: &str) -> String {
-    format!("{CHECK_AUTH_OK_PREFIX} ({session_path})")
+fn check_auth_ok_message(session_path: &Path) -> String {
+    format!("{CHECK_AUTH_OK_PREFIX} ({})", session_path.display())
 }
 
 fn check_auth_unauthorized_message(config_path: &str) -> String {
@@ -404,7 +403,11 @@ fn check_auth_unauthorized_message(config_path: &str) -> String {
     )
 }
 
-async fn check_auth(config_path: &str, config: config::Config, session_path: String) -> Result<()> {
+async fn check_auth(
+    config_path: &str,
+    config: config::Config,
+    session_path: PathBuf,
+) -> Result<()> {
     let client = GrammersClient::new(
         config.telegram.api_id,
         config.telegram.api_hash.clone(),
@@ -424,13 +427,13 @@ async fn check_auth(config_path: &str, config: config::Config, session_path: Str
 
 async fn run_real_telegram(
     config: config::Config,
-    session_path: String,
+    session_path: PathBuf,
     theme: &config::Theme,
     preferences_path: Option<PathBuf>,
 ) -> Result<()> {
     diagnostics::event(
         "real_client_create_start",
-        format!("session_path={session_path}"),
+        format!("session_path={}", session_path.display()),
     );
     let started = Instant::now();
     let mut client = GrammersClient::new(
@@ -873,9 +876,9 @@ async fn run_interaction_smoke<C: TelegramClient + Clone + Send + Sync + 'static
             "initial selected chat still showed unread messages after loading"
         ));
     }
-    if app.state.folders[app.state.selected_folder_index].unread_count != 2 {
+    if app.state.folders[app.state.selected_folder_index].unread_count != 5 {
         return Err(color_eyre::eyre::eyre!(
-            "initial selected folder unread count did not reconcile loaded chats"
+            "initial selected folder did not preserve its Telegram snapshot unread count"
         ));
     }
 
@@ -1623,12 +1626,79 @@ fn wait_for_enter_to_start() -> Result<()> {
     read_prompt_line_raw(LOGIN_START_PROMPT).map(|_| ())
 }
 
+trait TerminalSetupOperations {
+    type Terminal;
+
+    fn enable_raw_mode(&mut self) -> Result<()>;
+    fn enter_alternate_screen(&mut self) -> Result<()>;
+    fn enable_mouse_capture(&mut self) -> Result<()>;
+    fn build_terminal(&mut self) -> Result<Self::Terminal>;
+    fn disable_mouse_capture(&mut self) -> Result<()>;
+    fn leave_alternate_screen(&mut self) -> Result<()>;
+    fn disable_raw_mode(&mut self) -> Result<()>;
+}
+
+fn rollback_terminal_setup(operations: &mut impl TerminalSetupOperations) {
+    let _ = operations.disable_mouse_capture();
+    let _ = operations.leave_alternate_screen();
+    let _ = operations.disable_raw_mode();
+}
+
+fn setup_terminal_with<O: TerminalSetupOperations>(operations: &mut O) -> Result<O::Terminal> {
+    operations.enable_raw_mode()?;
+    if let Err(error) = operations.enter_alternate_screen() {
+        rollback_terminal_setup(operations);
+        return Err(error);
+    }
+    if let Err(error) = operations.enable_mouse_capture() {
+        rollback_terminal_setup(operations);
+        return Err(error);
+    }
+    match operations.build_terminal() {
+        Ok(terminal) => Ok(terminal),
+        Err(error) => {
+            rollback_terminal_setup(operations);
+            Err(error)
+        }
+    }
+}
+
+struct CrosstermTerminalSetup;
+
+impl TerminalSetupOperations for CrosstermTerminalSetup {
+    type Terminal = Terminal<CrosstermBackend<io::Stdout>>;
+
+    fn enable_raw_mode(&mut self) -> Result<()> {
+        enable_raw_mode().map_err(Into::into)
+    }
+
+    fn enter_alternate_screen(&mut self) -> Result<()> {
+        execute!(io::stdout(), EnterAlternateScreen).map_err(Into::into)
+    }
+
+    fn enable_mouse_capture(&mut self) -> Result<()> {
+        execute!(io::stdout(), EnableMouseCapture).map_err(Into::into)
+    }
+
+    fn build_terminal(&mut self) -> Result<Self::Terminal> {
+        Terminal::new(CrosstermBackend::new(io::stdout())).map_err(Into::into)
+    }
+
+    fn disable_mouse_capture(&mut self) -> Result<()> {
+        execute!(io::stdout(), DisableMouseCapture).map_err(Into::into)
+    }
+
+    fn leave_alternate_screen(&mut self) -> Result<()> {
+        execute!(io::stdout(), LeaveAlternateScreen).map_err(Into::into)
+    }
+
+    fn disable_raw_mode(&mut self) -> Result<()> {
+        disable_raw_mode().map_err(Into::into)
+    }
+}
+
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    Ok(Terminal::new(backend)?)
+    setup_terminal_with(&mut CrosstermTerminalSetup)
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
@@ -5459,15 +5529,15 @@ mod tests {
         SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE,
         SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_OK_PREFIX, SendMessageLoader,
         SendMessageResult, SubscribeUpdatesLoader, SubscribeUpdatesResult, TerminalAction,
-        TokioInstant, UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress, abort_running_task,
-        apply_chat_message_load_result, apply_delete_message_result, apply_edit_message_result,
-        apply_folder_chat_load_result, apply_initial_state_load_result, apply_media_preview_result,
-        apply_older_message_load_result, apply_reconciliation_result, apply_reply_message_result,
-        apply_send_message_result, apply_subscribe_updates_result, apply_update_with_read_ack,
-        check_auth_ok_message, check_auth_unauthorized_message, check_config_message,
-        check_config_session_status, classify_terminal_event, default_config_path_string,
-        discard_deferred_conversation_updates_represented_by_snapshot, drain_ready_results,
-        ensure_session_parent_dir, handle_input_focused, handle_key_event,
+        TerminalSetupOperations, TokioInstant, UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress,
+        abort_running_task, apply_chat_message_load_result, apply_delete_message_result,
+        apply_edit_message_result, apply_folder_chat_load_result, apply_initial_state_load_result,
+        apply_media_preview_result, apply_older_message_load_result, apply_reconciliation_result,
+        apply_reply_message_result, apply_send_message_result, apply_subscribe_updates_result,
+        apply_update_with_read_ack, check_auth_ok_message, check_auth_unauthorized_message,
+        check_config_message, check_config_session_status, classify_terminal_event,
+        default_config_path_string, discard_deferred_conversation_updates_represented_by_snapshot,
+        drain_ready_results, ensure_session_parent_dir, handle_input_focused, handle_key_event,
         handle_key_event_with_progress, handle_mouse_event, handle_received_update,
         handle_received_update_with_conversation_load, load_checked_config,
         load_checked_config_with_session_parent, loaded_read_ack, login_2fa_hint_message,
@@ -5477,7 +5547,8 @@ mod tests {
         parse_args_from, prepare_loop_step, preserve_prompt_input_line_spaces,
         release_gap_submit_if_ready, replay_deferred_conversation_updates, require_prompt_line,
         require_prompt_response, save_app_preferences, save_app_preferences_if_changed,
-        sleep_until_optional, smoke_ok_message, trim_prompt_input_line, validate_config,
+        setup_terminal_with, sleep_until_optional, smoke_ok_message, trim_prompt_input_line,
+        validate_config,
     };
     use crate::app::App;
     use crate::config::telegram::{Config, TelegramConfig};
@@ -5648,6 +5719,111 @@ mod tests {
             })),
             TerminalAction::Mouse(_)
         ));
+    }
+
+    struct FakeTerminalSetup {
+        fail_at: Option<&'static str>,
+        fail_cleanup: bool,
+        events: Vec<&'static str>,
+    }
+
+    impl FakeTerminalSetup {
+        fn step(&mut self, name: &'static str) -> color_eyre::Result<()> {
+            self.events.push(name);
+            if self.fail_at == Some(name) || (self.fail_cleanup && name.starts_with("cleanup_")) {
+                color_eyre::eyre::bail!(name)
+            }
+            Ok(())
+        }
+    }
+
+    impl TerminalSetupOperations for FakeTerminalSetup {
+        type Terminal = ();
+
+        fn enable_raw_mode(&mut self) -> color_eyre::Result<()> {
+            self.step("raw")
+        }
+
+        fn enter_alternate_screen(&mut self) -> color_eyre::Result<()> {
+            self.step("alternate")
+        }
+
+        fn enable_mouse_capture(&mut self) -> color_eyre::Result<()> {
+            self.step("mouse")
+        }
+
+        fn build_terminal(&mut self) -> color_eyre::Result<Self::Terminal> {
+            self.step("terminal")
+        }
+
+        fn disable_mouse_capture(&mut self) -> color_eyre::Result<()> {
+            self.step("cleanup_mouse")
+        }
+
+        fn leave_alternate_screen(&mut self) -> color_eyre::Result<()> {
+            self.step("cleanup_alternate")
+        }
+
+        fn disable_raw_mode(&mut self) -> color_eyre::Result<()> {
+            self.step("cleanup_raw")
+        }
+    }
+
+    #[test]
+    fn terminal_setup_rolls_back_each_completed_stage_and_preserves_original_error() {
+        for (failure, expected) in [
+            ("raw", vec!["raw"]),
+            (
+                "alternate",
+                vec![
+                    "raw",
+                    "alternate",
+                    "cleanup_mouse",
+                    "cleanup_alternate",
+                    "cleanup_raw",
+                ],
+            ),
+            (
+                "mouse",
+                vec![
+                    "raw",
+                    "alternate",
+                    "mouse",
+                    "cleanup_mouse",
+                    "cleanup_alternate",
+                    "cleanup_raw",
+                ],
+            ),
+            (
+                "terminal",
+                vec![
+                    "raw",
+                    "alternate",
+                    "mouse",
+                    "terminal",
+                    "cleanup_mouse",
+                    "cleanup_alternate",
+                    "cleanup_raw",
+                ],
+            ),
+        ] {
+            let mut setup = FakeTerminalSetup {
+                fail_at: Some(failure),
+                fail_cleanup: true,
+                events: Vec::new(),
+            };
+            let error = setup_terminal_with(&mut setup).expect_err("setup stage should fail");
+            assert_eq!(error.to_string(), failure);
+            assert_eq!(setup.events, expected);
+        }
+
+        let mut setup = FakeTerminalSetup {
+            fail_at: None,
+            fail_cleanup: false,
+            events: Vec::new(),
+        };
+        setup_terminal_with(&mut setup).expect("setup should succeed");
+        assert_eq!(setup.events, ["raw", "alternate", "mouse", "terminal"]);
     }
 
     #[test]
@@ -9273,7 +9449,7 @@ mod tests {
     #[test]
     fn check_auth_messages_use_shared_command_and_prefix() {
         assert_eq!(
-            check_auth_ok_message("session.dat"),
+            check_auth_ok_message(Path::new("session.dat")),
             format!("{CHECK_AUTH_OK_PREFIX} (session.dat)")
         );
         assert_eq!(
@@ -9480,7 +9656,7 @@ mod tests {
             load_checked_config_with_session_parent(test_path_str(&config_path)),
         );
 
-        assert_eq!(loaded_session_path, session_path.to_string_lossy().as_ref());
+        assert_eq!(loaded_session_path, session_path);
         assert!(missing_parent.is_dir());
         std::fs::remove_file(config_path).ok();
         std::fs::remove_dir_all(missing_parent).ok();
