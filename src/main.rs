@@ -1259,12 +1259,18 @@ async fn run_interaction_smoke<C: TelegramClient + Clone + Send + Sync + 'static
         ));
     }
     handle_key_event(app, smoke_key(KeyCode::Right), client).await?;
-    if app.state.selected_thread_topic_index != 1 {
+    if app.state.selected_thread_topic_index != 0 {
         return Err(color_eyre::eyre::eyre!(
-            "Right in messages did not open the next mock topic"
+            "Right in messages changed the selected mock topic"
         ));
     }
-    handle_key_event(app, smoke_key(KeyCode::Left), client).await?;
+    handle_key_event(app, smoke_key(KeyCode::Char(']')), client).await?;
+    if app.state.selected_thread_topic_index != 1 {
+        return Err(color_eyre::eyre::eyre!(
+            "] in messages did not open the next mock topic"
+        ));
+    }
+    handle_key_event(app, smoke_key(KeyCode::Char('[')), client).await?;
     if app.state.selected_thread_topic_index != 0
         || app.state.messages.is_empty()
         || !app
@@ -1274,9 +1280,18 @@ async fn run_interaction_smoke<C: TelegramClient + Clone + Send + Sync + 'static
             .all(|message| message.chat_id == 3 && message.thread_topic_id == Some(101))
     {
         return Err(color_eyre::eyre::eyre!(
-            "Left in messages did not return to the first mock topic"
+            "[ in messages did not return to the first mock topic"
         ));
     }
+    handle_key_event(app, smoke_key(KeyCode::Left), client).await?;
+    if app.state.focused_panel != state::FocusedPanel::Chats
+        || app.state.selected_thread_topic_index != 0
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "Left in messages did not return to chats without changing topic"
+        ));
+    }
+    app.state.focused_panel = state::FocusedPanel::Messages;
     handle_key_event(app, smoke_key(KeyCode::Enter), client).await?;
     if app.state.focused_panel != state::FocusedPanel::Input {
         return Err(color_eyre::eyre::eyre!(

@@ -24,18 +24,8 @@ pub fn handle_message_key(state: &mut AppState, key: KeyEvent) -> MessageKeyOutc
         KeyCode::End => state.select_last_message(),
         KeyCode::Down => state.select_next_message(),
         KeyCode::Up => state.select_prev_message(),
-        KeyCode::Left if state.thread_topics.is_empty() => {
-            state.focused_panel = FocusedPanel::Chats
-        }
-        KeyCode::Left => {
-            state.select_prev_thread_topic();
-            return MessageKeyOutcome::OpenSelectedThreadTopic;
-        }
-        KeyCode::Right if state.thread_topics.is_empty() => {}
-        KeyCode::Right => {
-            state.select_next_thread_topic();
-            return MessageKeyOutcome::OpenSelectedThreadTopic;
-        }
+        KeyCode::Left => state.focused_panel = FocusedPanel::Chats,
+        KeyCode::Right => {}
         KeyCode::Enter => state.focused_panel = FocusedPanel::Input,
         KeyCode::Char('[') => {
             state.select_prev_thread_topic();
@@ -167,16 +157,19 @@ mod tests {
 
         assert_eq!(
             handle_message_key(&mut state, key(KeyCode::Right)),
-            MessageKeyOutcome::OpenSelectedThreadTopic
+            MessageKeyOutcome::Handled
         );
-        assert_eq!(state.selected_thread_topic_index, 1);
+        assert_eq!(state.selected_thread_topic_index, 0);
+        assert_eq!(state.focused_panel, FocusedPanel::Messages);
 
         assert_eq!(
             handle_message_key(&mut state, key(KeyCode::Left)),
-            MessageKeyOutcome::OpenSelectedThreadTopic
+            MessageKeyOutcome::Handled
         );
         assert_eq!(state.selected_thread_topic_index, 0);
+        assert_eq!(state.focused_panel, FocusedPanel::Chats);
 
+        state.focused_panel = FocusedPanel::Messages;
         assert_eq!(
             handle_message_key(&mut state, key(KeyCode::Enter)),
             MessageKeyOutcome::Handled

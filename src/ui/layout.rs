@@ -357,15 +357,18 @@ fn help_bar_controls(app: &App) -> String {
     } else if app.state.focused_panel == FocusedPanel::Messages
         && app.state.selected_message().is_none()
     {
-        join_help_controls(&[
-            NO_MESSAGE_HELP_LABEL,
-            "Enter input",
+        let mut controls = vec![NO_MESSAGE_HELP_LABEL, "Enter input"];
+        if !app.state.thread_topics.is_empty() {
+            controls.push("[/] topics");
+        }
+        controls.extend([
             "Left chats",
             "Tab focus",
             "q quit",
             "< > resize",
             HIDE_HELP_CONTROL_LABEL,
-        ])
+        ]);
+        join_help_controls(&controls)
     } else if app.state.focused_panel == FocusedPanel::Messages
         && app
             .state
@@ -376,9 +379,11 @@ fn help_bar_controls(app: &App) -> String {
         if app.state.newer_history_gap() {
             controls.push("End refresh latest");
         }
+        controls.extend(["edit/delete/reply disabled", "Enter input"]);
+        if !app.state.thread_topics.is_empty() {
+            controls.push("[/] topics");
+        }
         controls.extend([
-            "edit/delete/reply disabled",
-            "Enter input",
             "Left chats",
             "Tab focus",
             "q quit",
@@ -396,8 +401,11 @@ fn help_bar_controls(app: &App) -> String {
         if app.state.newer_history_gap() {
             controls.push("End refresh latest");
         }
+        controls.push("Enter input to retry");
+        if !app.state.thread_topics.is_empty() {
+            controls.push("[/] topics");
+        }
         controls.extend([
-            "Enter input to retry",
             "Left chats",
             "Tab focus",
             "q quit",
@@ -446,7 +454,7 @@ fn selected_message_help_controls(state: &AppState, message: &Message) -> String
     let mut controls = vec![movement_label, "Enter input"];
 
     if !state.thread_topics.is_empty() {
-        controls.push("Left/Right topics");
+        controls.push("[/] topics");
     }
 
     if message.is_own && message.can_edit {
@@ -532,7 +540,8 @@ mod tests {
     use crate::app::App;
     use crate::state::{DeleteConfirmation, FocusedPanel};
     use crate::telegram::types::{
-        Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, Update, all_folder,
+        Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, ThreadTopic, Update,
+        all_folder,
     };
     use crate::ui::render_app_to_string_for_test;
     use chrono::Utc;
@@ -908,6 +917,34 @@ mod tests {
             help_bar_controls(&chats),
             "Search chats: type · Enter open · Esc clear · Backspace edit · Up/Down browse · ? hide help"
         );
+    }
+
+    #[test]
+    fn forum_help_uses_left_boundary_and_brackets_in_every_message_state() {
+        for status in [
+            None,
+            Some(MessageStatus::Delivered),
+            Some(MessageStatus::Sending),
+            Some(MessageStatus::Failed),
+        ] {
+            let mut app = App::new();
+            app.state.focused_panel = FocusedPanel::Messages;
+            app.state.thread_topics = vec![ThreadTopic {
+                id: 101,
+                title: "General".to_string(),
+                top_message_id: 1,
+                unread_count: 0,
+                is_closed: false,
+                is_pinned: false,
+            }];
+            if let Some(status) = status {
+                app.state.messages = vec![message_with_status(status)];
+            }
+            let controls = super::help_bar_controls(&app);
+            assert!(controls.contains("Left chats"), "{controls}");
+            assert!(controls.contains("[/] topics"), "{controls}");
+            assert!(!controls.contains("Left/Right topics"), "{controls}");
+        }
     }
 
     #[test]

@@ -430,7 +430,7 @@ pub struct AppState {
     pub input_buffer: String,
     pub input_cursor: usize,
     pub input_scroll_offset: usize,
-    pub chat_drafts: HashMap<i64, String>,
+    conversation_drafts: HashMap<ConversationScope, String>,
     cached_folder_chats: HashMap<Option<i32>, Vec<Chat>>,
     older_history_exhausted: HashSet<OlderHistoryKey>,
     newer_history_gap: bool,
@@ -487,7 +487,7 @@ impl AppState {
             input_buffer: String::new(),
             input_cursor: 0,
             input_scroll_offset: 0,
-            chat_drafts: HashMap::new(),
+            conversation_drafts: HashMap::new(),
             cached_folder_chats: HashMap::new(),
             older_history_exhausted: HashSet::new(),
             newer_history_gap: false,
@@ -1036,14 +1036,28 @@ impl AppState {
         }
     }
 
-    pub fn select_thread_topic_at(&mut self, index: usize) {
+    fn switch_thread_topic_to(&mut self, index: usize) {
         if self.thread_topics.is_empty() {
             self.selected_thread_topic_index = 0;
             self.thread_topic_scroll_offset = 0;
-        } else {
-            self.selected_thread_topic_index = index.min(last_index(self.thread_topics.len()));
-            self.ensure_selected_thread_topic_visible();
+            return;
         }
+        let index = index.min(last_index(self.thread_topics.len()));
+        if index == self.selected_thread_topic_index {
+            self.ensure_selected_thread_topic_visible();
+            return;
+        }
+        if self.editing_message_id.is_some() || self.replying_to_message_id.is_some() {
+            self.cancel_compose_mode();
+        }
+        self.save_current_draft();
+        self.selected_thread_topic_index = index;
+        self.ensure_selected_thread_topic_visible();
+        self.restore_draft_for_selected_chat();
+    }
+
+    pub fn select_thread_topic_at(&mut self, index: usize) {
+        self.switch_thread_topic_to(index);
     }
 
     pub fn ensure_selected_folder_visible(&mut self) {
@@ -1541,6 +1555,24 @@ impl AppState {
         self.pending_mutation_scopes.len()
     }
 
+    #[cfg(test)]
+    fn conversation_draft(&self, chat_id: i64, topic_id: Option<i32>) -> Option<&str> {
+        self.conversation_drafts
+            .get(&ConversationScope { chat_id, topic_id })
+            .map(String::as_str)
+    }
+
+    #[cfg(test)]
+    fn insert_conversation_draft(
+        &mut self,
+        chat_id: i64,
+        topic_id: Option<i32>,
+        draft: impl Into<String>,
+    ) {
+        self.conversation_drafts
+            .insert(ConversationScope { chat_id, topic_id }, draft.into());
+    }
+
     pub fn mark_gap_submit_ready(&mut self, request_id: u64, chat_id: i64, topic_id: Option<i32>) {
         if let Some(pending) = self.pending_gap_submit.as_mut()
             && pending.request_id == request_id
@@ -1905,25 +1937,23 @@ impl AppState {
 
     pub fn select_next_thread_topic(&mut self) {
         if self.thread_topics.is_empty() {
-            self.selected_thread_topic_index = 0;
-            self.thread_topic_scroll_offset = 0;
+            self.switch_thread_topic_to(0);
         } else {
-            self.selected_thread_topic_index =
-                (self.selected_thread_topic_index + 1) % self.thread_topics.len();
-            self.ensure_selected_thread_topic_visible();
+            self.switch_thread_topic_to(
+                (self.selected_thread_topic_index + 1) % self.thread_topics.len(),
+            );
         }
     }
 
     pub fn select_prev_thread_topic(&mut self) {
         if self.thread_topics.is_empty() {
-            self.selected_thread_topic_index = 0;
-            self.thread_topic_scroll_offset = 0;
-        } else if self.selected_thread_topic_index == 0 {
-            self.selected_thread_topic_index = last_index(self.thread_topics.len());
-            self.ensure_selected_thread_topic_visible();
+            self.switch_thread_topic_to(0);
         } else {
-            self.selected_thread_topic_index -= 1;
-            self.ensure_selected_thread_topic_visible();
+            self.switch_thread_topic_to(if self.selected_thread_topic_index == 0 {
+                last_index(self.thread_topics.len())
+            } else {
+                self.selected_thread_topic_index - 1
+            });
         }
     }
 
@@ -2238,9 +2268,9 @@ impl AppState {
             self.input_buffer.clone()
         };
         if draft.is_empty() {
-            self.chat_drafts.remove(&scope.chat_id);
+            self.conversation_drafts.remove(&scope);
         } else {
-            self.chat_drafts.insert(scope.chat_id, draft);
+            self.conversation_drafts.insert(scope, draft);
         }
     }
 
@@ -2250,8 +2280,8 @@ impl AppState {
         }
 
         self.input_buffer = self
-            .selected_chat_id()
-            .and_then(|chat_id| self.chat_drafts.get(&chat_id).cloned())
+            .selected_conversation_scope()
+            .and_then(|scope| self.conversation_drafts.get(&scope).cloned())
             .unwrap_or_default();
         if let Some(scope) = self.selected_conversation_scope()
             && let Some(recovery) = self.failed_submission_recovery.get_mut(&scope)
@@ -2271,7 +2301,7 @@ impl AppState {
 
     pub fn discard_draft_for_selected_chat(&mut self) {
         if let Some(scope) = self.selected_conversation_scope() {
-            self.chat_drafts.remove(&scope.chat_id);
+            self.conversation_drafts.remove(&scope);
             self.failed_submission_recovery.remove(&scope);
         }
     }
@@ -2327,7 +2357,9 @@ impl AppState {
             .collect::<Vec<_>>();
 
         let selected_chat_changed = context.chat_id != snapshot.selected_chat_id;
-        if selected_chat_changed {
+        let selected_scope_changed =
+            selected_chat_changed || context.topic_id != snapshot.selected_topic_id;
+        if selected_scope_changed {
             self.leave_selected_chat();
         }
 
@@ -2406,7 +2438,7 @@ impl AppState {
 
         self.typing_activity.clear();
         self.revalidate_reconciled_targets();
-        if selected_chat_changed {
+        if selected_scope_changed {
             self.clear_input_mode();
             self.restore_draft_for_selected_chat();
         }
@@ -4359,6 +4391,29 @@ mod tests {
     }
 
     #[test]
+    fn topic_switches_save_and_restore_exact_scope_drafts() {
+        let mut state = AppState::new();
+        state.chats = vec![chat_with_unread(1, "Forum", 0, None)];
+        state.thread_topics = vec![
+            thread_topic(101, "General"),
+            thread_topic(102, "Deployments"),
+        ];
+        state.input_buffer = "general draft".to_string();
+
+        state.select_next_thread_topic();
+        assert_eq!(state.input_buffer, "");
+        state.input_buffer = "deploy draft".to_string();
+        state.select_prev_thread_topic();
+        assert_eq!(state.input_buffer, "general draft");
+        state.select_thread_topic_at(1);
+        assert_eq!(state.input_buffer, "deploy draft");
+        state.cancel_input_mode();
+        state.select_thread_topic_at(0);
+        state.select_thread_topic_at(1);
+        assert_eq!(state.input_buffer, "");
+    }
+
+    #[test]
     fn failed_submission_recovery_is_scope_exact_and_submission_ordered() {
         let mut state = AppState::new();
         state.chats = vec![chat_with_unread(1, "Forum", 0, None)];
@@ -4378,24 +4433,14 @@ mod tests {
         assert_eq!(state.input_buffer, "sibling draft");
         assert_eq!(state.pending_mutation_submission_count(), 0);
 
-        state.selected_thread_topic_index = 0;
-        state.restore_draft_for_selected_chat();
-        assert_eq!(
-            state.input_buffer,
-            "first failed\n\nsecond failed\n\nsibling draft"
-        );
+        state.select_thread_topic_at(0);
+        assert_eq!(state.input_buffer, "first failed\n\nsecond failed");
 
-        state.save_current_draft();
-        state.selected_thread_topic_index = 1;
-        state.restore_draft_for_selected_chat();
+        state.select_thread_topic_at(1);
         assert_eq!(state.input_buffer, "sibling draft");
 
-        state.selected_thread_topic_index = 0;
-        state.restore_draft_for_selected_chat();
-        assert_eq!(
-            state.input_buffer,
-            "first failed\n\nsecond failed\n\nsibling draft"
-        );
+        state.select_thread_topic_at(0);
+        assert_eq!(state.input_buffer, "first failed\n\nsecond failed");
     }
 
     #[test]
@@ -4697,7 +4742,7 @@ mod tests {
         state.cancel_input_mode();
 
         assert_eq!(state.input_buffer, "");
-        assert!(!state.chat_drafts.contains_key(&10));
+        assert!(state.conversation_draft(10, None).is_none());
         assert_eq!(state.focused_panel, FocusedPanel::Messages);
     }
 
@@ -4953,7 +4998,7 @@ mod tests {
         assert_eq!(state.selected_message_index, 0);
         assert_eq!(state.input_buffer, "");
         assert_eq!(state.chats[0].last_message.as_deref(), Some("plain send"));
-        assert!(!state.chat_drafts.contains_key(&10));
+        assert!(state.conversation_draft(10, None).is_none());
     }
 
     #[test]
@@ -5218,14 +5263,11 @@ mod tests {
         let mut state = state_with_chats();
         state.input_buffer = "temporary".to_string();
         state.save_current_draft();
-        assert_eq!(
-            state.chat_drafts.get(&10).map(String::as_str),
-            Some("temporary")
-        );
+        assert_eq!(state.conversation_draft(10, None), Some("temporary"));
 
         state.input_buffer.clear();
         state.save_current_draft();
-        assert!(!state.chat_drafts.contains_key(&10));
+        assert!(state.conversation_draft(10, None).is_none());
     }
 
     #[test]
@@ -5235,10 +5277,7 @@ mod tests {
 
         state.leave_selected_chat();
 
-        assert_eq!(
-            state.chat_drafts.get(&10).map(String::as_str),
-            Some("leaving draft")
-        );
+        assert_eq!(state.conversation_draft(10, None), Some("leaving draft"));
         assert_eq!(state.input_buffer, "leaving draft");
     }
 
@@ -5254,10 +5293,7 @@ mod tests {
         assert!(state.editing_message_id.is_none());
         assert!(state.replying_to_message_id.is_none());
         assert_eq!(state.input_buffer, "");
-        assert_eq!(
-            state.chat_drafts.get(&10).map(String::as_str),
-            Some("plain draft")
-        );
+        assert_eq!(state.conversation_draft(10, None), Some("plain draft"));
     }
 
     #[test]
@@ -5630,10 +5666,7 @@ mod tests {
         assert!(state.replying_to_message_id.is_none());
         assert_eq!(state.input_buffer, "editable");
         assert_eq!(state.focused_panel, FocusedPanel::Input);
-        assert_eq!(
-            state.chat_drafts.get(&10).map(String::as_str),
-            Some("plain draft")
-        );
+        assert_eq!(state.conversation_draft(10, None), Some("plain draft"));
         assert!(state.error_message.is_none());
     }
 
@@ -5680,10 +5713,7 @@ mod tests {
         assert!(state.editing_message_id.is_none());
         assert_eq!(state.input_buffer, "plain draft");
         assert_eq!(state.focused_panel, FocusedPanel::Input);
-        assert_eq!(
-            state.chat_drafts.get(&10).map(String::as_str),
-            Some("plain draft")
-        );
+        assert_eq!(state.conversation_draft(10, None), Some("plain draft"));
     }
 
     #[test]
@@ -6461,6 +6491,88 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_topic_fallback_saves_old_scope_and_restores_destination_draft() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(0)];
+        state.chats = vec![chat(10, "Forum")];
+        state.thread_topics = vec![thread_topic(101, "General"), thread_topic(102, "Old")];
+        state.selected_thread_topic_index = 1;
+        state.input_buffer = "old topic draft".to_string();
+        state.focused_panel = FocusedPanel::Input;
+        state.insert_conversation_draft(10, Some(101), "general draft");
+        let context = state.reconciliation_context();
+        let mut replacement = message(9);
+        replacement.chat_id = 10;
+        replacement.thread_topic_id = Some(101);
+
+        assert_eq!(
+            state.apply_reconciliation_snapshot(
+                context,
+                ReconciliationSnapshot {
+                    folders: vec![all_folder(0)],
+                    selected_folder_id: Some(0),
+                    chats: vec![chat(10, "Forum")],
+                    chat_last_message_ids: Default::default(),
+                    selected_chat_id: Some(10),
+                    thread_topics: vec![thread_topic(101, "General")],
+                    selected_topic_id: Some(101),
+                    messages: vec![replacement],
+                },
+            ),
+            ReconciliationApply::Applied {
+                conversation_replaced: true
+            }
+        );
+        assert_eq!(
+            state.selected_thread_topic().map(|topic| topic.id),
+            Some(101)
+        );
+        assert_eq!(state.input_buffer, "general draft");
+        assert_eq!(
+            state.conversation_draft(10, Some(102)),
+            Some("old topic draft")
+        );
+    }
+
+    #[test]
+    fn reconciliation_topic_to_chat_wide_fallback_restores_chat_draft() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(0)];
+        state.chats = vec![chat(10, "Forum")];
+        state.thread_topics = vec![thread_topic(101, "Removed")];
+        state.input_buffer = "removed topic draft".to_string();
+        state.insert_conversation_draft(10, None, "chat draft");
+        let context = state.reconciliation_context();
+        let mut replacement = message(9);
+        replacement.chat_id = 10;
+
+        assert_eq!(
+            state.apply_reconciliation_snapshot(
+                context,
+                ReconciliationSnapshot {
+                    folders: vec![all_folder(0)],
+                    selected_folder_id: Some(0),
+                    chats: vec![chat(10, "Forum")],
+                    chat_last_message_ids: Default::default(),
+                    selected_chat_id: Some(10),
+                    thread_topics: Vec::new(),
+                    selected_topic_id: None,
+                    messages: vec![replacement],
+                },
+            ),
+            ReconciliationApply::Applied {
+                conversation_replaced: true
+            }
+        );
+        assert!(state.selected_thread_topic().is_none());
+        assert_eq!(state.input_buffer, "chat draft");
+        assert_eq!(
+            state.conversation_draft(10, Some(101)),
+            Some("removed topic draft")
+        );
+    }
+
+    #[test]
     fn reconciliation_falls_back_by_stable_id_and_restores_the_new_chat_draft() {
         let mut state = AppState::new();
         state.folders = vec![all_folder(0)];
@@ -6468,7 +6580,7 @@ mod tests {
         state.selected_chat_index = 1;
         state.input_buffer = "removed chat draft".to_string();
         state.focused_panel = FocusedPanel::Input;
-        state.chat_drafts.insert(10, "alice draft".to_string());
+        state.insert_conversation_draft(10, None, "alice draft");
         let context = state.reconciliation_context();
         let mut replacement = message(9);
         replacement.chat_id = 10;
@@ -6494,7 +6606,7 @@ mod tests {
         assert_eq!(state.selected_chat_id(), Some(10));
         assert_eq!(state.input_buffer, "alice draft");
         assert_eq!(
-            state.chat_drafts.get(&20).map(String::as_str),
+            state.conversation_draft(20, None),
             Some("removed chat draft")
         );
         assert_eq!(state.focused_panel, FocusedPanel::Input);
