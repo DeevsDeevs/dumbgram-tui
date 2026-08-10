@@ -221,6 +221,14 @@ impl TelegramClient for MockTelegramClient {
         Ok(topics.into_iter().take(limit).collect())
     }
 
+    async fn get_thread_topic(&self, chat_id: i64, topic_id: i32) -> Result<Option<ThreadTopic>> {
+        Ok(self
+            .get_thread_topics(chat_id, usize::MAX)
+            .await?
+            .into_iter()
+            .find(|topic| topic.id == topic_id))
+    }
+
     #[allow(clippy::manual_async_fn)]
     fn get_thread_messages(
         &self,

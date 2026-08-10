@@ -4,7 +4,7 @@ use grammers_client::{
     Client, Config, FixedReconnect, InitParams, InputMessage, grammers_tl_types as tl,
     types::{ChatMap, Downloadable, photo_sizes::PhotoSize},
 };
-use grammers_session::Session;
+use grammers_session::{PackedChat, Session};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -26,6 +26,31 @@ const TELEGRAM_RECONNECT_POLICY: FixedReconnect = FixedReconnect {
     attempts: 5,
     delay: Duration::from_secs(2),
 };
+
+enum BoundedChatReadRequest {
+    Channel(tl::functions::channels::ReadHistory),
+    Messages(tl::functions::messages::ReadHistory),
+}
+
+fn bounded_chat_read_request(
+    chat: PackedChat,
+    max_message_id: i32,
+) -> Result<BoundedChatReadRequest> {
+    if max_message_id <= 0 {
+        color_eyre::eyre::bail!("chat read maximum must be positive");
+    }
+    Ok(if let Some(channel) = chat.try_to_input_channel() {
+        BoundedChatReadRequest::Channel(tl::functions::channels::ReadHistory {
+            channel,
+            max_id: max_message_id,
+        })
+    } else {
+        BoundedChatReadRequest::Messages(tl::functions::messages::ReadHistory {
+            peer: chat.to_input_peer(),
+            max_id: max_message_id,
+        })
+    })
+}
 
 type ChatCache = HashMap<i64, grammers_client::types::Chat>;
 type UserNameCache = HashMap<i64, String>;
@@ -427,14 +452,20 @@ fn thread_topic_from_tl(topic: tl::enums::ForumTopic) -> Option<ThreadTopic> {
     }
 }
 
-fn message_thread_topic_id(reply_to: Option<&tl::enums::MessageReplyHeader>) -> Option<i32> {
+const GENERAL_FORUM_TOPIC_ID: i32 = 1;
+
+fn message_thread_topic_id(
+    reply_to: Option<&tl::enums::MessageReplyHeader>,
+    chat_is_forum: bool,
+) -> Option<i32> {
+    if !chat_is_forum {
+        return None;
+    }
     match reply_to {
-        Some(tl::enums::MessageReplyHeader::Header(header))
-            if header.forum_topic || header.reply_to_top_id.is_some() =>
-        {
+        Some(tl::enums::MessageReplyHeader::Header(header)) if header.forum_topic => {
             header.reply_to_top_id.or(header.reply_to_msg_id)
         }
-        _ => None,
+        _ => Some(GENERAL_FORUM_TOPIC_ID),
     }
 }
 
@@ -445,7 +476,8 @@ fn convert_message(
     let is_outgoing = msg.outgoing();
     let chat = msg.chat();
     let media = message_media(msg.media().as_ref());
-    let thread_topic_id = message_thread_topic_id(msg.raw.reply_to.as_ref());
+    let thread_topic_id =
+        message_thread_topic_id(msg.raw.reply_to.as_ref(), grammers_chat_is_forum(&chat));
     Message {
         id: msg.id(),
         chat_id: chat.id(),
@@ -1074,6 +1106,36 @@ impl TelegramClient for GrammersClient {
     }
 
     #[allow(clippy::manual_async_fn)]
+    fn get_thread_topic(
+        &self,
+        chat_id: i64,
+        topic_id: i32,
+    ) -> impl std::future::Future<Output = Result<Option<ThreadTopic>>> + Send + '_ {
+        async move {
+            let chat = self.cached_chat(chat_id)?;
+            if !grammers_chat_is_forum(&chat) {
+                return Ok(None);
+            }
+            let Some(channel) = chat.pack().try_to_input_channel() else {
+                return Ok(None);
+            };
+
+            let topics = self
+                .client
+                .invoke(&tl::functions::channels::GetForumTopicsById {
+                    channel,
+                    topics: vec![topic_id],
+                })
+                .await?;
+            let tl::enums::messages::ForumTopics::Topics(topics) = topics;
+            Ok(topics
+                .topics
+                .into_iter()
+                .find_map(|topic| thread_topic_from_tl(topic).filter(|topic| topic.id == topic_id)))
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
     fn get_thread_messages(
         &self,
         chat_id: i64,
@@ -1455,6 +1517,26 @@ impl TelegramClient for GrammersClient {
     }
 
     #[allow(clippy::manual_async_fn)]
+    fn mark_chat_read_through(
+        &self,
+        chat_id: i64,
+        max_message_id: i32,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        async move {
+            let chat = self.cached_chat(chat_id)?;
+            match bounded_chat_read_request(chat.pack(), max_message_id)? {
+                BoundedChatReadRequest::Channel(request) => {
+                    self.client.invoke(&request).await?;
+                }
+                BoundedChatReadRequest::Messages(request) => {
+                    self.client.invoke(&request).await?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
     fn mark_thread_read(
         &self,
         chat_id: i64,
@@ -1659,24 +1741,57 @@ impl TelegramClient for GrammersClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHAT_CACHE_LOCK_FAILED, CHAT_NOT_FOUND_IN_CACHE_PREFIX, DialogPageParts,
-        UPDATE_ERROR_PREFIX, cached_media_thumbnail_path, chat_cache_lock_failed_message,
+        BoundedChatReadRequest, CHAT_CACHE_LOCK_FAILED, CHAT_NOT_FOUND_IN_CACHE_PREFIX,
+        DialogPageParts, UPDATE_ERROR_PREFIX, bounded_chat_read_request,
+        cached_media_thumbnail_path, chat_cache_lock_failed_message,
         chat_matches_filter_categories, chat_not_found_in_cache_message, delete_message_updates,
         delete_update_chat_id, dialog_chats_from_page_parts, dumbgram_init_params,
         folders_from_dialog_filters, input_peers_contain_chat, message_sender_name,
         message_status_for_read_state, message_thread_topic_id, read_outbox_update_from_raw,
-        typing_status_update_from_raw, typing_status_update_from_raw_with_user_names,
-        update_error_message,
+        thread_topic_from_tl, typing_status_update_from_raw,
+        typing_status_update_from_raw_with_user_names, update_error_message,
     };
     use crate::telegram::types::{
         MessageStatus, OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update,
     };
     use grammers_client::grammers_tl_types as tl;
+    use grammers_session::{PackedChat, PackedType};
     use std::{
         collections::HashMap,
         ops::ControlFlow,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn bounded_chat_read_requests_use_exact_nonzero_max_for_messages_and_channels() {
+        let user = PackedChat {
+            ty: PackedType::User,
+            id: 1,
+            access_hash: Some(11),
+        };
+        let channel = PackedChat {
+            ty: PackedType::Megagroup,
+            id: 2,
+            access_hash: Some(22),
+        };
+
+        match bounded_chat_read_request(user, 77).expect("user read should be bounded") {
+            BoundedChatReadRequest::Messages(request) => assert_eq!(request.max_id, 77),
+            BoundedChatReadRequest::Channel(_) => panic!("user read must use messages.readHistory"),
+        }
+        match bounded_chat_read_request(channel, 88).expect("channel read should be bounded") {
+            BoundedChatReadRequest::Channel(request) => assert_eq!(request.max_id, 88),
+            BoundedChatReadRequest::Messages(_) => {
+                panic!("megagroup read must use channels.readHistory")
+            }
+        }
+        assert!(bounded_chat_read_request(user, 0).is_err());
+    }
+
+    #[test]
+    fn deleted_exact_forum_topic_maps_to_absence() {
+        assert!(thread_topic_from_tl(tl::types::ForumTopicDeleted { id: 99 }.into()).is_none());
+    }
 
     #[test]
     fn cached_media_thumbnail_path_requires_existing_file() {
@@ -1777,11 +1892,11 @@ mod tests {
             quote_offset: None,
         });
 
-        assert_eq!(message_thread_topic_id(Some(&reply_to)), Some(101));
+        assert_eq!(message_thread_topic_id(Some(&reply_to), true), Some(101));
     }
 
     #[test]
-    fn regular_replies_do_not_become_thread_topics() {
+    fn ordinary_supergroup_replies_do_not_become_thread_topics() {
         let reply_to = tl::enums::MessageReplyHeader::Header(tl::types::MessageReplyHeader {
             reply_to_scheduled: false,
             forum_topic: false,
@@ -1790,13 +1905,18 @@ mod tests {
             reply_to_peer_id: None,
             reply_from: None,
             reply_media: None,
-            reply_to_top_id: None,
+            reply_to_top_id: Some(101),
             quote_text: None,
             quote_entities: None,
             quote_offset: None,
         });
 
-        assert_eq!(message_thread_topic_id(Some(&reply_to)), None);
+        assert_eq!(message_thread_topic_id(Some(&reply_to), false), None);
+    }
+
+    #[test]
+    fn headerless_forum_messages_belong_to_general_topic() {
+        assert_eq!(message_thread_topic_id(None, true), Some(1));
     }
 
     #[test]

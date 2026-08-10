@@ -36,6 +36,7 @@ use ratatui::{
     Terminal,
     backend::{CrosstermBackend, TestBackend},
 };
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::{pending, poll_fn};
 use std::path::{Path, PathBuf};
@@ -2231,6 +2232,7 @@ struct EventLoopState {
     reconciliation_requested_while_pending: bool,
     reconciliation_high_water_ids: HashMap<i64, i32>,
     deferred_updates: Vec<Update>,
+    deferred_conversation_updates: Vec<Update>,
     staged_update: Option<Update>,
     staged_terminal_event: Option<Event>,
     #[cfg(test)]
@@ -2279,6 +2281,7 @@ impl EventLoopState {
                 reconciliation_requested_while_pending: false,
                 reconciliation_high_water_ids: HashMap::new(),
                 deferred_updates: Vec::new(),
+                deferred_conversation_updates: Vec::new(),
                 staged_update: None,
                 staged_terminal_event: None,
                 #[cfg(test)]
@@ -2394,7 +2397,12 @@ fn drain_ready_results<C: TelegramClient + Clone + Send + Sync + 'static>(
             loop_state.finish_reconciliation_gate(now + RECONCILIATION_RETRY_DELAY);
         }
         dirty = true;
-        replay_deferred_updates(loop_state, app, mark_read_loader);
+        replay_deferred_updates(
+            loop_state,
+            app,
+            mark_read_loader,
+            selected_conversation_load_active(app, chat_message_loader, folder_chat_loader),
+        );
     }
     while let Ok(result) = loop_state.reconciliation_rx.try_recv() {
         dirty |= apply_reconciliation_result(
@@ -2405,11 +2413,35 @@ fn drain_ready_results<C: TelegramClient + Clone + Send + Sync + 'static>(
             mark_read_loader,
         );
         if !loop_state.initial_state_pending && !loop_state.reconciliation_pending {
-            replay_deferred_updates(loop_state, app, mark_read_loader);
+            replay_deferred_updates(
+                loop_state,
+                app,
+                mark_read_loader,
+                selected_conversation_load_active(app, chat_message_loader, folder_chat_loader),
+            );
         }
     }
+    let mut conversation_load_active =
+        selected_conversation_load_active(app, chat_message_loader, folder_chat_loader);
+    if !conversation_load_active
+        && !loop_state.initial_state_pending
+        && !loop_state.reconciliation_pending
+        && !loop_state.deferred_conversation_updates.is_empty()
+    {
+        if app.state.conversation_load_status == state::ConversationLoadStatus::Loading {
+            app.state.mark_conversation_load_failed();
+            dirty = true;
+        }
+        dirty |= replay_deferred_conversation_updates(loop_state, app, mark_read_loader);
+    }
     if let Some(update) = loop_state.staged_update.take() {
-        dirty |= handle_received_update(loop_state, app, update, mark_read_loader);
+        dirty |= handle_received_update_with_conversation_load(
+            loop_state,
+            app,
+            update,
+            mark_read_loader,
+            conversation_load_active,
+        );
     }
     let queued_updates = loop_state
         .update_rx
@@ -2417,27 +2449,72 @@ fn drain_ready_results<C: TelegramClient + Clone + Send + Sync + 'static>(
         .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>())
         .unwrap_or_default();
     for update in queued_updates {
-        dirty |= handle_received_update(loop_state, app, update, mark_read_loader);
+        dirty |= handle_received_update_with_conversation_load(
+            loop_state,
+            app,
+            update,
+            mark_read_loader,
+            conversation_load_active,
+        );
     }
     while let Ok(result) = loop_state.chat_message_rx.try_recv() {
-        dirty |= apply_chat_message_load_result(
+        let request_id = result.request_id;
+        let finished_open = chat_message_loader.finish_open_request(request_id);
+        let outcome = apply_chat_message_load_result_with_outcome(
             app,
             chat_message_loader.latest_request_id(),
             result,
             mark_read_loader,
         );
+        dirty |= outcome.dirty;
+        if outcome.snapshot_applied {
+            discard_deferred_conversation_updates_represented_by_snapshot(loop_state, app, None);
+        }
+        conversation_load_active =
+            selected_conversation_load_active(app, chat_message_loader, folder_chat_loader);
+        if finished_open && !conversation_load_active {
+            if app.state.conversation_load_status == state::ConversationLoadStatus::Loading {
+                app.state.mark_conversation_load_failed();
+                dirty = true;
+            }
+            dirty |= replay_deferred_conversation_updates(loop_state, app, mark_read_loader);
+        }
     }
     while let Ok(result) = loop_state.older_message_rx.try_recv() {
         dirty |=
             apply_older_message_load_result(app, older_message_loader.latest_request_id(), result);
     }
     while let Ok(result) = loop_state.folder_chat_rx.try_recv() {
-        dirty |= apply_folder_chat_load_result(
+        let request_id = result.request_id;
+        let chat_last_message_ids = result
+            .result
+            .as_ref()
+            .ok()
+            .map(|load| load.chat_last_message_ids.clone());
+        let finished_folder = folder_chat_loader.finish_request(request_id);
+        let outcome = apply_folder_chat_load_result_with_outcome(
             app,
             folder_chat_loader.latest_request_id(),
             result,
             mark_read_loader,
         );
+        dirty |= outcome.dirty;
+        if outcome.snapshot_applied {
+            discard_deferred_conversation_updates_represented_by_snapshot(
+                loop_state,
+                app,
+                chat_last_message_ids.as_ref(),
+            );
+        }
+        conversation_load_active =
+            selected_conversation_load_active(app, chat_message_loader, folder_chat_loader);
+        if finished_folder && !conversation_load_active {
+            if app.state.conversation_load_status == state::ConversationLoadStatus::Loading {
+                app.state.mark_conversation_load_failed();
+                dirty = true;
+            }
+            dirty |= replay_deferred_conversation_updates(loop_state, app, mark_read_loader);
+        }
     }
     while let Ok(result) = loop_state.send_message_rx.try_recv() {
         apply_send_message_result(app, result);
@@ -2474,11 +2551,7 @@ fn update_represented_by_reconciliation(
         return false;
     };
     let belongs_to_selected_conversation = app.state.selected_chat_id() == Some(message.chat_id)
-        && app
-            .state
-            .selected_thread_topic()
-            .map(|topic| topic.id)
-            .is_none_or(|topic_id| message.thread_topic_id == Some(topic_id));
+        && app.state.selected_thread_topic().map(|topic| topic.id) == message.thread_topic_id;
     !belongs_to_selected_conversation
         && loop_state
             .reconciliation_high_water_ids
@@ -2486,11 +2559,27 @@ fn update_represented_by_reconciliation(
             .is_some_and(|last_id| message.id <= *last_id)
 }
 
-fn handle_received_update<C>(
+fn selected_conversation_load_active<C>(
+    app: &App,
+    chat_message_loader: &ChatMessageLoader<C>,
+    folder_chat_loader: &FolderChatLoader<C>,
+) -> bool
+where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    folder_chat_loader.has_active_request()
+        || app
+            .state
+            .selected_chat_id()
+            .is_some_and(|chat_id| chat_message_loader.has_active_open_for(chat_id))
+}
+
+fn handle_received_update_with_conversation_load<C>(
     loop_state: &mut EventLoopState,
     app: &mut App,
     update: Update,
     mark_read_loader: &MarkChatReadLoader<C>,
+    conversation_load_active: bool,
 ) -> bool
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
@@ -2507,6 +2596,16 @@ where
         loop_state.deferred_updates.push(update);
         return false;
     }
+    if conversation_load_active
+        && matches!(
+            &update,
+            Update::NewMessage(message)
+                if app.state.selected_chat_id() == Some(message.chat_id)
+        )
+    {
+        loop_state.deferred_conversation_updates.push(update);
+        return false;
+    }
     if update_represented_by_reconciliation(loop_state, app, &update) {
         diagnostics::event("reconciliation_update_deduplicated", "count=1");
         return false;
@@ -2517,17 +2616,111 @@ where
     true
 }
 
+#[cfg(test)]
+fn handle_received_update<C>(
+    loop_state: &mut EventLoopState,
+    app: &mut App,
+    update: Update,
+    mark_read_loader: &MarkChatReadLoader<C>,
+) -> bool
+where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    handle_received_update_with_conversation_load(loop_state, app, update, mark_read_loader, false)
+}
+
 fn replay_deferred_updates<C>(
     loop_state: &mut EventLoopState,
     app: &mut App,
     mark_read_loader: &MarkChatReadLoader<C>,
+    conversation_load_active: bool,
 ) where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
     let deferred_updates = std::mem::take(&mut loop_state.deferred_updates);
     for update in deferred_updates {
-        handle_received_update(loop_state, app, update, mark_read_loader);
+        handle_received_update_with_conversation_load(
+            loop_state,
+            app,
+            update,
+            mark_read_loader,
+            conversation_load_active,
+        );
     }
+}
+
+fn update_represented_by_loaded_conversation(
+    app: &App,
+    update: &Update,
+    chat_last_message_ids: Option<&HashMap<i64, i32>>,
+) -> bool {
+    let Update::NewMessage(message) = update else {
+        return false;
+    };
+    if chat_last_message_ids
+        .and_then(|ids| ids.get(&message.chat_id))
+        .is_some_and(|last_id| message.id <= *last_id)
+    {
+        return true;
+    }
+    if app.state.selected_chat_id() != Some(message.chat_id) {
+        return false;
+    }
+    let selected_topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
+    if message.thread_topic_id == selected_topic_id {
+        return app
+            .state
+            .messages
+            .iter()
+            .any(|loaded| loaded.chat_id == message.chat_id && loaded.id >= message.id);
+    }
+    message.thread_topic_id.is_some_and(|topic_id| {
+        app.state
+            .thread_topics
+            .iter()
+            .find(|topic| topic.id == topic_id)
+            .is_some_and(|topic| topic.top_message_id >= message.id)
+    })
+}
+
+fn discard_deferred_conversation_updates_represented_by_snapshot(
+    loop_state: &mut EventLoopState,
+    app: &App,
+    chat_last_message_ids: Option<&HashMap<i64, i32>>,
+) {
+    let before = loop_state.deferred_conversation_updates.len();
+    loop_state.deferred_conversation_updates.retain(|update| {
+        !update_represented_by_loaded_conversation(app, update, chat_last_message_ids)
+    });
+    let discarded = before - loop_state.deferred_conversation_updates.len();
+    if discarded > 0 {
+        diagnostics::event(
+            "conversation_load_update_deduplicated",
+            format!("count={discarded}"),
+        );
+    }
+}
+
+fn replay_deferred_conversation_updates<C>(
+    loop_state: &mut EventLoopState,
+    app: &mut App,
+    mark_read_loader: &MarkChatReadLoader<C>,
+) -> bool
+where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    let deferred_updates = std::mem::take(&mut loop_state.deferred_conversation_updates);
+    let mut dirty = false;
+    for update in deferred_updates {
+        dirty |= handle_received_update_with_conversation_load(
+            loop_state,
+            app,
+            update,
+            mark_read_loader,
+            false,
+        );
+    }
+    dirty
 }
 
 fn apply_reconciliation_result<C>(
@@ -2573,19 +2766,27 @@ where
                             max_message_id,
                         })
                 } else {
+                    let max_message_id = snapshot.messages.iter().map(|message| message.id).max();
                     snapshot
                         .chats
                         .iter()
                         .find(|chat| chat.id == chat_id)
-                        .is_some_and(|chat| chat.unread_count > 0 && !snapshot.messages.is_empty())
-                        .then_some(ReconciliationReadAck::Chat { chat_id })
+                        .is_some_and(|chat| chat.unread_count > 0)
+                        .then_some(max_message_id)
+                        .flatten()
+                        .map(|max_message_id| ReconciliationReadAck::Chat {
+                            chat_id,
+                            max_message_id,
+                        })
                 }
             });
             match app
                 .state
                 .apply_reconciliation_snapshot(result.context, snapshot)
             {
-                state::ReconciliationApply::Applied { .. } => {
+                state::ReconciliationApply::Applied {
+                    conversation_replaced,
+                } => {
                     loop_state.reconciliation_high_water_ids = high_water_ids;
                     loop_state.last_reconciliation_success_at = Some(now);
                     let follow_up_requested =
@@ -2595,16 +2796,20 @@ where
                         loop_state.announce_reconciliation_success = false;
                     }
                     match selected_read_ack {
-                        Some(ReconciliationReadAck::Chat { chat_id })
-                            if app.state.selected_chat_id() == Some(chat_id) =>
+                        Some(ReconciliationReadAck::Chat {
+                            chat_id,
+                            max_message_id,
+                        }) if conversation_replaced
+                            && app.state.selected_chat_id() == Some(chat_id) =>
                         {
-                            mark_read_loader.spawn_mark_chat_read(chat_id);
+                            mark_read_loader.spawn_mark_chat_read_through(chat_id, max_message_id);
                         }
                         Some(ReconciliationReadAck::Thread {
                             chat_id,
                             topic_id,
                             max_message_id,
-                        }) if app.state.selected_chat_id() == Some(chat_id)
+                        }) if conversation_replaced
+                            && app.state.selected_chat_id() == Some(chat_id)
                             && app.state.selected_thread_topic().map(|topic| topic.id)
                                 == Some(topic_id) =>
                         {
@@ -2644,6 +2849,7 @@ fn update_trace_label(update: &Update) -> String {
 enum ReconciliationReadAck {
     Chat {
         chat_id: i64,
+        max_message_id: i32,
     },
     Thread {
         chat_id: i64,
@@ -2684,6 +2890,12 @@ struct ChatMessageLoadResult {
     topic_id: Option<i32>,
     purpose: ChatMessageLoadPurpose,
     result: std::result::Result<ChatMessageLoad, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConversationLoadApply {
+    dirty: bool,
+    snapshot_applied: bool,
 }
 
 struct OlderMessageLoadResult {
@@ -2893,6 +3105,7 @@ struct ChatMessageLoader<C> {
     client: C,
     tx: UiSender<ChatMessageLoadResult>,
     latest_request_id: u64,
+    active_open_request: Cell<Option<(u64, i64)>>,
     current_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -2933,6 +3146,17 @@ where
         });
     }
 
+    fn spawn_mark_chat_read_through(&self, chat_id: i64, max_message_id: i32) {
+        let client = self.client.clone();
+        diagnostics::event(
+            "mark_chat_read_through_spawn",
+            format!("chat_id={chat_id} max_message_id={max_message_id}"),
+        );
+        tokio::spawn(async move {
+            actions::mark_chat_read_through_best_effort(&client, chat_id, max_message_id).await;
+        });
+    }
+
     fn spawn_mark_thread_read(&self, chat_id: i64, topic_id: i32, max_message_id: i32) {
         let client = self.client.clone();
         diagnostics::event(
@@ -2954,12 +3178,42 @@ where
             client,
             tx: tx.into(),
             latest_request_id: 0,
+            active_open_request: Cell::new(None),
             current_handle: None,
         }
     }
 
     fn latest_request_id(&self) -> u64 {
         self.latest_request_id
+    }
+
+    fn has_active_open_for(&self, chat_id: i64) -> bool {
+        self.active_open_request
+            .get()
+            .is_some_and(|(_, active_chat_id)| active_chat_id == chat_id)
+    }
+
+    fn cancel_open_request(&mut self) {
+        abort_running_task(
+            &mut self.current_handle,
+            "messages_load_abort",
+            self.latest_request_id,
+        );
+        self.latest_request_id = self.latest_request_id.saturating_add(1);
+        self.active_open_request.set(None);
+    }
+
+    fn finish_open_request(&self, request_id: u64) -> bool {
+        if self
+            .active_open_request
+            .get()
+            .is_some_and(|(active_request_id, _)| active_request_id == request_id)
+        {
+            self.active_open_request.set(None);
+            true
+        } else {
+            false
+        }
     }
 
     fn spawn_latest_chat_messages(&mut self, chat_id: i64) {
@@ -2975,6 +3229,10 @@ where
 
         self.latest_request_id = self.latest_request_id.saturating_add(1);
         let request_id = self.latest_request_id;
+        self.active_open_request.set(
+            matches!(purpose, ChatMessageLoadPurpose::OpenConversation)
+                .then_some((request_id, chat_id)),
+        );
         let client = self.client.clone();
         let tx = self.tx.clone();
         diagnostics::event(
@@ -3039,6 +3297,10 @@ where
 
         self.latest_request_id = self.latest_request_id.saturating_add(1);
         let request_id = self.latest_request_id;
+        self.active_open_request.set(
+            matches!(purpose, ChatMessageLoadPurpose::OpenConversation)
+                .then_some((request_id, chat_id)),
+        );
         let client = self.client.clone();
         let tx = self.tx.clone();
         diagnostics::event(
@@ -3152,6 +3414,7 @@ struct FolderChatLoader<C> {
     client: C,
     tx: UiSender<FolderChatLoadResult>,
     latest_request_id: u64,
+    active_request_id: Cell<Option<u64>>,
     current_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -3442,12 +3705,36 @@ where
             client,
             tx: tx.into(),
             latest_request_id: 0,
+            active_request_id: Cell::new(None),
             current_handle: None,
         }
     }
 
     fn latest_request_id(&self) -> u64 {
         self.latest_request_id
+    }
+
+    fn has_active_request(&self) -> bool {
+        self.active_request_id.get().is_some()
+    }
+
+    fn cancel_request(&mut self) {
+        abort_running_task(
+            &mut self.current_handle,
+            "folder_chats_load_abort",
+            self.latest_request_id,
+        );
+        self.latest_request_id = self.latest_request_id.saturating_add(1);
+        self.active_request_id.set(None);
+    }
+
+    fn finish_request(&self, request_id: u64) -> bool {
+        if self.active_request_id.get() == Some(request_id) {
+            self.active_request_id.set(None);
+            true
+        } else {
+            false
+        }
     }
 
     fn spawn_folder_chats(&mut self, folder_index: usize, folder_id: Option<i32>) {
@@ -3459,6 +3746,7 @@ where
 
         self.latest_request_id = self.latest_request_id.saturating_add(1);
         let request_id = self.latest_request_id;
+        self.active_request_id.set(Some(request_id));
         let client = self.client.clone();
         let tx = self.tx.clone();
         diagnostics::event(
@@ -3516,7 +3804,10 @@ fn apply_subscribe_updates_result(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoadedReadAck {
-    Chat(i64),
+    Chat {
+        chat_id: i64,
+        max_message_id: i32,
+    },
     Thread {
         chat_id: i64,
         topic_id: i32,
@@ -3535,13 +3826,16 @@ fn loaded_read_ack(
     }
     let chat = chats.first()?;
     if let Some(topic) = thread_topics.first() {
-        return (topic.unread_count > 0).then(|| LoadedReadAck::Thread {
+        return Some(LoadedReadAck::Thread {
             chat_id: chat.id,
             topic_id: topic.id,
             max_message_id: messages.iter().map(|message| message.id).max().unwrap_or(0),
         });
     }
-    (chat.unread_count > 0).then_some(LoadedReadAck::Chat(chat.id))
+    Some(LoadedReadAck::Chat {
+        chat_id: chat.id,
+        max_message_id: messages.iter().map(|message| message.id).max().unwrap_or(0),
+    })
 }
 
 fn initial_load_read_ack(load: &InitialStateLoadResult) -> Option<LoadedReadAck> {
@@ -3554,14 +3848,8 @@ fn folder_chat_load_read_ack(load: &FolderChatLoadResult) -> Option<LoadedReadAc
     loaded_read_ack(&load.chats, &load.messages, &load.thread_topics)
 }
 
-fn selected_chat_needs_read_ack(app: &App, chat_id: i64, messages: &[Message]) -> bool {
-    !messages.is_empty()
-        && app.state.selected_chat_id() == Some(chat_id)
-        && app
-            .state
-            .chats
-            .get(app.state.selected_chat_index)
-            .is_some_and(|chat| chat.unread_count > 0)
+fn selected_chat_has_displayed_messages(app: &App, chat_id: i64, messages: &[Message]) -> bool {
+    !messages.is_empty() && app.state.selected_chat_id() == Some(chat_id)
 }
 
 fn apply_initial_state_load_result<C>(
@@ -3575,8 +3863,11 @@ fn apply_initial_state_load_result<C>(
     let read_ack = initial_load_read_ack(&load);
     actions::apply_initial_state_load_result(&mut app.state, load.result);
     match read_ack {
-        Some(LoadedReadAck::Chat(chat_id)) if app.state.selected_chat_id() == Some(chat_id) => {
-            mark_read_loader.spawn_mark_chat_read(chat_id);
+        Some(LoadedReadAck::Chat {
+            chat_id,
+            max_message_id,
+        }) if app.state.selected_chat_id() == Some(chat_id) => {
+            mark_read_loader.spawn_mark_chat_read_through(chat_id, max_message_id);
         }
         Some(LoadedReadAck::Thread {
             chat_id,
@@ -3614,9 +3905,7 @@ fn apply_send_message_result(app: &mut App, load: SendMessageResult) {
         .find(|message| message.chat_id == load.chat_id && message.id == load.temp_id)
         .map(|message| message.thread_topic_id);
     let selected_topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
-    let pending_matches_scope = pending_topic_id.is_some_and(|pending_topic_id| {
-        selected_topic_id.is_none_or(|topic_id| pending_topic_id == Some(topic_id))
-    });
+    let pending_matches_scope = pending_topic_id == Some(selected_topic_id);
     if app.state.selected_chat_id() == Some(load.chat_id) && pending_matches_scope {
         actions::apply_send_message_result(&mut app.state, load.temp_id, load.result);
     } else {
@@ -3681,20 +3970,6 @@ fn apply_reply_message_result(app: &mut App, load: ReplyMessageResult) {
     }
 }
 
-fn incoming_update_thread_read_ack(app: &App, update: &Update) -> Option<(i64, i32, i32)> {
-    let Update::NewMessage(message) = update else {
-        return None;
-    };
-    if message.is_own {
-        return None;
-    }
-
-    let chat_id = app.state.selected_chat_id()?;
-    let topic_id = app.state.selected_thread_topic()?.id;
-    (message.chat_id == chat_id && message.thread_topic_id == Some(topic_id))
-        .then_some((chat_id, topic_id, message.id))
-}
-
 fn apply_update_with_read_ack<C>(
     app: &mut App,
     update: Update,
@@ -3702,10 +3977,13 @@ fn apply_update_with_read_ack<C>(
 ) where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
-    let thread_read_ack = incoming_update_thread_read_ack(app, &update);
-    app.state.apply_update(update);
-    if let Some((chat_id, topic_id, max_message_id)) = thread_read_ack {
-        mark_read_loader.spawn_mark_thread_read(chat_id, topic_id, max_message_id);
+    let Some(presented) = app.state.apply_update(update) else {
+        return;
+    };
+    if let Some(topic_id) = presented.topic_id {
+        mark_read_loader.spawn_mark_thread_read(presented.chat_id, topic_id, presented.message_id);
+    } else {
+        mark_read_loader.spawn_mark_chat_read_through(presented.chat_id, presented.message_id);
     }
 }
 
@@ -3776,12 +4054,12 @@ fn release_gap_submit_if_ready<C>(
     }
 }
 
-fn apply_chat_message_load_result<C>(
+fn apply_chat_message_load_result_with_outcome<C>(
     app: &mut App,
     latest_request_id: u64,
     load: ChatMessageLoadResult,
     mark_read_loader: &MarkChatReadLoader<C>,
-) -> bool
+) -> ConversationLoadApply
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
@@ -3799,7 +4077,10 @@ where
             ),
         );
         app.state.cancel_gap_submit_for_request(request_id);
-        return false;
+        return ConversationLoadApply {
+            dirty: false,
+            snapshot_applied: false,
+        };
     }
 
     if app.state.selected_chat_id() != Some(load.chat_id) {
@@ -3813,7 +4094,10 @@ where
             ),
         );
         app.state.cancel_gap_submit_for_request(request_id);
-        return false;
+        return ConversationLoadApply {
+            dirty: false,
+            snapshot_applied: false,
+        };
     }
 
     let selected_topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
@@ -3830,16 +4114,23 @@ where
             ),
         );
         app.state.cancel_gap_submit_for_request(request_id);
-        return false;
+        return ConversationLoadApply {
+            dirty: false,
+            snapshot_applied: false,
+        };
     }
 
     if gap_generation.is_some_and(|generation| generation != app.state.newer_history_generation()) {
         app.state.cancel_gap_submit_for_request(request_id);
         app.state
             .set_error("Newer messages arrived during refresh; try again".to_string());
-        return true;
+        return ConversationLoadApply {
+            dirty: true,
+            snapshot_applied: false,
+        };
     }
 
+    let snapshot_applied = load.result.is_ok();
     let chat_id = load.chat_id;
     let topic_id = load.topic_id;
     match load.result {
@@ -3855,8 +4146,10 @@ where
                     .max()
                     .map(|max_message_id| (topic_id, max_message_id))
             });
-            let should_mark_chat_read =
-                topic_id.is_none() && selected_chat_needs_read_ack(app, chat_id, &load.messages);
+            let chat_read_ack = (topic_id.is_none()
+                && selected_chat_has_displayed_messages(app, chat_id, &load.messages))
+            .then(|| load.messages.iter().map(|message| message.id).max())
+            .flatten();
             if gap_generation.is_none()
                 && let Some(thread_topics) = load.thread_topics.take()
             {
@@ -3878,8 +4171,8 @@ where
             }
             if let Some((topic_id, max_message_id)) = thread_read_ack {
                 mark_read_loader.spawn_mark_thread_read(chat_id, topic_id, max_message_id);
-            } else if should_mark_chat_read {
-                mark_read_loader.spawn_mark_chat_read(chat_id);
+            } else if let Some(max_message_id) = chat_read_ack {
+                mark_read_loader.spawn_mark_chat_read_through(chat_id, max_message_id);
             }
             app.state
                 .mark_gap_submit_ready(request_id, chat_id, topic_id);
@@ -3895,15 +4188,31 @@ where
             }
         }
     }
-    true
+    ConversationLoadApply {
+        dirty: true,
+        snapshot_applied,
+    }
 }
 
-fn apply_folder_chat_load_result<C>(
+fn apply_chat_message_load_result<C>(
+    app: &mut App,
+    latest_request_id: u64,
+    load: ChatMessageLoadResult,
+    mark_read_loader: &MarkChatReadLoader<C>,
+) -> bool
+where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    apply_chat_message_load_result_with_outcome(app, latest_request_id, load, mark_read_loader)
+        .dirty
+}
+
+fn apply_folder_chat_load_result_with_outcome<C>(
     app: &mut App,
     latest_request_id: u64,
     load: FolderChatLoadResult,
     mark_read_loader: &MarkChatReadLoader<C>,
-) -> bool
+) -> ConversationLoadApply
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
@@ -3915,7 +4224,10 @@ where
                 load.request_id, latest_request_id, load.folder_index, load.folder_id
             ),
         );
-        return false;
+        return ConversationLoadApply {
+            dirty: false,
+            snapshot_applied: false,
+        };
     }
 
     if app.state.selected_folder_index != load.folder_index
@@ -3932,14 +4244,21 @@ where
                 app.state.selected_folder_filter_id()
             ),
         );
-        return false;
+        return ConversationLoadApply {
+            dirty: false,
+            snapshot_applied: false,
+        };
     }
 
+    let snapshot_applied = load.result.is_ok();
     let read_ack = folder_chat_load_read_ack(&load);
     actions::apply_folder_chat_load_result(&mut app.state, load.result);
     match read_ack {
-        Some(LoadedReadAck::Chat(chat_id)) if app.state.selected_chat_id() == Some(chat_id) => {
-            mark_read_loader.spawn_mark_chat_read(chat_id);
+        Some(LoadedReadAck::Chat {
+            chat_id,
+            max_message_id,
+        }) if app.state.selected_chat_id() == Some(chat_id) => {
+            mark_read_loader.spawn_mark_chat_read_through(chat_id, max_message_id);
         }
         Some(LoadedReadAck::Thread {
             chat_id,
@@ -3953,7 +4272,22 @@ where
         _ => {}
     }
     app.state.clear_status();
-    true
+    ConversationLoadApply {
+        dirty: true,
+        snapshot_applied,
+    }
+}
+
+fn apply_folder_chat_load_result<C>(
+    app: &mut App,
+    latest_request_id: u64,
+    load: FolderChatLoadResult,
+    mark_read_loader: &MarkChatReadLoader<C>,
+) -> bool
+where
+    C: TelegramClient + Clone + Send + Sync + 'static,
+{
+    apply_folder_chat_load_result_with_outcome(app, latest_request_id, load, mark_read_loader).dirty
 }
 
 fn apply_older_message_load_result(
@@ -4457,6 +4791,7 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
                 client,
                 progress,
                 &mut loaders.chat_message,
+                &mut loaders.folder_chat,
             )
             .await?;
             return Ok(());
@@ -4495,6 +4830,7 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
                 client,
                 progress,
                 &mut loaders.chat_message,
+                &mut loaders.folder_chat,
                 index,
             )
             .await?;
@@ -4506,6 +4842,7 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
                 client,
                 progress,
                 &mut loaders.chat_message,
+                &mut loaders.folder_chat,
                 index,
             )
             .await?;
@@ -4524,6 +4861,7 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
                 app,
                 client,
                 progress,
+                &mut loaders.chat_message,
                 &mut loaders.folder_chat,
                 index,
             )
@@ -4538,6 +4876,7 @@ async fn handle_normal_navigation<C: TelegramClient + Clone + Send + Sync + 'sta
                 app,
                 client,
                 progress,
+                &mut loaders.chat_message,
                 &mut loaders.folder_chat,
                 index,
             )
@@ -4640,6 +4979,7 @@ async fn open_folder_at_with_optional_async_loader<
     app: &mut App,
     client: &mut C,
     progress: &mut UiProgress<'_>,
+    chat_message_loader: &mut Option<&mut ChatMessageLoader<C>>,
     folder_chat_loader: &mut Option<&mut FolderChatLoader<C>>,
     index: usize,
 ) -> Result<()> {
@@ -4650,6 +4990,9 @@ async fn open_folder_at_with_optional_async_loader<
 
     progress.show(app, LOADING_FOLDER_CHATS_STATUS)?;
     if let Some(loader) = folder_chat_loader.as_deref_mut() {
+        if let Some(chat_loader) = chat_message_loader.as_deref_mut() {
+            chat_loader.cancel_open_request();
+        }
         loader.spawn_folder_chats(folder_index, folder_id);
         return Ok(());
     }
@@ -4667,6 +5010,7 @@ async fn open_selected_thread_topic_with_optional_async_loader<
     client: &mut C,
     progress: &mut UiProgress<'_>,
     chat_message_loader: &mut Option<&mut ChatMessageLoader<C>>,
+    folder_chat_loader: &mut Option<&mut FolderChatLoader<C>>,
 ) -> Result<()> {
     let Some((chat_id, topic_id)) = app
         .state
@@ -4679,6 +5023,9 @@ async fn open_selected_thread_topic_with_optional_async_loader<
     app.state.begin_conversation_load();
     progress.show(app, LOADING_CHAT_MESSAGES_STATUS)?;
     if let Some(loader) = chat_message_loader.as_deref_mut() {
+        if let Some(folder_loader) = folder_chat_loader.as_deref_mut() {
+            folder_loader.cancel_request();
+        }
         loader.spawn_thread_topic_messages(chat_id, topic_id);
         return Ok(());
     }
@@ -4697,6 +5044,7 @@ async fn open_chat_at_with_optional_async_loader<
     client: &mut C,
     progress: &mut UiProgress<'_>,
     chat_message_loader: &mut Option<&mut ChatMessageLoader<C>>,
+    folder_chat_loader: &mut Option<&mut FolderChatLoader<C>>,
     index: usize,
 ) -> Result<()> {
     app.state.clear_chat_search();
@@ -4706,6 +5054,9 @@ async fn open_chat_at_with_optional_async_loader<
 
     progress.show(app, LOADING_CHAT_MESSAGES_STATUS)?;
     if let Some(loader) = chat_message_loader.as_deref_mut() {
+        if let Some(folder_loader) = folder_chat_loader.as_deref_mut() {
+            folder_loader.cancel_request();
+        }
         loader.spawn_latest_chat_messages(chat_id);
         return Ok(());
     }
@@ -4912,6 +5263,7 @@ async fn execute_context_menu_action<C: TelegramClient + Clone + Send + Sync + '
                 client,
                 progress,
                 &mut loaders.chat_message,
+                &mut loaders.folder_chat,
                 index,
             )
             .await?;
@@ -5039,6 +5391,7 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
                 app,
                 client,
                 progress,
+                &mut loaders.chat_message,
                 &mut loaders.folder_chat,
                 index,
             )
@@ -5057,6 +5410,7 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
                 client,
                 progress,
                 &mut loaders.chat_message,
+                &mut loaders.folder_chat,
                 index,
             )
             .await?;
@@ -5074,6 +5428,7 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
                 client,
                 progress,
                 &mut loaders.chat_message,
+                &mut loaders.folder_chat,
             )
             .await?;
         }
@@ -5111,16 +5466,18 @@ mod tests {
         apply_send_message_result, apply_subscribe_updates_result, apply_update_with_read_ack,
         check_auth_ok_message, check_auth_unauthorized_message, check_config_message,
         check_config_session_status, classify_terminal_event, default_config_path_string,
-        drain_ready_results, ensure_session_parent_dir, handle_input_focused, handle_key_event,
+        discard_deferred_conversation_updates_represented_by_snapshot, drain_ready_results,
+        ensure_session_parent_dir, handle_input_focused, handle_key_event,
         handle_key_event_with_progress, handle_mouse_event, handle_received_update,
-        load_checked_config, load_checked_config_with_session_parent, loaded_read_ack,
-        login_2fa_hint_message, login_2fa_signed_in_message, login_code_sent_message,
-        login_failed_message, login_signed_in_message, message_submit_action_status,
-        older_message_key_navigation, open_chat_at_with_optional_async_loader, parse_args_from,
-        prepare_loop_step, preserve_prompt_input_line_spaces, release_gap_submit_if_ready,
-        require_prompt_line, require_prompt_response, save_app_preferences,
-        save_app_preferences_if_changed, sleep_until_optional, smoke_ok_message,
-        trim_prompt_input_line, validate_config,
+        handle_received_update_with_conversation_load, load_checked_config,
+        load_checked_config_with_session_parent, loaded_read_ack, login_2fa_hint_message,
+        login_2fa_signed_in_message, login_code_sent_message, login_failed_message,
+        login_signed_in_message, message_submit_action_status, older_message_key_navigation,
+        open_chat_at_with_optional_async_loader, open_folder_at_with_optional_async_loader,
+        parse_args_from, prepare_loop_step, preserve_prompt_input_line_spaces,
+        release_gap_submit_if_ready, replay_deferred_conversation_updates, require_prompt_line,
+        require_prompt_response, save_app_preferences, save_app_preferences_if_changed,
+        sleep_until_optional, smoke_ok_message, trim_prompt_input_line, validate_config,
     };
     use crate::app::App;
     use crate::config::telegram::{Config, TelegramConfig};
@@ -5441,8 +5798,327 @@ mod tests {
         assert_eq!(app.state.error_message.as_deref(), Some("queued"));
     }
 
-    #[test]
-    fn reconciliation_applies_snapshot_before_deferred_updates() {
+    #[tokio::test]
+    async fn overlapping_chat_success_then_folder_failure_keeps_one_bounded_ack() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let client = RecordingMarkReadClient {
+            marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads: marked_threads.clone(),
+        };
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation);
+        let mut chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message.clone());
+        chat_loader.latest_request_id = 1;
+        chat_loader.active_open_request.set(Some((1, 1)));
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let mut folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat.clone());
+        folder_loader.latest_request_id = 1;
+        folder_loader.active_request_id.set(Some(1));
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0)];
+        app.state.chats = vec![chat(1)];
+        app.state.begin_conversation_load();
+        let mut incoming = message(5);
+        incoming.chat_id = 1;
+        loop_state.staged_update = Some(Update::NewMessage(incoming.clone()));
+        senders
+            .chat_message
+            .send(ChatMessageLoadResult {
+                request_id: 1,
+                chat_id: 1,
+                topic_id: None,
+                purpose: ChatMessageLoadPurpose::OpenConversation,
+                result: Ok(ChatMessageLoad {
+                    messages: vec![incoming],
+                    thread_topics: Some(Vec::new()),
+                }),
+            })
+            .expect("chat load result receiver should be open");
+        senders
+            .folder_chat
+            .send(FolderChatLoadResult {
+                request_id: 1,
+                folder_index: 0,
+                folder_id: None,
+                result: Err("overlapping folder failed".to_string()),
+            })
+            .expect("folder failure receiver should be open");
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        tokio::task::yield_now().await;
+
+        assert!(loop_state.deferred_conversation_updates.is_empty());
+        assert!(app.state.messages.is_empty());
+        assert_eq!(app.state.chats[0].unread_count, 0);
+        assert_eq!(*marked_chat_ids.lock().unwrap(), vec![1]);
+        assert!(marked_threads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_folder_deferrals_release_once_on_success_and_failure() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let client = RecordingMarkReadClient {
+            marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads: marked_threads.clone(),
+        };
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation);
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let mut folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat.clone());
+        folder_loader.latest_request_id = 1;
+        folder_loader.active_request_id.set(Some(1));
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0)];
+        app.state.chats = vec![chat(1)];
+        app.state.begin_conversation_load();
+        let mut represented = message(5);
+        represented.chat_id = 1;
+        loop_state.staged_update = Some(Update::NewMessage(represented.clone()));
+        senders
+            .folder_chat
+            .send(FolderChatLoadResult {
+                request_id: 1,
+                folder_index: 0,
+                folder_id: None,
+                result: Ok(crate::actions::FolderChatLoad {
+                    chats: vec![chat(1)],
+                    chat_last_message_ids: HashMap::from([(1, 5)]),
+                    messages: Ok(vec![represented]),
+                    thread_topics: Vec::new(),
+                }),
+            })
+            .expect("folder success receiver should be open");
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        tokio::task::yield_now().await;
+        assert!(loop_state.deferred_conversation_updates.is_empty());
+        assert_eq!(
+            app.state
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
+        assert_eq!(*marked_chat_ids.lock().unwrap(), vec![1]);
+
+        folder_loader.latest_request_id = 2;
+        folder_loader.active_request_id.set(Some(2));
+        app.state.clear_loaded_chat_messages();
+        app.state.begin_conversation_load();
+        let mut replayed = message(6);
+        replayed.chat_id = 1;
+        loop_state.staged_update = Some(Update::NewMessage(replayed));
+        senders
+            .folder_chat
+            .send(FolderChatLoadResult {
+                request_id: 2,
+                folder_index: 0,
+                folder_id: None,
+                result: Err("folder unavailable".to_string()),
+            })
+            .expect("folder failure receiver should be open");
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        tokio::task::yield_now().await;
+        assert!(loop_state.deferred_conversation_updates.is_empty());
+        assert_eq!(
+            app.state
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![6]
+        );
+        assert_eq!(*marked_chat_ids.lock().unwrap(), vec![1, 1]);
+        assert!(marked_threads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn folder_high_water_deduplicates_update_after_selection_changes() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let client = RecordingMarkReadClient {
+            marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads: marked_threads.clone(),
+        };
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation);
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let mut folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat.clone());
+        folder_loader.latest_request_id = 1;
+        folder_loader.active_request_id.set(Some(1));
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0)];
+        app.state.chats = vec![chat(1), chat(2)];
+        app.state.selected_chat_index = 1;
+        app.state.begin_conversation_load();
+        let mut incoming = message(5);
+        incoming.chat_id = 2;
+        loop_state.staged_update = Some(Update::NewMessage(incoming));
+        let mut refreshed_chat_two = chat(2);
+        refreshed_chat_two.unread_count = 1;
+        let mut selected_message = message(10);
+        selected_message.chat_id = 1;
+        senders
+            .folder_chat
+            .send(FolderChatLoadResult {
+                request_id: 1,
+                folder_index: 0,
+                folder_id: None,
+                result: Ok(crate::actions::FolderChatLoad {
+                    chats: vec![chat(1), refreshed_chat_two],
+                    chat_last_message_ids: HashMap::from([(1, 10), (2, 5)]),
+                    messages: Ok(vec![selected_message]),
+                    thread_topics: Vec::new(),
+                }),
+            })
+            .expect("folder result receiver should be open");
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        tokio::task::yield_now().await;
+
+        assert!(loop_state.deferred_conversation_updates.is_empty());
+        assert_eq!(app.state.selected_chat_id(), Some(1));
+        assert_eq!(app.state.chats[1].unread_count, 1);
+        assert_eq!(*marked_chat_ids.lock().unwrap(), vec![1]);
+        assert!(marked_threads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn latest_stale_topic_result_releases_owned_deferral() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let client = RecordingMarkReadClient {
+            marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads: marked_threads.clone(),
+        };
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation);
+        let mut chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message.clone());
+        chat_loader.latest_request_id = 1;
+        chat_loader.active_open_request.set(Some((1, 1)));
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        app.state
+            .apply_loaded_selected_chat_thread_topics(vec![thread_topic(101, 0)]);
+        app.state.begin_conversation_load();
+        let mut incoming = message(5);
+        incoming.chat_id = 1;
+        incoming.thread_topic_id = Some(101);
+        loop_state.staged_update = Some(Update::NewMessage(incoming));
+        senders
+            .chat_message
+            .send(ChatMessageLoadResult {
+                request_id: 1,
+                chat_id: 1,
+                topic_id: Some(102),
+                purpose: ChatMessageLoadPurpose::OpenConversation,
+                result: Ok(ChatMessageLoad {
+                    messages: Vec::new(),
+                    thread_topics: None,
+                }),
+            })
+            .expect("stale topic result receiver should be open");
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        tokio::task::yield_now().await;
+
+        assert!(loop_state.deferred_conversation_updates.is_empty());
+        assert_eq!(
+            app.state
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
+        assert!(marked_chat_ids.lock().unwrap().is_empty());
+        assert_eq!(*marked_threads.lock().unwrap(), vec![(1, 101, 5)]);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_applies_snapshot_before_deferred_updates() {
         let (mut loop_state, senders) = EventLoopState::new();
         loop_state.initial_state_pending = false;
         loop_state.reconciliation_pending = true;
@@ -5584,8 +6260,8 @@ mod tests {
         assert!(loop_state.deferred_updates.is_empty());
     }
 
-    #[test]
-    fn stale_reconciliation_replays_deferred_updates_without_new_high_water_filtering() {
+    #[tokio::test]
+    async fn stale_reconciliation_replays_deferred_updates_without_new_high_water_filtering() {
         let (mut loop_state, senders) = EventLoopState::new();
         loop_state.initial_state_pending = false;
         loop_state.reconciliation_pending = true;
@@ -5872,7 +6548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn topic_reconciliation_marks_only_the_selected_thread_read() {
+    async fn topic_reconciliation_preserve_does_not_mark_unseen_snapshot_read() {
         let (mut loop_state, _) = EventLoopState::new();
         loop_state.initial_state_pending = false;
         loop_state.reconciliation_pending = true;
@@ -5927,9 +6603,9 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(marked_chat_ids.lock().unwrap().is_empty());
-        assert_eq!(*marked_threads.lock().unwrap(), vec![(1, 10, 30)]);
-        assert_eq!(app.state.chats[0].unread_count, 3);
-        assert_eq!(app.state.folders[0].unread_count, 3);
+        assert!(marked_threads.lock().unwrap().is_empty());
+        assert_eq!(app.state.chats[0].unread_count, 5);
+        assert_eq!(app.state.folders[0].unread_count, 5);
         assert_eq!(
             app.state
                 .messages
@@ -5938,8 +6614,75 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
-        assert_eq!(app.state.thread_topics[0].unread_count, 0);
+        assert_eq!(app.state.thread_topics[0].unread_count, 2);
         assert_eq!(app.state.thread_topics[1].unread_count, 3);
+    }
+
+    #[tokio::test]
+    async fn topic_reconciliation_replacement_marks_installed_max_read() {
+        let (mut loop_state, _) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        loop_state.reconciliation_pending = true;
+        let mut app = App::new();
+        let mut local_chat = chat(1);
+        local_chat.unread_count = 3;
+        app.state.folders = vec![all_folder(3)];
+        app.state.chats = vec![local_chat];
+        app.state.thread_topics = vec![thread_topic(10, 3)];
+        let mut current = message(1);
+        current.chat_id = 1;
+        current.thread_topic_id = Some(10);
+        app.state.messages = vec![current];
+        let context = app.state.reconciliation_context();
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
+            marked_chat_ids: Arc::clone(&marked_chat_ids),
+            marked_threads: Arc::clone(&marked_threads),
+        });
+        let mut first = message(29);
+        first.chat_id = 1;
+        first.thread_topic_id = Some(10);
+        let mut latest = message(30);
+        latest.chat_id = 1;
+        latest.thread_topic_id = Some(10);
+        let mut refreshed_chat = chat(1);
+        refreshed_chat.unread_count = 5;
+
+        assert!(apply_reconciliation_result(
+            &mut app,
+            ReconciliationResult {
+                request_id: 0,
+                context,
+                result: Ok(ReconciliationSnapshot {
+                    folders: vec![all_folder(5)],
+                    selected_folder_id: Some(0),
+                    chats: vec![refreshed_chat],
+                    chat_last_message_ids: Default::default(),
+                    selected_chat_id: Some(1),
+                    thread_topics: vec![thread_topic(10, 2)],
+                    selected_topic_id: Some(10),
+                    messages: vec![first, latest],
+                }),
+            },
+            0,
+            &mut loop_state,
+            &mark_read_loader,
+        ));
+        tokio::task::yield_now().await;
+
+        assert!(marked_chat_ids.lock().unwrap().is_empty());
+        assert_eq!(*marked_threads.lock().unwrap(), vec![(1, 10, 30)]);
+        assert_eq!(
+            app.state
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![29, 30]
+        );
+        assert_eq!(app.state.thread_topics[0].unread_count, 0);
+        assert_eq!(app.state.chats[0].unread_count, 3);
     }
 
     #[tokio::test(start_paused = true)]
@@ -6405,6 +7148,14 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_chat_read_through(&self, chat_id: i64, _max_message_id: i32) -> Result<()> {
+            self.marked_chat_ids
+                .lock()
+                .expect("marked chat ids lock should not be poisoned")
+                .push(chat_id);
+            Ok(())
+        }
+
         async fn mark_thread_read(
             &self,
             chat_id: i64,
@@ -6542,7 +7293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_chat_message_load_marks_read_only_when_unread() {
+    async fn accepted_chat_message_load_marks_displayed_max_even_if_local_unread_is_zero() {
         let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
         let marked_threads = Arc::new(Mutex::new(Vec::new()));
         let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
@@ -6570,11 +7321,12 @@ mod tests {
             &mark_read_loader,
         );
         tokio::task::yield_now().await;
-        assert!(
+        assert_eq!(
             marked_chat_ids
                 .lock()
                 .expect("marked chat ids lock should not be poisoned")
-                .is_empty()
+                .as_slice(),
+            &[1]
         );
 
         app.state.chats[0].unread_count = 5;
@@ -6601,7 +7353,7 @@ mod tests {
                 .lock()
                 .expect("marked chat ids lock should not be poisoned")
                 .as_slice(),
-            &[1]
+            &[1, 1]
         );
         assert!(
             marked_threads
@@ -6717,6 +7469,166 @@ mod tests {
                 .as_slice(),
             &[(1, 102, 55)]
         );
+    }
+
+    #[tokio::test]
+    async fn live_incoming_selected_chat_tail_marks_chat_read() {
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
+            marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads: marked_threads.clone(),
+        });
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+
+        let mut incoming = message(57);
+        incoming.chat_id = 1;
+        apply_update_with_read_ack(&mut app, Update::NewMessage(incoming), &mark_read_loader);
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            app.state.selected_message().map(|message| message.id),
+            Some(57)
+        );
+        assert_eq!(*marked_chat_ids.lock().unwrap(), vec![1]);
+        assert!(marked_threads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_incoming_while_reading_older_stays_unread_without_ack() {
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
+            marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads: marked_threads.clone(),
+        });
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0)];
+        app.state.chats = vec![chat(1)];
+        app.state.messages = vec![message(1), message(2)];
+        for message in &mut app.state.messages {
+            message.chat_id = 1;
+        }
+        app.state.selected_message_index = 0;
+
+        let mut incoming = message(3);
+        incoming.chat_id = 1;
+        apply_update_with_read_ack(&mut app, Update::NewMessage(incoming), &mark_read_loader);
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            app.state.selected_message().map(|message| message.id),
+            Some(1)
+        );
+        assert_eq!(app.state.chats[0].unread_count, 1);
+        assert!(marked_chat_ids.lock().unwrap().is_empty());
+        assert!(marked_threads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_incoming_topic_across_gap_is_omitted_unread_and_unacknowledged() {
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
+            marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads: marked_threads.clone(),
+        });
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0)];
+        app.state.chats = vec![chat(1)];
+        app.state
+            .apply_loaded_selected_chat_thread_topics(vec![thread_topic(102, 0)]);
+        app.state.messages = (1..=500)
+            .map(|id| {
+                let mut message = message(id);
+                message.chat_id = 1;
+                message.thread_topic_id = Some(102);
+                message
+            })
+            .collect();
+        app.state.selected_message_index = 0;
+        let mut opens_gap = message(501);
+        opens_gap.chat_id = 1;
+        opens_gap.thread_topic_id = Some(102);
+        app.state.apply_update(Update::NewMessage(opens_gap));
+        assert!(app.state.newer_history_gap());
+
+        let mut omitted = message(502);
+        omitted.chat_id = 1;
+        omitted.thread_topic_id = Some(102);
+        apply_update_with_read_ack(&mut app, Update::NewMessage(omitted), &mark_read_loader);
+        tokio::task::yield_now().await;
+
+        assert!(!app.state.messages.iter().any(|message| message.id == 502));
+        assert_eq!(app.state.thread_topics[0].unread_count, 2);
+        assert_eq!(app.state.chats[0].unread_count, 2);
+        assert!(marked_chat_ids.lock().unwrap().is_empty());
+        assert!(marked_threads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn topic_update_during_forum_open_waits_for_resolved_scope() {
+        let (mut loop_state, _) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let mark_read_loader = MarkChatReadLoader::new(RecordingMarkReadClient {
+            marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads: marked_threads.clone(),
+        });
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0)];
+        app.state.chats = vec![chat(1)];
+        app.state.chats[0].unread_count = 1;
+        app.state.begin_conversation_load();
+        let mut incoming = message(102);
+        incoming.chat_id = 1;
+        incoming.thread_topic_id = Some(102);
+
+        assert!(!handle_received_update_with_conversation_load(
+            &mut loop_state,
+            &mut app,
+            Update::NewMessage(incoming),
+            &mark_read_loader,
+            true,
+        ));
+        assert_eq!(loop_state.deferred_conversation_updates.len(), 1);
+        assert!(app.state.messages.is_empty());
+
+        assert!(apply_chat_message_load_result(
+            &mut app,
+            1,
+            ChatMessageLoadResult {
+                request_id: 1,
+                chat_id: 1,
+                topic_id: Some(101),
+                purpose: ChatMessageLoadPurpose::OpenConversation,
+                result: Ok(ChatMessageLoad {
+                    messages: Vec::new(),
+                    thread_topics: Some(vec![thread_topic(101, 0), thread_topic(102, 1)]),
+                }),
+            },
+            &mark_read_loader,
+        ));
+        discard_deferred_conversation_updates_represented_by_snapshot(&mut loop_state, &app, None);
+        assert!(!replay_deferred_conversation_updates(
+            &mut loop_state,
+            &mut app,
+            &mark_read_loader,
+        ));
+        tokio::task::yield_now().await;
+
+        assert!(loop_state.deferred_updates.is_empty());
+        assert!(app.state.messages.is_empty());
+        assert_eq!(
+            app.state.selected_thread_topic().map(|topic| topic.id),
+            Some(101)
+        );
+        assert_eq!(app.state.thread_topics[1].unread_count, 1);
+        assert_eq!(app.state.chats[0].unread_count, 1);
+        assert!(marked_chat_ids.lock().unwrap().is_empty());
+        assert!(marked_threads.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -7259,10 +8171,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_and_folder_opens_keep_selected_conversation_owner_exclusive() {
+        let (_loop_state, senders) = EventLoopState::new();
+        let mut chat_loader =
+            ChatMessageLoader::new(MockTelegramClient::new(), senders.chat_message);
+        let mut folder_loader =
+            FolderChatLoader::new(MockTelegramClient::new(), senders.folder_chat);
+        folder_loader.latest_request_id = 1;
+        folder_loader.active_request_id.set(Some(1));
+        let mut chat_loader_ref = Some(&mut chat_loader);
+        let mut folder_loader_ref = Some(&mut folder_loader);
+        let mut client = MockTelegramClient::new();
+        let mut progress = UiProgress::Silent;
+        let mut app = App::new();
+        app.state.folders = vec![all_folder(0), folder(2, "Personal")];
+        app.state.chats = vec![chat(1), chat(2)];
+
+        open_chat_at_with_optional_async_loader(
+            &mut app,
+            &mut client,
+            &mut progress,
+            &mut chat_loader_ref,
+            &mut folder_loader_ref,
+            1,
+        )
+        .await
+        .expect("chat open should succeed");
+
+        assert!(!folder_loader_ref.as_ref().unwrap().has_active_request());
+        assert!(chat_loader_ref.as_ref().unwrap().has_active_open_for(2));
+
+        let mark_read_loader = MarkChatReadLoader::new(MockTelegramClient::new());
+        assert!(!apply_folder_chat_load_result(
+            &mut app,
+            folder_loader_ref.as_ref().unwrap().latest_request_id(),
+            FolderChatLoadResult {
+                request_id: 1,
+                folder_index: 0,
+                folder_id: None,
+                result: Ok(crate::actions::FolderChatLoad {
+                    chats: vec![chat(99)],
+                    chat_last_message_ids: HashMap::new(),
+                    messages: Ok(Vec::new()),
+                    thread_topics: Vec::new(),
+                }),
+            },
+            &mark_read_loader,
+        ));
+        assert_eq!(app.state.selected_chat_id(), Some(2));
+        let canceled_chat_request_id = chat_loader_ref.as_ref().unwrap().latest_request_id();
+
+        open_folder_at_with_optional_async_loader(
+            &mut app,
+            &mut client,
+            &mut progress,
+            &mut chat_loader_ref,
+            &mut folder_loader_ref,
+            1,
+        )
+        .await
+        .expect("folder open should succeed");
+
+        assert!(!chat_loader_ref.as_ref().unwrap().has_active_open_for(2));
+        assert!(folder_loader_ref.as_ref().unwrap().has_active_request());
+
+        app.state.chats = vec![chat(2)];
+        app.state.reset_chat_selection();
+        app.state.begin_conversation_load();
+        assert!(!apply_chat_message_load_result(
+            &mut app,
+            chat_loader_ref.as_ref().unwrap().latest_request_id(),
+            ChatMessageLoadResult {
+                request_id: canceled_chat_request_id,
+                chat_id: 2,
+                topic_id: None,
+                purpose: ChatMessageLoadPurpose::OpenConversation,
+                result: Ok(ChatMessageLoad {
+                    messages: vec![message(5)],
+                    thread_topics: Some(Vec::new()),
+                }),
+            },
+            &mark_read_loader,
+        ));
+        assert!(app.state.messages.is_empty());
+    }
+
+    #[tokio::test]
     async fn async_noop_chat_open_does_not_spawn_message_load() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut loader = ChatMessageLoader::new(MockTelegramClient::new(), tx);
         let mut loader_ref = Some(&mut loader);
+        let mut folder_loader_ref = None;
         let mut client = MockTelegramClient::new();
         let mut progress = UiProgress::Silent;
         let mut app = App::new();
@@ -7275,6 +8274,7 @@ mod tests {
             &mut client,
             &mut progress,
             &mut loader_ref,
+            &mut folder_loader_ref,
             0,
         )
         .await
@@ -7654,6 +8654,7 @@ mod tests {
                 folder_id: Some(2),
                 result: Ok(crate::actions::FolderChatLoad {
                     chats: vec![chat(99)],
+                    chat_last_message_ids: HashMap::new(),
                     messages: Ok(Vec::new()),
                     thread_topics: Vec::new(),
                 }),
@@ -7673,6 +8674,7 @@ mod tests {
                 folder_id: Some(2),
                 result: Ok(crate::actions::FolderChatLoad {
                     chats: vec![chat(2)],
+                    chat_last_message_ids: HashMap::from([(2, 1)]),
                     messages: Ok(vec![loaded_message]),
                     thread_topics: Vec::new(),
                 }),

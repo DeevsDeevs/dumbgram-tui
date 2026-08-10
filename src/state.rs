@@ -337,6 +337,13 @@ pub enum ReconciliationApply {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentedIncomingMessage {
+    pub chat_id: i64,
+    pub topic_id: Option<i32>,
+    pub message_id: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrependMessagesResult {
     pub added: usize,
     pub had_unique_messages: bool,
@@ -1202,17 +1209,18 @@ impl AppState {
     }
 
     pub fn apply_loaded_selected_chat_messages(&mut self, messages: Vec<Message>) {
-        self.apply_selected_chat_message_replacement(messages, false);
+        self.apply_selected_chat_message_replacement(messages, false, true);
     }
 
     pub fn apply_refreshed_selected_chat_messages(&mut self, messages: Vec<Message>) {
-        self.apply_selected_chat_message_replacement(messages, true);
+        self.apply_selected_chat_message_replacement(messages, true, false);
     }
 
     fn apply_selected_chat_message_replacement(
         &mut self,
         messages: Vec<Message>,
         preserve_current_input: bool,
+        preserve_newer_remote_rows: bool,
     ) {
         let current_input = preserve_current_input.then(|| {
             (
@@ -1232,12 +1240,35 @@ impl AppState {
                     message.status,
                     MessageStatus::Sending | MessageStatus::Failed
                 ) && Some(message.chat_id) == selected_chat_id
-                    && selected_topic_id
-                        .is_none_or(|topic_id| message.thread_topic_id == Some(topic_id))
+                    && message.thread_topic_id == selected_topic_id
             })
             .cloned()
             .collect::<Vec<_>>();
+        let fetched_max_message_id = messages.iter().map(|message| message.id).max();
+        let newer_remote_rows = if preserve_newer_remote_rows {
+            self.messages
+                .iter()
+                .filter(|message| {
+                    Self::is_remote_message(message)
+                        && Some(message.chat_id) == selected_chat_id
+                        && message.thread_topic_id == selected_topic_id
+                        && fetched_max_message_id.is_none_or(|max_id| message.id > max_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         self.messages = messages;
+        for message in newer_remote_rows {
+            if !self
+                .messages
+                .iter()
+                .any(|existing| existing.chat_id == message.chat_id && existing.id == message.id)
+            {
+                self.insert_remote_message_ordered(message);
+            }
+        }
         self.retain_newest_remote_messages();
         for local in local_rows {
             if !self.messages.iter().any(|message| message.id == local.id) {
@@ -1688,7 +1719,7 @@ impl AppState {
         self.thread_topics.get(self.selected_thread_topic_index)
     }
 
-    fn reconcile_thread_topic_unread_for_message(&mut self, message: &Message) {
+    fn reconcile_thread_topic_unread_for_message(&mut self, message: &Message, presented: bool) {
         let Some(topic_id) = message.thread_topic_id else {
             return;
         };
@@ -1701,7 +1732,7 @@ impl AppState {
         };
 
         let topic = &mut self.thread_topics[topic_index];
-        if topic_index == self.selected_thread_topic_index {
+        if topic_index == self.selected_thread_topic_index && presented {
             topic.unread_count = 0;
         } else if !message.is_own {
             topic.unread_count += 1;
@@ -2165,9 +2196,7 @@ impl AppState {
             self.messages = snapshot.messages;
             for local in local_rows {
                 if Some(local.chat_id) == snapshot.selected_chat_id
-                    && snapshot
-                        .selected_topic_id
-                        .is_none_or(|topic_id| local.thread_topic_id == Some(topic_id))
+                    && local.thread_topic_id == snapshot.selected_topic_id
                     && !self.messages.iter().any(|current| current.id == local.id)
                 {
                     self.messages.push(local);
@@ -2207,7 +2236,9 @@ impl AppState {
         } else {
             focused_panel
         };
-        self.clear_selected_conversation_unread(snapshot.selected_topic_id);
+        if !preserve_conversation {
+            self.clear_selected_conversation_unread(snapshot.selected_topic_id);
+        }
 
         ReconciliationApply::Applied {
             conversation_replaced: !preserve_conversation,
@@ -2311,13 +2342,13 @@ impl AppState {
         }
     }
 
-    pub fn apply_update(&mut self, update: Update) {
+    pub fn apply_update(&mut self, update: Update) -> Option<PresentedIncomingMessage> {
+        let mut presented_incoming = None;
         match update {
             Update::NewMessage(msg) => {
                 let current_chat_id = self.chats.get(self.selected_chat_index).map(|c| c.id);
                 let selected_thread_topic_id = self.selected_thread_topic().map(|topic| topic.id);
-                let matches_selected_thread_topic = selected_thread_topic_id
-                    .is_none_or(|topic_id| msg.thread_topic_id == Some(topic_id));
+                let matches_selected_thread_topic = msg.thread_topic_id == selected_thread_topic_id;
                 let should_append_to_loaded_messages =
                     current_chat_id == Some(msg.chat_id) && matches_selected_thread_topic;
                 if should_append_to_loaded_messages
@@ -2335,7 +2366,7 @@ impl AppState {
                             self.messages.len()
                         ),
                     );
-                    return;
+                    return None;
                 }
 
                 self.clear_typing_user(msg.chat_id, &msg.sender_name);
@@ -2345,8 +2376,19 @@ impl AppState {
                     self.clear_thread_typing_user_for_chat(msg.chat_id, &msg.sender_name);
                 }
 
-                if should_append_to_loaded_messages {
-                    self.append_remote_message_with_retention(msg.clone());
+                let was_following_tail = should_append_to_loaded_messages
+                    && !self.newer_history_gap
+                    && (self.messages.is_empty() || self.selected_message_is_last());
+                let retained = should_append_to_loaded_messages
+                    && self.append_remote_message_with_retention(msg.clone());
+                let presented = !msg.is_own && retained && was_following_tail;
+                if presented {
+                    self.select_message_by_identity(msg.chat_id, msg.id);
+                    presented_incoming = Some(PresentedIncomingMessage {
+                        chat_id: msg.chat_id,
+                        topic_id: msg.thread_topic_id,
+                        message_id: msg.id,
+                    });
                 }
 
                 let selected_topic_unread = selected_thread_topic_id
@@ -2359,7 +2401,7 @@ impl AppState {
                     })
                     .unwrap_or(0);
                 if current_chat_id == Some(msg.chat_id) {
-                    self.reconcile_thread_topic_unread_for_message(&msg);
+                    self.reconcile_thread_topic_unread_for_message(&msg, presented);
                 }
 
                 if let Some(chat) = self.chats.iter_mut().find(|c| c.id == msg.chat_id) {
@@ -2367,13 +2409,17 @@ impl AppState {
                         Some(message_display_preview(msg.media.as_ref(), &msg.content));
                     if current_chat_id == Some(msg.chat_id) {
                         match selected_thread_topic_id {
-                            Some(topic_id) if msg.thread_topic_id == Some(topic_id) => {
+                            Some(topic_id)
+                                if msg.thread_topic_id == Some(topic_id) && presented =>
+                            {
                                 chat.unread_count =
                                     chat.unread_count.saturating_sub(selected_topic_unread);
                             }
                             Some(_) if !msg.is_own => chat.unread_count += 1,
                             Some(_) => {}
-                            None => chat.unread_count = 0,
+                            None if presented => chat.unread_count = 0,
+                            None if !msg.is_own => chat.unread_count += 1,
+                            None => {}
                         }
                     } else if !msg.is_own {
                         chat.unread_count += 1;
@@ -2475,6 +2521,7 @@ impl AppState {
             }
             Update::Error(error) => self.set_error(error),
         }
+        presented_incoming
     }
 
     pub fn selected_typing_users(&self) -> Option<&Vec<String>> {
@@ -3044,7 +3091,7 @@ impl AppState {
         }
         if self.selected_chat_id() == Some(chat_id) {
             let selected_topic_id = self.selected_thread_topic().map(|topic| topic.id);
-            if selected_topic_id.is_none() || selected_topic_id == sent_topic_id {
+            if selected_topic_id == sent_topic_id {
                 self.clear_selected_conversation_unread(selected_topic_id);
             }
         }
@@ -3189,11 +3236,11 @@ mod tests {
         MAX_REMOTE_MESSAGES, MAX_SPLIT_RATIO, MESSAGE_DELETED_STATUS, MESSAGE_EDITED_STATUS,
         MESSAGE_ROW_HEIGHT, MIN_SPLIT_RATIO, MessageSubmitAction, NO_CHAT_SELECTED_ERROR,
         NOTIFICATION_LIFETIME, PANEL_BORDER_RESERVED_COLUMNS, PANEL_BORDER_RESERVED_ROWS,
-        REMOTE_EDIT_WHILE_EDITING_STATUS, REPLY_MESSAGE_ROW_HEIGHT, REPLY_SENT_STATUS,
-        ReconciliationApply, ReconciliationSnapshot, SPLIT_RATIO_STEP, TYPING_ACTION_COOLDOWN,
-        delete_failed_error, delete_update_matches_chat, edit_failed_error, last_index,
-        message_visible_row_height, message_visible_row_height_for_width, reply_failed_error,
-        send_failed_error,
+        PresentedIncomingMessage, REMOTE_EDIT_WHILE_EDITING_STATUS, REPLY_MESSAGE_ROW_HEIGHT,
+        REPLY_SENT_STATUS, ReconciliationApply, ReconciliationSnapshot, SPLIT_RATIO_STEP,
+        TYPING_ACTION_COOLDOWN, delete_failed_error, delete_update_matches_chat, edit_failed_error,
+        last_index, message_visible_row_height, message_visible_row_height_for_width,
+        reply_failed_error, send_failed_error,
     };
     use crate::telegram::types::{
         Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, ThreadTopic,
@@ -3473,19 +3520,68 @@ mod tests {
         ];
         state.selected_chat_index = 0;
 
-        state.apply_update(Update::NewMessage(update_message(
+        let presented = state.apply_update(Update::NewMessage(update_message(
             10,
             1,
             "open chat",
             false,
         )));
 
+        assert_eq!(
+            presented,
+            Some(PresentedIncomingMessage {
+                chat_id: 1,
+                topic_id: None,
+                message_id: 10,
+            })
+        );
         assert_eq!(state.chats[0].unread_count, 0);
         assert_eq!(state.folders[0].unread_count, 0);
         assert_eq!(state.folders[1].unread_count, 0);
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].content, "open chat");
         assert_eq!(state.chats[0].last_message.as_deref(), Some("open chat"));
+    }
+
+    #[test]
+    fn incoming_message_while_reading_older_is_unread_and_not_presented() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(0)];
+        state.chats = vec![chat_with_unread(1, "Chat 1", 0, None)];
+        state.messages = vec![
+            update_message(10, 1, "older", false),
+            update_message(20, 1, "tail", false),
+        ];
+        state.selected_message_index = 0;
+
+        let presented = state.apply_update(Update::NewMessage(update_message(
+            30,
+            1,
+            "new unread",
+            false,
+        )));
+
+        assert_eq!(presented, None);
+        assert_eq!(state.selected_message().map(|message| message.id), Some(10));
+        assert!(state.messages.iter().any(|message| message.id == 30));
+        assert_eq!(state.chats[0].unread_count, 1);
+    }
+
+    #[test]
+    fn incoming_message_across_newer_gap_is_omitted_and_unread() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(0)];
+        state.chats = vec![chat_with_unread(1, "Chat 1", 0, None)];
+        state.messages = vec![update_message(10, 1, "older", false)];
+        state.newer_history_gap = true;
+
+        let presented =
+            state.apply_update(Update::NewMessage(update_message(30, 1, "hidden", false)));
+
+        assert_eq!(presented, None);
+        assert!(!state.messages.iter().any(|message| message.id == 30));
+        assert_eq!(state.chats[0].unread_count, 1);
+        assert!(state.newer_history_gap());
     }
 
     #[test]
@@ -3569,6 +3665,22 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_forum_scope_never_presents_topic_message_as_chat_wide() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(0)];
+        state.chats = vec![chat(1, "Forum")];
+        state.begin_conversation_load();
+        let mut topic_message = update_message(12, 1, "unresolved topic", false);
+        topic_message.thread_topic_id = Some(101);
+
+        let presented = state.apply_update(Update::NewMessage(topic_message));
+
+        assert_eq!(presented, None);
+        assert!(state.messages.is_empty());
+        assert_eq!(state.chats[0].unread_count, 1);
+    }
+
+    #[test]
     fn incoming_message_for_other_thread_does_not_append_to_selected_thread_view() {
         let mut state = AppState::new();
         state.chats = vec![chat(1, "Forum")];
@@ -3601,8 +3713,16 @@ mod tests {
 
         let mut topic_message = update_message(12, 1, "selected topic update", false);
         topic_message.thread_topic_id = Some(101);
-        state.apply_update(Update::NewMessage(topic_message));
+        let presented = state.apply_update(Update::NewMessage(topic_message));
 
+        assert_eq!(
+            presented,
+            Some(PresentedIncomingMessage {
+                chat_id: 1,
+                topic_id: Some(101),
+                message_id: 12,
+            })
+        );
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].content, "selected topic update");
         assert_eq!(state.chats[0].unread_count, 0);
@@ -4539,6 +4659,22 @@ mod tests {
         assert_eq!(state.folders[0].unread_count, 3);
         assert_eq!(state.thread_topics[0].unread_count, 0);
         assert_eq!(state.thread_topics[1].unread_count, 3);
+    }
+
+    #[test]
+    fn unresolved_scope_send_success_does_not_clear_chat_unread() {
+        let mut state = state_with_chats();
+        state.chats[0].unread_count = 5;
+        state.folders = vec![all_folder(5)];
+        state.apply_send_pending(-1, 10, Some(101), "topic send".to_string());
+        let mut sent_message = update_message(42, 10, "topic send", true);
+        sent_message.thread_topic_id = Some(101);
+        sent_message.status = MessageStatus::Sent;
+
+        state.apply_send_success(-1, sent_message);
+
+        assert_eq!(state.chats[0].unread_count, 5);
+        assert_eq!(state.folders[0].unread_count, 5);
     }
 
     #[test]
@@ -5544,11 +5680,33 @@ mod tests {
     }
 
     #[test]
+    fn open_snapshot_preserves_newer_live_tail_once_under_cap() {
+        let mut state = state_with_chats();
+        state.messages = vec![message(501)];
+
+        state.apply_loaded_selected_chat_messages(
+            (1..=MAX_REMOTE_MESSAGES as i32).map(message).collect(),
+        );
+
+        assert_eq!(state.remote_message_count(), MAX_REMOTE_MESSAGES);
+        assert_eq!(state.messages.first().map(|message| message.id), Some(2));
+        assert_eq!(state.messages.last().map(|message| message.id), Some(501));
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|message| message.id == 501)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn streaming_retention_preserves_reader_anchor_then_records_newer_gap() {
         let mut state = state_with_chats();
         state.messages = (1..=MAX_REMOTE_MESSAGES as i32).map(message).collect();
-        state.selected_message_index = MAX_REMOTE_MESSAGES - 1;
-        state.message_scroll_offset = MAX_REMOTE_MESSAGES - 10;
+        state.selected_message_index = 249;
+        state.message_scroll_offset = 240;
 
         for id in (MAX_REMOTE_MESSAGES as i32 + 1)..=10_000 {
             state.apply_update(Update::NewMessage(message(id)));
@@ -5557,14 +5715,14 @@ mod tests {
         assert_eq!(state.remote_message_count(), MAX_REMOTE_MESSAGES);
         assert_eq!(
             state.selected_message().map(|message| message.id),
-            Some(500)
+            Some(250)
         );
         assert_eq!(
             state
                 .messages
                 .get(state.message_scroll_offset)
                 .map(|message| message.id),
-            Some(491)
+            Some(241)
         );
         assert!(state.newer_history_gap());
         assert_eq!(
@@ -5845,6 +6003,8 @@ mod tests {
 
         let mut refreshed_chat = chat_with_unread(20, "Work renamed", 3, Some(2));
         refreshed_chat.last_message = Some("new server preview".to_string());
+        let mut refreshed_topic = thread_topic(100, "General renamed");
+        refreshed_topic.unread_count = 2;
         let mut latest = message(9);
         latest.chat_id = 20;
         latest.thread_topic_id = Some(100);
@@ -5856,7 +6016,7 @@ mod tests {
                 chats: vec![refreshed_chat],
                 chat_last_message_ids: Default::default(),
                 selected_chat_id: Some(20),
-                thread_topics: vec![thread_topic(100, "General renamed")],
+                thread_topics: vec![refreshed_topic],
                 selected_topic_id: Some(100),
                 messages: vec![latest],
             },
@@ -5881,6 +6041,9 @@ mod tests {
         assert_eq!(state.focused_panel, FocusedPanel::Messages);
         assert_eq!(state.input_buffer, "preserved draft");
         assert_eq!(state.chat_search_query.as_deref(), Some("work"));
+        assert_eq!(state.chats[0].unread_count, 3);
+        assert_eq!(state.thread_topics[0].unread_count, 2);
+        assert_eq!(state.folders[0].unread_count, 3);
     }
 
     #[test]

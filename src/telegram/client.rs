@@ -39,9 +39,16 @@ pub trait TelegramClient {
         Self: Sync,
     {
         async move {
+            let chats = self.get_chats(folder_id, limit).await?;
+            let mut last_message_ids = HashMap::new();
+            for chat in &chats {
+                if let Some(message) = self.get_messages(chat.id, 1).await?.first() {
+                    last_message_ids.insert(chat.id, message.id);
+                }
+            }
             Ok(ReconciliationChatList {
-                chats: self.get_chats(folder_id, limit).await?,
-                last_message_ids: HashMap::new(),
+                chats,
+                last_message_ids,
             })
         }
     }
@@ -55,6 +62,13 @@ pub trait TelegramClient {
     fn mark_chat_read(
         &self,
         _chat_id: i64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        async move { Ok(()) }
+    }
+    fn mark_chat_read_through(
+        &self,
+        _chat_id: i64,
+        _max_message_id: i32,
     ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
         async move { Ok(()) }
     }
@@ -79,6 +93,13 @@ pub trait TelegramClient {
         _limit: usize,
     ) -> impl std::future::Future<Output = Result<Vec<ThreadTopic>>> + Send + '_ {
         async move { Ok(Vec::new()) }
+    }
+    fn get_thread_topic(
+        &self,
+        _chat_id: i64,
+        _topic_id: i32,
+    ) -> impl std::future::Future<Output = Result<Option<ThreadTopic>>> + Send + '_ {
+        async move { Ok(None) }
     }
     fn get_thread_messages(
         &self,
