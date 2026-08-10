@@ -19,6 +19,7 @@ A small terminal Telegram client written in Rust with Ratatui/Crossterm and Gram
 - Telegram folder names are best-effort from dialog filters/folder metadata; folder-rule editing is not implemented.
 - Photo/image messages are shown with text placeholders such as `[photo]`. In Ghostty/Kitty-compatible terminals, selected downloaded thumbnails are also displayed with the Kitty graphics protocol. Full media browser controls, multi-account support, and server-side search are not implemented.
 - Some Telegram delete updates do not include enough context to identify the chat precisely.
+- Focus-aware read acknowledgements require terminal focus-event support; terminals that do not report focus changes cannot distinguish a background window.
 
 ## Setup
 

@@ -26,6 +26,14 @@ const CHAT_LIST_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const CHAT_LIST_LOAD_TIMEOUT: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
+pub(crate) const COMPLETE_CONVERSATION_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub(crate) const COMPLETE_CONVERSATION_LOAD_TIMEOUT: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
+pub(crate) const INITIAL_STATE_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub(crate) const INITIAL_STATE_LOAD_TIMEOUT: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
 const MARK_CHAT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const MARK_CHAT_READ_TIMEOUT: Duration = Duration::from_millis(10);
@@ -43,6 +51,8 @@ pub(crate) const OLDER_MESSAGES_RETAINED_WINDOW_STATUS: &str =
 pub(crate) const LOAD_MESSAGES_TIMED_OUT_STATUS: &str = "Load messages timed out";
 pub(crate) const LOAD_OLDER_MESSAGES_TIMED_OUT_STATUS: &str = "Load older messages timed out";
 pub(crate) const LOAD_CHATS_TIMED_OUT_STATUS: &str = "Load chats timed out";
+pub(crate) const LOAD_INITIAL_STATE_TIMED_OUT_STATUS: &str = "Initial load timed out";
+pub(crate) const LOAD_CONVERSATION_TIMED_OUT_STATUS: &str = "Conversation load timed out";
 pub(crate) const LOAD_OLDER_MESSAGES_FAILED_PREFIX: &str = "Load older messages failed";
 pub(crate) const DOWNLOAD_MEDIA_FAILED_PREFIX: &str = "Download media failed";
 
@@ -139,7 +149,7 @@ pub fn apply_delete_message_result(
 ) {
     match result {
         Ok(_) => state.apply_delete_success(confirmation),
-        Err(error) => state.apply_delete_failure(error),
+        Err(error) => state.apply_delete_failure(confirmation, error),
     }
 }
 
@@ -377,11 +387,24 @@ pub async fn fetch_chat_thread_topics<C: TelegramClient>(
         format!("chat_id={chat_id} limit={CHAT_THREAD_TOPIC_PAGE_SIZE}"),
     );
     let started = Instant::now();
-    match client
-        .get_thread_topics(chat_id, CHAT_THREAD_TOPIC_PAGE_SIZE)
-        .await
+    match tokio::time::timeout(
+        MESSAGE_LOAD_TIMEOUT,
+        client.get_thread_topics(chat_id, CHAT_THREAD_TOPIC_PAGE_SIZE),
+    )
+    .await
     {
-        Ok(thread_topics) => {
+        Err(_) => {
+            diagnostics::event(
+                "thread_topics_load_timeout",
+                format!(
+                    "chat_id={chat_id} elapsed_ms={} timeout_ms={}",
+                    started.elapsed().as_millis(),
+                    MESSAGE_LOAD_TIMEOUT.as_millis()
+                ),
+            );
+            Err(LOAD_CONVERSATION_TIMED_OUT_STATUS.to_string())
+        }
+        Ok(Ok(thread_topics)) => {
             diagnostics::event(
                 "thread_topics_load_finish",
                 format!(
@@ -392,7 +415,7 @@ pub async fn fetch_chat_thread_topics<C: TelegramClient>(
             );
             Ok(thread_topics)
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             diagnostics::event(
                 "thread_topics_load_error",
                 format!(
@@ -472,7 +495,9 @@ pub async fn load_selected_thread_topic_messages<C: TelegramClient>(
         Ok(messages) => {
             let max_message_id = messages.iter().map(|message| message.id).max();
             state.apply_loaded_selected_chat_messages(messages);
-            if let Some(max_message_id) = max_message_id {
+            if state.terminal_focused()
+                && let Some(max_message_id) = max_message_id
+            {
                 mark_thread_read_best_effort(client, chat_id, topic_id, max_message_id).await;
             }
         }
@@ -512,6 +537,9 @@ pub async fn load_selected_chat_messages<C: TelegramClient>(
                         let max_message_id = messages.iter().map(|message| message.id).max();
                         state.apply_loaded_selected_chat_thread_topics(thread_topics);
                         state.apply_loaded_selected_chat_messages(messages);
+                        if !state.terminal_focused() {
+                            return Ok(());
+                        }
                         match (topic_id, max_message_id) {
                             (Some(topic_id), Some(max_message_id)) => {
                                 mark_thread_read_best_effort(
@@ -705,6 +733,26 @@ fn folder_filter_id(folder: &Folder) -> Option<i32> {
 }
 
 pub async fn fetch_initial_state<C: TelegramClient + Sync>(
+    client: &C,
+) -> std::result::Result<InitialStateLoad, String> {
+    match tokio::time::timeout(
+        INITIAL_STATE_LOAD_TIMEOUT,
+        fetch_initial_state_inner(client),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            diagnostics::event(
+                "initial_load_timeout",
+                format!("timeout_ms={}", INITIAL_STATE_LOAD_TIMEOUT.as_millis()),
+            );
+            Err(LOAD_INITIAL_STATE_TIMED_OUT_STATUS.to_string())
+        }
+    }
+}
+
+async fn fetch_initial_state_inner<C: TelegramClient + Sync>(
     client: &C,
 ) -> std::result::Result<InitialStateLoad, String> {
     diagnostics::event(
@@ -939,6 +987,30 @@ pub struct FolderChatLoad {
 }
 
 pub async fn fetch_folder_chats_and_selected_messages<C: TelegramClient + Sync>(
+    client: &C,
+    folder_id: Option<i32>,
+) -> std::result::Result<FolderChatLoad, String> {
+    match tokio::time::timeout(
+        COMPLETE_CONVERSATION_LOAD_TIMEOUT,
+        fetch_folder_chats_and_selected_messages_inner(client, folder_id),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            diagnostics::event(
+                "folder_conversation_load_timeout",
+                format!(
+                    "folder_id={folder_id:?} timeout_ms={}",
+                    COMPLETE_CONVERSATION_LOAD_TIMEOUT.as_millis()
+                ),
+            );
+            Err(LOAD_CONVERSATION_TIMED_OUT_STATUS.to_string())
+        }
+    }
+}
+
+async fn fetch_folder_chats_and_selected_messages_inner<C: TelegramClient + Sync>(
     client: &C,
     folder_id: Option<i32>,
 ) -> std::result::Result<FolderChatLoad, String> {
@@ -1255,14 +1327,15 @@ pub async fn finish_send_message<C: TelegramClient>(
 #[cfg(test)]
 mod tests {
     use super::{
-        LOAD_CHATS_TIMED_OUT_STATUS, NO_OLDER_MESSAGES_STATUS, apply_initial_state_load_result,
-        begin_open_chat_at, begin_open_folder_at, begin_send_message, confirm_delete,
-        download_message_media_result, fetch_folder_chats_and_selected_messages,
-        fetch_initial_state, fetch_latest_chat_messages, fetch_reconciliation_snapshot,
-        finish_send_message, load_initial_state, load_older_messages_failed_error,
-        load_older_selected_chat_messages, load_selected_chat_messages,
-        load_selected_thread_topic_messages, reload_selected_folder_chats,
-        send_typing_action_best_effort, submit_message,
+        LOAD_CHATS_TIMED_OUT_STATUS, LOAD_CONVERSATION_TIMED_OUT_STATUS,
+        LOAD_INITIAL_STATE_TIMED_OUT_STATUS, NO_OLDER_MESSAGES_STATUS,
+        apply_initial_state_load_result, begin_open_chat_at, begin_open_folder_at,
+        begin_send_message, confirm_delete, download_message_media_result,
+        fetch_folder_chats_and_selected_messages, fetch_initial_state, fetch_latest_chat_messages,
+        fetch_reconciliation_snapshot, finish_send_message, load_initial_state,
+        load_older_messages_failed_error, load_older_selected_chat_messages,
+        load_selected_chat_messages, load_selected_thread_topic_messages,
+        reload_selected_folder_chats, send_typing_action_best_effort, submit_message,
     };
     use crate::state::{
         AppState, ConversationLoadStatus, DeleteConfirmation, MESSAGE_DELETED_STATUS,
@@ -1597,6 +1670,79 @@ mod tests {
 
         async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
             unexpected_client_call("mark-read client", "subscribe to updates")
+        }
+    }
+
+    struct HangingDiscoveryClient {
+        hang_folders: bool,
+    }
+
+    impl TelegramClient for HangingDiscoveryClient {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_folders(&self) -> Result<Vec<Folder>> {
+            if self.hang_folders {
+                std::future::pending().await
+            } else {
+                Ok(vec![all_folder(0)])
+            }
+        }
+
+        async fn get_chats(&self, _folder_id: Option<i32>, _limit: usize) -> Result<Vec<Chat>> {
+            Ok(vec![chat(42, "Forum")])
+        }
+
+        async fn get_messages(&self, chat_id: i64, _limit: usize) -> Result<Vec<Message>> {
+            Ok(vec![message(1, chat_id, "loaded")])
+        }
+
+        async fn get_messages_before(
+            &self,
+            _chat_id: i64,
+            _before_message_id: i32,
+            _limit: usize,
+        ) -> Result<Vec<Message>> {
+            unexpected_client_call("hanging-discovery client", "fetch older messages")
+        }
+
+        async fn get_thread_topics(
+            &self,
+            _chat_id: i64,
+            _limit: usize,
+        ) -> Result<Vec<ThreadTopic>> {
+            std::future::pending().await
+        }
+
+        async fn send_message(&self, _chat_id: i64, _content: String) -> Result<Message> {
+            unexpected_client_call("hanging-discovery client", "send messages")
+        }
+
+        async fn edit_message(
+            &self,
+            _chat_id: i64,
+            _message_id: i32,
+            _content: String,
+        ) -> Result<()> {
+            unexpected_client_call("hanging-discovery client", "edit messages")
+        }
+
+        async fn reply_to_message(
+            &self,
+            _chat_id: i64,
+            _reply_to: i32,
+            _content: String,
+        ) -> Result<Message> {
+            unexpected_client_call("hanging-discovery client", "reply to messages")
+        }
+
+        async fn delete_message(&self, _chat_id: i64, _message_id: i32) -> Result<()> {
+            unexpected_client_call("hanging-discovery client", "delete messages")
+        }
+
+        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+            unexpected_client_call("hanging-discovery client", "subscribe to updates")
         }
     }
 
@@ -2937,6 +3083,32 @@ mod tests {
                 .as_slice(),
             &[(42, 1)]
         );
+    }
+
+    #[tokio::test]
+    async fn initial_folder_discovery_has_a_complete_timeout() {
+        let client = HangingDiscoveryClient { hang_folders: true };
+
+        let result = fetch_initial_state(&client).await;
+
+        assert!(matches!(result, Err(error) if error == LOAD_INITIAL_STATE_TIMED_OUT_STATUS));
+    }
+
+    #[tokio::test]
+    async fn forum_topic_discovery_has_a_complete_conversation_timeout() {
+        let client = HangingDiscoveryClient {
+            hang_folders: false,
+        };
+
+        let result = fetch_folder_chats_and_selected_messages(&client, None).await;
+
+        match result {
+            Ok(load) => assert!(matches!(
+                load.messages,
+                Err(error) if error == LOAD_CONVERSATION_TIMED_OUT_STATUS
+            )),
+            Err(error) => panic!("unexpected outer load error: {error}"),
+        }
     }
 
     #[tokio::test]

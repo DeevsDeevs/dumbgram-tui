@@ -451,6 +451,7 @@ pub struct AppState {
     edit_submission_request_id: Option<u64>,
     pending_mutation_scopes: HashMap<u64, ConversationScope>,
     failed_submission_recovery: HashMap<ConversationScope, FailedSubmissionRecovery>,
+    pending_delete_submissions: HashMap<u64, DeleteConfirmation>,
     manual_mark_read_owners: HashMap<i64, ManualMarkReadOwner>,
     pub split_ratio: f32,
     pub split_drag_active: bool,
@@ -473,6 +474,7 @@ pub struct AppState {
     pub last_downloaded_media: Option<DownloadedMediaReference>,
     pub modal: Option<ModalState>,
     typing_activity: BTreeMap<TypingActivityKey, TypingActivity>,
+    terminal_focused: bool,
     pub conversation_load_status: ConversationLoadStatus,
     last_typing_action_context: Option<(i64, Option<i32>)>,
     last_typing_action_at: Option<Instant>,
@@ -509,6 +511,7 @@ impl AppState {
             edit_submission_request_id: None,
             pending_mutation_scopes: HashMap::new(),
             failed_submission_recovery: HashMap::new(),
+            pending_delete_submissions: HashMap::new(),
             manual_mark_read_owners: HashMap::new(),
             split_ratio: DEFAULT_SPLIT_RATIO,
             split_drag_active: false,
@@ -531,6 +534,7 @@ impl AppState {
             last_downloaded_media: None,
             modal: None,
             typing_activity: BTreeMap::new(),
+            terminal_focused: true,
             conversation_load_status: ConversationLoadStatus::Idle,
             last_typing_action_context: None,
             last_typing_action_at: None,
@@ -630,7 +634,11 @@ impl AppState {
                 }
                 if message.status == MessageStatus::Failed {
                     actions.push(ContextMenuAction::DismissFailedSend);
-                } else if message.is_own && message.can_delete && actionable {
+                } else if message.is_own
+                    && message.can_delete
+                    && actionable
+                    && !self.delete_submission_pending_for(chat_id, message_id)
+                {
                     actions.push(ContextMenuAction::DeleteMessage);
                 }
                 actions
@@ -749,6 +757,46 @@ impl AppState {
         true
     }
 
+    pub fn begin_delete_submission(
+        &mut self,
+        submission_id: u64,
+        confirmation: DeleteConfirmation,
+    ) -> bool {
+        if self.delete_submission_pending_for(confirmation.chat_id, confirmation.message_id) {
+            return false;
+        }
+        self.pending_delete_submissions
+            .insert(submission_id, confirmation);
+        true
+    }
+
+    pub fn delete_submission_pending_for(&self, chat_id: i64, message_id: i32) -> bool {
+        self.pending_delete_submissions
+            .values()
+            .any(|confirmation| {
+                confirmation.chat_id == chat_id && confirmation.message_id == message_id
+            })
+    }
+
+    pub fn finish_delete_submission(
+        &mut self,
+        submission_id: u64,
+        confirmation: DeleteConfirmation,
+    ) -> bool {
+        if self.pending_delete_submissions.get(&submission_id) != Some(&confirmation) {
+            return false;
+        }
+        self.pending_delete_submissions.remove(&submission_id);
+        true
+    }
+
+    pub fn finish_delete_submissions_for_update(&mut self, chat_id: i64, message_id: i32) {
+        self.pending_delete_submissions.retain(|_, confirmation| {
+            confirmation.message_id != message_id
+                || !delete_update_matches_chat(chat_id, confirmation.chat_id)
+        });
+    }
+
     pub fn begin_manual_mark_read(&mut self, chat_id: i64, request_id: u64) -> bool {
         if self.manual_mark_read_pending(chat_id) {
             return false;
@@ -858,6 +906,14 @@ impl AppState {
     pub fn end_split_drag(&mut self) {
         self.split_drag_active = false;
         self.split_drag_origin = None;
+    }
+
+    pub fn set_terminal_focused(&mut self, focused: bool) {
+        self.terminal_focused = focused;
+    }
+
+    pub fn terminal_focused(&self) -> bool {
+        self.terminal_focused
     }
 
     fn folder_label_display_width(folder: &Folder) -> usize {
@@ -1436,7 +1492,9 @@ impl AppState {
             self.conversation_load_status = ConversationLoadStatus::Loaded;
             self.select_last_message();
         }
-        self.clear_selected_conversation_unread(selected_topic_id);
+        if self.terminal_focused {
+            self.clear_selected_conversation_unread(selected_topic_id);
+        }
         if selected_topic_id.is_none() {
             self.refresh_selected_chat_last_message_from_loaded_messages();
         }
@@ -2520,7 +2578,7 @@ impl AppState {
         } else {
             focused_panel
         };
-        if !preserve_conversation {
+        if !preserve_conversation && self.terminal_focused {
             self.clear_selected_conversation_unread(snapshot.selected_topic_id);
         }
 
@@ -2622,7 +2680,8 @@ impl AppState {
                     && (self.messages.is_empty() || self.selected_message_is_last());
                 let retained = should_append_to_loaded_messages
                     && self.append_remote_message_with_retention(msg.clone());
-                let presented = !msg.is_own && retained && was_following_tail;
+                let presented =
+                    self.terminal_focused && !msg.is_own && retained && was_following_tail;
                 if retained && was_following_tail {
                     self.select_message_by_identity(msg.chat_id, msg.id);
                 }
@@ -2697,6 +2756,7 @@ impl AppState {
                 chat_id,
                 message_id,
             } => {
+                self.finish_delete_submissions_for_update(chat_id, message_id);
                 let anchors = self.capture_message_window_anchors();
                 if chat_id == UNKNOWN_DELETE_UPDATE_CHAT_ID {
                     self.messages.retain(|m| m.id != message_id);
@@ -3070,13 +3130,15 @@ impl AppState {
 
         if status == MessageStatus::Failed {
             self.dismiss_failed_send(chat_id, message_id);
-        } else if can_delete {
-            self.set_delete_confirmation(DeleteConfirmation {
-                chat_id,
-                message_id,
-            });
-        } else {
-            self.set_error(CANNOT_DELETE_MESSAGE_ERROR.to_string());
+        } else if !self.delete_submission_pending_for(chat_id, message_id) {
+            if can_delete {
+                self.set_delete_confirmation(DeleteConfirmation {
+                    chat_id,
+                    message_id,
+                });
+            } else {
+                self.set_error(CANNOT_DELETE_MESSAGE_ERROR.to_string());
+            }
         }
     }
 
@@ -3333,7 +3395,7 @@ impl AppState {
                 self.upsert_confirmed_message(sent_message, Some((chat_id, temp_id)));
             }
         }
-        if self.selected_chat_id() == Some(chat_id) {
+        if self.terminal_focused && self.selected_chat_id() == Some(chat_id) {
             let selected_topic_id = self.selected_thread_topic().map(|topic| topic.id);
             if selected_topic_id == sent_topic_id {
                 self.clear_selected_conversation_unread(selected_topic_id);
@@ -3384,12 +3446,10 @@ impl AppState {
         self.ensure_selected_message_visible();
         self.refresh_selected_chat_last_message_from_loaded_messages();
         self.set_status(MESSAGE_DELETED_STATUS);
-        self.modal = None;
     }
 
-    pub fn apply_delete_failure(&mut self, error: String) {
+    pub fn apply_delete_failure(&mut self, _confirmation: DeleteConfirmation, error: String) {
         self.set_error(delete_failed_error(error));
-        self.modal = None;
     }
 
     pub fn cancel_delete_confirmation(&mut self) {
@@ -3827,6 +3887,27 @@ mod tests {
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].content, "open chat");
         assert_eq!(state.chats[0].last_message.as_deref(), Some("open chat"));
+    }
+
+    #[test]
+    fn unfocused_incoming_message_is_retained_unread_and_not_presented() {
+        let mut state = AppState::new();
+        state.folders = vec![all_folder(4)];
+        state.chats = vec![chat_with_unread(1, "Chat 1", 0, None)];
+        state.set_terminal_focused(false);
+
+        let presented = state.apply_update(Update::NewMessage(update_message(
+            10,
+            1,
+            "unseen while away",
+            false,
+        )));
+
+        assert_eq!(presented, None);
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.chats[0].unread_count, 1);
+        assert_eq!(state.folders[0].unread_count, 4);
+        assert!(!state.terminal_focused());
     }
 
     #[test]
@@ -5154,7 +5235,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_delete_success_removes_message_selects_previous_and_clears_confirmation() {
+    fn apply_delete_success_removes_message_and_preserves_current_modal() {
         let mut state = state_with_chats();
         let confirmation = DeleteConfirmation {
             chat_id: 10,
@@ -5166,7 +5247,10 @@ mod tests {
             update_message(42, 10, "delete", true),
         ];
         state.selected_message_index = 1;
-        state.set_delete_confirmation(confirmation);
+        state.set_delete_confirmation(DeleteConfirmation {
+            chat_id: 10,
+            message_id: 41,
+        });
 
         state.apply_delete_success(confirmation);
 
@@ -5175,7 +5259,13 @@ mod tests {
         assert_eq!(state.selected_message_index, 0);
         assert_eq!(state.message_scroll_offset, 0);
         assert_eq!(state.chats[0].last_message.as_deref(), Some("keep"));
-        assert!(state.delete_confirmation().is_none());
+        assert_eq!(
+            state.delete_confirmation(),
+            Some(DeleteConfirmation {
+                chat_id: 10,
+                message_id: 41,
+            })
+        );
         assert_eq!(
             state.status_message.as_deref(),
             Some(MESSAGE_DELETED_STATUS)
@@ -5191,7 +5281,6 @@ mod tests {
         };
         state.chats[0].last_message = Some("delete".to_string());
         state.messages = vec![update_message(42, 10, "delete", true)];
-        state.set_delete_confirmation(confirmation);
 
         state.apply_delete_success(confirmation);
 
@@ -5200,16 +5289,21 @@ mod tests {
     }
 
     #[test]
-    fn apply_delete_failure_sets_error_and_clears_confirmation() {
+    fn apply_delete_failure_sets_error_and_preserves_newer_confirmation() {
         let mut state = AppState::new();
-        state.set_delete_confirmation(DeleteConfirmation {
+        let failed = DeleteConfirmation {
             chat_id: 10,
             message_id: 42,
-        });
+        };
+        let newer = DeleteConfirmation {
+            chat_id: 10,
+            message_id: 43,
+        };
+        state.set_delete_confirmation(newer);
 
-        state.apply_delete_failure("network down".to_string());
+        state.apply_delete_failure(failed, "network down".to_string());
 
-        assert!(state.delete_confirmation().is_none());
+        assert_eq!(state.delete_confirmation(), Some(newer));
         assert_eq!(
             state.error_message.as_deref(),
             Some(delete_failed_error("network down").as_str())
@@ -5992,6 +6086,41 @@ mod tests {
         assert!(state.context_menu().is_none());
         assert!(!state.open_context_menu(target, 1, 1));
         assert!(state.delete_confirmation().is_some());
+    }
+
+    #[test]
+    fn delete_submission_owner_suppresses_duplicates_and_remote_delete_settles_it() {
+        let mut state = AppState::new();
+        let confirmation = DeleteConfirmation {
+            chat_id: 7,
+            message_id: 9,
+        };
+        state.chats = vec![chat_with_unread(7, "Alice", 0, None)];
+        let mut selected = update_message(9, 7, "delete", true);
+        selected.can_delete = true;
+        state.messages = vec![selected];
+
+        assert!(state.begin_delete_submission(1, confirmation));
+        assert!(!state.begin_delete_submission(2, confirmation));
+        state.request_delete_selected_message();
+        assert!(state.delete_confirmation().is_none());
+        assert!(state.error_message.is_none());
+        assert!(
+            !state
+                .context_actions_for_target(ContextMenuTarget::Message {
+                    chat_id: 7,
+                    message_id: 9,
+                })
+                .contains(&ContextMenuAction::DeleteMessage)
+        );
+        assert!(!state.finish_delete_submission(2, confirmation));
+
+        state.apply_update(Update::DeleteMessage {
+            chat_id: 7,
+            message_id: 9,
+        });
+        assert!(!state.delete_submission_pending_for(7, 9));
+        assert!(!state.finish_delete_submission(1, confirmation));
     }
 
     #[test]

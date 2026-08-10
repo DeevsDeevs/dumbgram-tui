@@ -87,7 +87,7 @@ pub(crate) fn kitty_png_file_image_at_sequence(
     let byte_len = payload.bytes.len();
     Ok((
         format!(
-            "\x1b[{};{}H{}",
+            "\x1b7\x1b[{};{}H{}\x1b8",
             row.saturating_add(1),
             column.saturating_add(1),
             kitty_png_image_sequence(&payload.bytes, geometry.columns, geometry.rows)
@@ -440,7 +440,8 @@ mod tests {
         assert_eq!(byte_len, png_bytes.len());
         assert_eq!(source_format, ImagePayloadSourceFormat::Png);
         assert_eq!((columns, rows), (8, 4));
-        assert!(sequence.starts_with("\x1b[4;3H\x1b_G"));
+        assert!(sequence.starts_with("\x1b7\x1b[4;3H\x1b_G"));
+        assert!(sequence.ends_with("\x1b\\\x1b8"));
         assert!(!sequence.contains(path.to_string_lossy().as_ref()));
         fs::remove_file(path).ok();
     }
@@ -464,7 +465,8 @@ mod tests {
         assert_eq!(source_format, ImagePayloadSourceFormat::Jpeg);
         assert!(byte_len > 0);
         assert_eq!((columns, rows), (8, 4));
-        assert!(sequence.starts_with("\x1b[4;3H\x1b_G"));
+        assert!(sequence.starts_with("\x1b7\x1b[4;3H\x1b_G"));
+        assert!(sequence.ends_with("\x1b\\\x1b8"));
         assert!(sequence.contains("a=T,f=100,q=2,z=1,c=8,r=4;"));
         fs::remove_file(path).ok();
     }

@@ -25,8 +25,8 @@ use app::App;
 use color_eyre::Result;
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+        DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+        EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -62,7 +62,6 @@ const TELEGRAM_UPDATES_DISCONNECTED_ERROR: &str =
     "Telegram updates disconnected; retrying subscription";
 const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const RECONCILIATION_RETRY_DELAY: Duration = Duration::from_secs(10);
-const RECONCILIATION_FOCUS_STALE_AFTER: Duration = Duration::from_secs(30);
 const OPENER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const OPENER_KILL_TIMEOUT: Duration = Duration::from_millis(500);
 static MUTATION_SUBMISSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1812,13 +1811,16 @@ trait TerminalSetupOperations {
     fn enable_raw_mode(&mut self) -> Result<()>;
     fn enter_alternate_screen(&mut self) -> Result<()>;
     fn enable_mouse_capture(&mut self) -> Result<()>;
+    fn enable_focus_change(&mut self) -> Result<()>;
     fn build_terminal(&mut self) -> Result<Self::Terminal>;
+    fn disable_focus_change(&mut self) -> Result<()>;
     fn disable_mouse_capture(&mut self) -> Result<()>;
     fn leave_alternate_screen(&mut self) -> Result<()>;
     fn disable_raw_mode(&mut self) -> Result<()>;
 }
 
 fn rollback_terminal_setup(operations: &mut impl TerminalSetupOperations) {
+    let _ = operations.disable_focus_change();
     let _ = operations.disable_mouse_capture();
     let _ = operations.leave_alternate_screen();
     let _ = operations.disable_raw_mode();
@@ -1831,6 +1833,10 @@ fn setup_terminal_with<O: TerminalSetupOperations>(operations: &mut O) -> Result
         return Err(error);
     }
     if let Err(error) = operations.enable_mouse_capture() {
+        rollback_terminal_setup(operations);
+        return Err(error);
+    }
+    if let Err(error) = operations.enable_focus_change() {
         rollback_terminal_setup(operations);
         return Err(error);
     }
@@ -1860,8 +1866,16 @@ impl TerminalSetupOperations for CrosstermTerminalSetup {
         execute!(io::stdout(), EnableMouseCapture).map_err(Into::into)
     }
 
+    fn enable_focus_change(&mut self) -> Result<()> {
+        execute!(io::stdout(), EnableFocusChange).map_err(Into::into)
+    }
+
     fn build_terminal(&mut self) -> Result<Self::Terminal> {
         Terminal::new(CrosstermBackend::new(io::stdout())).map_err(Into::into)
+    }
+
+    fn disable_focus_change(&mut self) -> Result<()> {
+        execute!(io::stdout(), DisableFocusChange).map_err(Into::into)
     }
 
     fn disable_mouse_capture(&mut self) -> Result<()> {
@@ -1882,20 +1896,23 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    let clear_images_result = terminal_images::clear_terminal_images(terminal.backend_mut());
-    let raw_mode_result = disable_raw_mode();
-    let leave_screen_result = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
-    let cursor_result = terminal.show_cursor();
+    let mut first_error = None;
+    let mut record = |result: Result<()>| {
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    };
 
-    clear_images_result?;
-    raw_mode_result?;
-    leave_screen_result?;
-    cursor_result?;
-    Ok(())
+    record(terminal_images::clear_terminal_images(terminal.backend_mut()).map_err(Into::into));
+    record(execute!(terminal.backend_mut(), DisableFocusChange).map_err(Into::into));
+    record(execute!(terminal.backend_mut(), DisableMouseCapture).map_err(Into::into));
+    record(execute!(terminal.backend_mut(), LeaveAlternateScreen).map_err(Into::into));
+    record(disable_raw_mode().map_err(Into::into));
+    record(terminal.show_cursor().map_err(Into::into));
+
+    first_error.map_or(Ok(()), Err)
 }
 
 fn load_app_preferences(app: &mut App) {
@@ -2136,6 +2153,11 @@ fn prepare_loop_step<C: TelegramClient + Clone + Send + Sync + 'static>(
     mark_read_loader: &MarkChatReadLoader<C>,
     media_preview_loader: &MediaPreviewLoader<C>,
 ) -> PreparedLoopStep {
+    match loop_state.staged_terminal_event {
+        Some(Event::FocusLost) => app.state.set_terminal_focused(false),
+        Some(Event::FocusGained) => app.state.set_terminal_focused(true),
+        _ => {}
+    }
     let compose_cancel = loop_state
         .staged_terminal_event
         .as_ref()
@@ -2304,6 +2326,7 @@ async fn dispatch_terminal_event<C: TelegramClient + Clone + Send + Sync + 'stat
         }
         TerminalAction::Resize => Ok(true),
         TerminalAction::FocusLost => {
+            app.state.set_terminal_focused(false);
             if app.state.split_drag_active {
                 app.state.end_split_drag();
                 save_app_preferences(app);
@@ -2311,6 +2334,7 @@ async fn dispatch_terminal_event<C: TelegramClient + Clone + Send + Sync + 'stat
             Ok(true)
         }
         TerminalAction::FocusGained => {
+            app.state.set_terminal_focused(true);
             loop_state.schedule_focus_reconciliation();
             Ok(false)
         }
@@ -2674,13 +2698,8 @@ impl EventLoopState {
     }
 
     fn schedule_focus_reconciliation(&mut self) {
-        let now = TokioInstant::now();
-        if self.last_reconciliation_success_at.is_none_or(|last| {
-            now.saturating_duration_since(last) >= RECONCILIATION_FOCUS_STALE_AFTER
-        }) {
-            self.announce_reconciliation_success = true;
-            self.schedule_reconciliation_at(now);
-        }
+        self.announce_reconciliation_success = true;
+        self.schedule_reconciliation_now();
     }
 
     fn service_deadline(&self) -> Option<TokioInstant> {
@@ -2994,6 +3013,14 @@ where
     let Some(update) = bind_wildcard_delete_at_ingress(loop_state, app, update) else {
         return false;
     };
+    if let Update::DeleteMessage {
+        chat_id,
+        message_id,
+    } = &update
+    {
+        app.state
+            .finish_delete_submissions_for_update(*chat_id, *message_id);
+    }
     if loop_state.initial_state_pending || loop_state.reconciliation_pending {
         loop_state.deferred_updates.push(update);
         return false;
@@ -3205,6 +3232,7 @@ where
                             chat_id,
                             max_message_id,
                         }) if conversation_replaced
+                            && app.state.terminal_focused()
                             && app.state.selected_chat_id() == Some(chat_id) =>
                         {
                             mark_read_loader.spawn_mark_chat_read_through(chat_id, max_message_id);
@@ -3214,6 +3242,7 @@ where
                             topic_id,
                             max_message_id,
                         }) if conversation_replaced
+                            && app.state.terminal_focused()
                             && app.state.selected_chat_id() == Some(chat_id)
                             && app.state.selected_thread_topic().map(|topic| topic.id)
                                 == Some(topic_id) =>
@@ -3329,6 +3358,7 @@ struct SendMessageResult {
 }
 
 struct DeleteMessageResult {
+    submission_id: u64,
     confirmation: state::DeleteConfirmation,
     result: std::result::Result<(), String>,
 }
@@ -3704,31 +3734,44 @@ where
             format!("request_id={request_id} chat_id={chat_id}"),
         );
         self.current_handle = Some(tokio::spawn(async move {
-            let result = match actions::fetch_latest_chat_messages(&client, chat_id).await {
-                Ok(chat_messages) => {
-                    match actions::fetch_chat_thread_topics(&client, chat_id).await {
-                        Ok(thread_topics) => {
-                            let topic_id = thread_topics.first().map(|topic| topic.id);
-                            let messages = match topic_id {
-                                Some(topic_id) => {
-                                    actions::fetch_thread_topic_messages(&client, chat_id, topic_id)
+            let load = async {
+                match actions::fetch_latest_chat_messages(&client, chat_id).await {
+                    Ok(chat_messages) => {
+                        match actions::fetch_chat_thread_topics(&client, chat_id).await {
+                            Ok(thread_topics) => {
+                                let topic_id = thread_topics.first().map(|topic| topic.id);
+                                let messages = match topic_id {
+                                    Some(topic_id) => {
+                                        actions::fetch_thread_topic_messages(
+                                            &client, chat_id, topic_id,
+                                        )
                                         .await
-                                }
-                                None => Ok(chat_messages),
-                            };
-                            (
-                                topic_id,
-                                messages.map(|messages| ChatMessageLoad {
-                                    messages,
-                                    thread_topics: Some(thread_topics),
-                                }),
-                            )
+                                    }
+                                    None => Ok(chat_messages),
+                                };
+                                (
+                                    topic_id,
+                                    messages.map(|messages| ChatMessageLoad {
+                                        messages,
+                                        thread_topics: Some(thread_topics),
+                                    }),
+                                )
+                            }
+                            Err(error) => (None, Err(error)),
                         }
-                        Err(error) => (None, Err(error)),
                     }
+                    Err(error) => (None, Err(error)),
                 }
-                Err(error) => (None, Err(error)),
             };
+            let result =
+                match tokio::time::timeout(actions::COMPLETE_CONVERSATION_LOAD_TIMEOUT, load).await
+                {
+                    Ok(result) => result,
+                    Err(_) => (
+                        None,
+                        Err(actions::LOAD_CONVERSATION_TIMED_OUT_STATUS.to_string()),
+                    ),
+                };
             let _ = tx.send(ChatMessageLoadResult {
                 request_id,
                 chat_id,
@@ -4092,23 +4135,26 @@ where
         }
     }
 
-    fn spawn_delete_message(&self, confirmation: state::DeleteConfirmation) {
+    fn spawn_delete_message(&self, confirmation: state::DeleteConfirmation) -> u64 {
+        let submission_id = MUTATION_SUBMISSION_COUNTER.fetch_add(1, Ordering::Relaxed);
         let client = self.client.clone();
         let tx = self.tx.clone();
         diagnostics::event(
             "delete_message_spawn",
             format!(
-                "chat_id={} message_id={}",
+                "submission_id={submission_id} chat_id={} message_id={}",
                 confirmation.chat_id, confirmation.message_id
             ),
         );
         tokio::spawn(async move {
             let result = actions::delete_message_result(&client, confirmation).await;
             let _ = tx.send(DeleteMessageResult {
+                submission_id,
                 confirmation,
                 result,
             });
         });
+        submission_id
     }
 }
 
@@ -4473,14 +4519,15 @@ fn apply_initial_state_load_result<C>(
         Some(LoadedReadAck::Chat {
             chat_id,
             max_message_id,
-        }) if app.state.selected_chat_id() == Some(chat_id) => {
+        }) if app.state.terminal_focused() && app.state.selected_chat_id() == Some(chat_id) => {
             mark_read_loader.spawn_mark_chat_read_through(chat_id, max_message_id);
         }
         Some(LoadedReadAck::Thread {
             chat_id,
             topic_id,
             max_message_id,
-        }) if app.state.selected_chat_id() == Some(chat_id)
+        }) if app.state.terminal_focused()
+            && app.state.selected_chat_id() == Some(chat_id)
             && app.state.selected_thread_topic().map(|topic| topic.id) == Some(topic_id) =>
         {
             mark_read_loader.spawn_mark_thread_read(chat_id, topic_id, max_message_id);
@@ -4544,10 +4591,17 @@ fn apply_delete_message_result(app: &mut App, load: DeleteMessageResult) {
     diagnostics::event(
         "delete_message_result",
         format!(
-            "chat_id={} message_id={}",
-            load.confirmation.chat_id, load.confirmation.message_id
+            "submission_id={} chat_id={} message_id={}",
+            load.submission_id, load.confirmation.chat_id, load.confirmation.message_id
         ),
     );
+    if !app
+        .state
+        .finish_delete_submission(load.submission_id, load.confirmation)
+    {
+        diagnostics::event("delete_message_result_ignored", "reason=stale_owner");
+        return;
+    }
     actions::apply_delete_message_result(&mut app.state, load.confirmation, load.result);
 }
 
@@ -4866,14 +4920,20 @@ where
                 .is_some()
                 .then(|| load.messages.iter().map(|message| message.id).max())
                 .flatten();
-            let thread_read_ack = topic_id.and_then(|topic_id| {
-                load.messages
-                    .iter()
-                    .map(|message| message.id)
-                    .max()
-                    .map(|max_message_id| (topic_id, max_message_id))
-            });
-            let chat_read_ack = (topic_id.is_none()
+            let thread_read_ack = app
+                .state
+                .terminal_focused()
+                .then_some(topic_id)
+                .flatten()
+                .and_then(|topic_id| {
+                    load.messages
+                        .iter()
+                        .map(|message| message.id)
+                        .max()
+                        .map(|max_message_id| (topic_id, max_message_id))
+                });
+            let chat_read_ack = (app.state.terminal_focused()
+                && topic_id.is_none()
                 && selected_chat_has_displayed_messages(app, chat_id, &load.messages))
             .then(|| load.messages.iter().map(|message| message.id).max())
             .flatten();
@@ -4985,14 +5045,15 @@ where
         Some(LoadedReadAck::Chat {
             chat_id,
             max_message_id,
-        }) if app.state.selected_chat_id() == Some(chat_id) => {
+        }) if app.state.terminal_focused() && app.state.selected_chat_id() == Some(chat_id) => {
             mark_read_loader.spawn_mark_chat_read_through(chat_id, max_message_id);
         }
         Some(LoadedReadAck::Thread {
             chat_id,
             topic_id,
             max_message_id,
-        }) if app.state.selected_chat_id() == Some(chat_id)
+        }) if app.state.terminal_focused()
+            && app.state.selected_chat_id() == Some(chat_id)
             && app.state.selected_thread_topic().map(|topic| topic.id) == Some(topic_id) =>
         {
             mark_read_loader.spawn_mark_thread_read(chat_id, topic_id, max_message_id);
@@ -5454,7 +5515,9 @@ async fn handle_key_event_with_progress<C: TelegramClient + Clone + Send + Sync 
                 progress.show(app, DELETING_MESSAGE_STATUS)?;
                 if let Some(loader) = loaders.delete_message {
                     if let Some(confirmation) = actions::begin_confirm_delete(&mut app.state) {
-                        loader.spawn_delete_message(confirmation);
+                        let submission_id = loader.spawn_delete_message(confirmation);
+                        app.state
+                            .begin_delete_submission(submission_id, confirmation);
                     }
                 } else {
                     actions::confirm_delete(&mut app.state, client).await?;
@@ -6234,15 +6297,14 @@ mod tests {
         LOGIN_SIGNING_IN_STATUS, LOGIN_START_PROMPT, MIN_FRAME_INTERVAL, ManualMarkChatReadResult,
         MarkChatReadLoader, MediaPreviewLoader, MediaPreviewResult, OlderMessageLoadResult,
         OlderMessageLoader, OlderMessageNavigation, OpenTargetKind, OpenTargetLoader,
-        PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR, RECONCILIATION_FOCUS_STALE_AFTER,
-        RECONCILIATION_INTERVAL, ReconciliationLoader, ReconciliationResult, ReplyMessageLoader,
-        ReplyMessageResult, RunMode, SAVING_EDIT_STATUS, SENDING_MESSAGE_STATUS,
-        SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE, SMOKE_CHECK_AUTH_CONFLICT,
-        SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_OK_PREFIX, SendMessageLoader, SendMessageResult,
-        SubscribeUpdatesLoader, SubscribeUpdatesResult, TerminalAction, TerminalSetupOperations,
-        TokioInstant, UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress, abort_running_task,
-        apply_chat_message_load_result, apply_delete_message_result, apply_edit_message_result,
-        apply_folder_chat_load_result, apply_initial_state_load_result,
+        PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR, RECONCILIATION_INTERVAL, ReconciliationLoader,
+        ReconciliationResult, ReplyMessageLoader, ReplyMessageResult, RunMode, SAVING_EDIT_STATUS,
+        SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE,
+        SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_OK_PREFIX, SendMessageLoader,
+        SendMessageResult, SubscribeUpdatesLoader, SubscribeUpdatesResult, TerminalAction,
+        TerminalSetupOperations, TokioInstant, UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress,
+        abort_running_task, apply_chat_message_load_result, apply_delete_message_result,
+        apply_edit_message_result, apply_folder_chat_load_result, apply_initial_state_load_result,
         apply_manual_mark_chat_read_result, apply_media_preview_result,
         apply_older_message_load_result, apply_open_target_result, apply_reconciliation_result,
         apply_reply_message_result, apply_send_message_result, apply_subscribe_updates_result,
@@ -6466,8 +6528,16 @@ mod tests {
             self.step("mouse")
         }
 
+        fn enable_focus_change(&mut self) -> color_eyre::Result<()> {
+            self.step("focus")
+        }
+
         fn build_terminal(&mut self) -> color_eyre::Result<Self::Terminal> {
             self.step("terminal")
+        }
+
+        fn disable_focus_change(&mut self) -> color_eyre::Result<()> {
+            self.step("cleanup_focus")
         }
 
         fn disable_mouse_capture(&mut self) -> color_eyre::Result<()> {
@@ -6589,6 +6659,7 @@ mod tests {
                 vec![
                     "raw",
                     "alternate",
+                    "cleanup_focus",
                     "cleanup_mouse",
                     "cleanup_alternate",
                     "cleanup_raw",
@@ -6600,6 +6671,20 @@ mod tests {
                     "raw",
                     "alternate",
                     "mouse",
+                    "cleanup_focus",
+                    "cleanup_mouse",
+                    "cleanup_alternate",
+                    "cleanup_raw",
+                ],
+            ),
+            (
+                "focus",
+                vec![
+                    "raw",
+                    "alternate",
+                    "mouse",
+                    "focus",
+                    "cleanup_focus",
                     "cleanup_mouse",
                     "cleanup_alternate",
                     "cleanup_raw",
@@ -6611,7 +6696,9 @@ mod tests {
                     "raw",
                     "alternate",
                     "mouse",
+                    "focus",
                     "terminal",
+                    "cleanup_focus",
                     "cleanup_mouse",
                     "cleanup_alternate",
                     "cleanup_raw",
@@ -6634,7 +6721,10 @@ mod tests {
             events: Vec::new(),
         };
         setup_terminal_with(&mut setup).expect("setup should succeed");
-        assert_eq!(setup.events, ["raw", "alternate", "mouse", "terminal"]);
+        assert_eq!(
+            setup.events,
+            ["raw", "alternate", "mouse", "focus", "terminal"]
+        );
     }
 
     #[test]
@@ -6670,12 +6760,9 @@ mod tests {
         loop_state.last_reconciliation_success_at = Some(TokioInstant::now());
 
         loop_state.schedule_focus_reconciliation();
-        assert!(loop_state.next_reconciliation_at.is_none());
-        tokio::time::advance(RECONCILIATION_FOCUS_STALE_AFTER + Duration::from_millis(1)).await;
-        loop_state.schedule_focus_reconciliation();
         let focus_deadline = loop_state
             .next_reconciliation_at
-            .expect("stale focus should schedule reconciliation");
+            .expect("every focus return should schedule reconciliation");
         loop_state.schedule_focus_reconciliation();
         assert_eq!(loop_state.next_reconciliation_at, Some(focus_deadline));
         assert!(loop_state.announce_reconciliation_success);
@@ -6980,6 +7067,50 @@ mod tests {
         ));
         assert!(ownerless_loop.deferred_updates.is_empty());
         assert!(ownerless_loop.reconciliation_requested_while_pending);
+    }
+
+    #[test]
+    fn deferred_remote_delete_settles_rpc_owner_at_first_ingress() {
+        let (mut loop_state, _senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        loop_state.reconciliation_pending = true;
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        let confirmation = DeleteConfirmation {
+            chat_id: 1,
+            message_id: 7,
+        };
+        assert!(app.state.begin_delete_submission(10, confirmation));
+        let mark_read_loader = MarkChatReadLoader::new(MockTelegramClient::new());
+
+        assert!(!handle_received_update_with_conversation_load(
+            &mut loop_state,
+            &mut app,
+            Update::DeleteMessage {
+                chat_id: 1,
+                message_id: 7,
+            },
+            &mark_read_loader,
+            false,
+        ));
+        assert!(!app.state.delete_submission_pending_for(1, 7));
+        assert_eq!(loop_state.deferred_updates.len(), 1);
+
+        let newer = DeleteConfirmation {
+            chat_id: 1,
+            message_id: 8,
+        };
+        app.state.set_delete_confirmation(newer);
+        apply_delete_message_result(
+            &mut app,
+            DeleteMessageResult {
+                submission_id: 10,
+                confirmation,
+                result: Err("late rpc failure".to_string()),
+            },
+        );
+        assert!(app.state.error_message.is_none());
+        assert_eq!(app.state.delete_confirmation(), Some(newer));
     }
 
     #[tokio::test]
@@ -7993,6 +8124,59 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn initial_timeout_releases_and_replays_deferred_updates() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        let initial_loader =
+            InitialStateLoader::new(HangingReconciliationClient, senders.initial_state);
+        initial_loader.spawn_initial_state();
+        tokio::task::yield_now().await;
+        let client = HangingReconciliationClient;
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation);
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+        let mut incoming = message(7);
+        incoming.chat_id = 1;
+        assert!(!handle_received_update(
+            &mut loop_state,
+            &mut app,
+            Update::NewMessage(incoming),
+            &mark_read_loader,
+        ));
+
+        tokio::time::advance(crate::actions::INITIAL_STATE_LOAD_TIMEOUT + Duration::from_millis(1))
+            .await;
+        tokio::task::yield_now().await;
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        assert!(!loop_state.initial_state_pending);
+        assert!(loop_state.deferred_updates.is_empty());
+        assert!(loop_state.drain_trace.iter().any(|entry| entry == "update"));
+        assert!(app.state.messages.is_empty());
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some(crate::actions::LOAD_INITIAL_STATE_TIMED_OUT_STATUS)
+        );
+    }
+
     #[test]
     fn loop_step_applies_ready_results_before_releasing_staged_input() {
         let (mut loop_state, senders) = EventLoopState::new();
@@ -8081,6 +8265,51 @@ mod tests {
         assert!(step.terminal_event.is_none());
         assert!(loop_state.staged_terminal_event.is_none());
         assert!(app.state.gap_submit_pending());
+    }
+
+    #[tokio::test]
+    async fn same_step_focus_loss_prevents_update_presentation_before_dispatch() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        loop_state.staged_terminal_event = Some(Event::FocusLost);
+        let marked_chat_ids = Arc::new(Mutex::new(Vec::new()));
+        let marked_threads = Arc::new(Mutex::new(Vec::new()));
+        let client = RecordingMarkReadClient {
+            marked_chat_ids: marked_chat_ids.clone(),
+            marked_threads,
+        };
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation);
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        let mut incoming = message(7);
+        incoming.chat_id = 1;
+        loop_state.staged_update = Some(Update::NewMessage(incoming));
+
+        let step = prepare_loop_step(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        );
+        tokio::task::yield_now().await;
+
+        assert!(matches!(step.terminal_event, Some(Event::FocusLost)));
+        assert!(!app.state.terminal_focused());
+        assert_eq!(app.state.chats[0].unread_count, 1);
+        assert!(marked_chat_ids.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -8449,7 +8678,10 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct SlowFirstLatestMessagesClient;
+    struct SlowFirstLatestMessagesClient {
+        slow_first: bool,
+        hang_topics: bool,
+    }
 
     #[derive(Clone)]
     struct SlowFirstOlderMessagesClient;
@@ -8534,12 +8766,24 @@ mod tests {
         }
 
         async fn get_messages(&self, chat_id: i64, _limit: usize) -> Result<Vec<Message>> {
-            if chat_id == 1 {
+            if self.slow_first && chat_id == 1 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             let mut loaded = message(chat_id as i32);
             loaded.chat_id = chat_id;
             Ok(vec![loaded])
+        }
+
+        async fn get_thread_topics(
+            &self,
+            _chat_id: i64,
+            _limit: usize,
+        ) -> Result<Vec<ThreadTopic>> {
+            if self.hang_topics {
+                std::future::pending().await
+            } else {
+                Ok(Vec::new())
+            }
         }
 
         async fn get_messages_before(
@@ -8891,6 +9135,29 @@ mod tests {
                 .expect("marked threads lock should not be poisoned")
                 .is_empty()
         );
+
+        app.state.chats[0].unread_count = 5;
+        app.state.set_terminal_focused(false);
+        let mut unfocused_message = message(3);
+        unfocused_message.chat_id = 1;
+        apply_chat_message_load_result(
+            &mut app,
+            3,
+            ChatMessageLoadResult {
+                request_id: 3,
+                chat_id: 1,
+                topic_id: None,
+                purpose: ChatMessageLoadPurpose::OpenConversation,
+                result: Ok(ChatMessageLoad {
+                    messages: vec![unfocused_message],
+                    thread_topics: Some(Vec::new()),
+                }),
+            },
+            &mark_read_loader,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(marked_chat_ids.lock().unwrap().as_slice(), &[1, 1]);
+        assert_eq!(app.state.chats[0].unread_count, 5);
     }
 
     #[tokio::test]
@@ -10071,7 +10338,13 @@ mod tests {
     #[tokio::test]
     async fn async_chat_message_loader_aborts_superseded_load() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut loader = ChatMessageLoader::new(SlowFirstLatestMessagesClient, tx);
+        let mut loader = ChatMessageLoader::new(
+            SlowFirstLatestMessagesClient {
+                slow_first: true,
+                hang_topics: false,
+            },
+            tx,
+        );
 
         loader.spawn_latest_chat_messages(1);
         loader.spawn_latest_chat_messages(2);
@@ -10095,6 +10368,59 @@ mod tests {
                 .await
                 .is_err(),
             "aborted stale chat-message load should not send a result"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_topic_open_releases_owner_and_replays_deferred_update() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        let client = SlowFirstLatestMessagesClient {
+            slow_first: false,
+            hang_topics: true,
+        };
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation);
+        let mut chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        app.state.begin_conversation_load();
+        chat_loader.spawn_latest_chat_messages(1);
+        tokio::task::yield_now().await;
+        let mut incoming = message(7);
+        incoming.chat_id = 1;
+        loop_state.staged_update = Some(Update::NewMessage(incoming));
+
+        tokio::time::advance(
+            crate::actions::COMPLETE_CONVERSATION_LOAD_TIMEOUT + Duration::from_millis(1),
+        )
+        .await;
+        tokio::task::yield_now().await;
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        assert!(!chat_loader.has_active_open_for(1));
+        assert!(loop_state.deferred_conversation_updates.is_empty());
+        assert_eq!(app.state.messages.len(), 1);
+        assert_eq!(app.state.messages[0].id, 7);
+        assert_eq!(
+            app.state.error_message.as_deref(),
+            Some(crate::actions::LOAD_CONVERSATION_TIMED_OUT_STATUS)
         );
     }
 
@@ -10831,15 +11157,66 @@ mod tests {
             .expect("delete confirmation should be present");
         assert!(app.state.delete_confirmation().is_none());
 
+        assert!(app.state.begin_delete_submission(1, confirmation));
+        let newer_confirmation = DeleteConfirmation {
+            chat_id: 1,
+            message_id: 8,
+        };
+        app.state.set_delete_confirmation(newer_confirmation);
         apply_delete_message_result(
             &mut app,
             DeleteMessageResult {
+                submission_id: 1,
                 confirmation,
                 result: Ok(()),
             },
         );
 
         assert!(app.state.messages.is_empty());
+        assert_eq!(app.state.delete_confirmation(), Some(newer_confirmation));
+    }
+
+    #[test]
+    fn late_delete_results_preserve_newer_modal_and_require_exact_owner() {
+        let mut app = App::new();
+        let first = DeleteConfirmation {
+            chat_id: 1,
+            message_id: 7,
+        };
+        let newer = DeleteConfirmation {
+            chat_id: 1,
+            message_id: 8,
+        };
+        let mut first_message = message(7);
+        first_message.chat_id = 1;
+        let mut newer_message = message(8);
+        newer_message.chat_id = 1;
+        app.state.chats = vec![chat(1)];
+        app.state.messages = vec![first_message, newer_message];
+        assert!(app.state.begin_delete_submission(10, first));
+        app.state.set_delete_confirmation(newer);
+
+        apply_delete_message_result(
+            &mut app,
+            DeleteMessageResult {
+                submission_id: 10,
+                confirmation: first,
+                result: Err("offline".to_string()),
+            },
+        );
+        assert_eq!(app.state.delete_confirmation(), Some(newer));
+        assert_eq!(app.state.messages.len(), 2);
+
+        apply_delete_message_result(
+            &mut app,
+            DeleteMessageResult {
+                submission_id: 10,
+                confirmation: first,
+                result: Ok(()),
+            },
+        );
+        assert_eq!(app.state.delete_confirmation(), Some(newer));
+        assert_eq!(app.state.messages.len(), 2);
     }
 
     #[tokio::test]
@@ -10851,12 +11228,13 @@ mod tests {
             message_id: 7,
         };
 
-        loader.spawn_delete_message(confirmation);
+        let submission_id = loader.spawn_delete_message(confirmation);
 
         let result = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
             .expect("background delete should respond")
             .expect("background delete channel should stay open");
+        assert_eq!(result.submission_id, submission_id);
         assert_eq!(result.confirmation, confirmation);
         result.result.expect("mock delete should succeed");
     }
