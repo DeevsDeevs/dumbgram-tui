@@ -377,6 +377,7 @@ mod tests {
             id,
             chat_id: 7,
             thread_topic_id: None,
+            sender_identity: None,
             sender_name: "me".to_string(),
             content: content.to_string(),
             timestamp: Utc::now(),

@@ -47,7 +47,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use std::{fs, io};
-use telegram::types::{Message, ThreadTopic, Update};
+use telegram::types::{Message, SenderIdentity, ThreadTopic, Update};
 use telegram::{GrammersClient, MockTelegramClient, TelegramClient};
 use tokio::time::Instant as TokioInstant;
 
@@ -504,7 +504,7 @@ async fn login(client: &mut GrammersClient) -> Result<()> {
                 println!("{}", login_2fa_hint_message(hint));
             }
 
-            let password = prompt_input_preserving_spaces(LOGIN_2FA_PROMPT)?;
+            let password = prompt_secret(LOGIN_2FA_PROMPT)?;
             let user = client
                 .inner()
                 .check_password(password_token, password.as_bytes())
@@ -542,12 +542,23 @@ async fn run_smoke_with_client<C: TelegramClient + Clone + Send + Sync + 'static
     app.state.clear_status();
 
     if let Some(chat_id) = app.state.selected_chat_id() {
-        app.state
-            .typing_users
-            .insert(chat_id, vec!["Alice".to_string()]);
+        let topic_id = app.state.selected_thread_topic().map(|topic| topic.id);
+        app.state.apply_update(Update::TypingStatus {
+            chat_id,
+            topic_id,
+            sender_identity: SenderIdentity::User(1),
+            user_name: "Alice".to_string(),
+            is_typing: true,
+        });
+        assert_smoke_render(&mut app, theme)?;
+        app.state.apply_update(Update::TypingStatus {
+            chat_id,
+            topic_id,
+            sender_identity: SenderIdentity::User(1),
+            user_name: "Alice".to_string(),
+            is_typing: false,
+        });
     }
-    assert_smoke_render(&mut app, theme)?;
-    app.state.typing_users.clear();
     run_interaction_smoke(&mut app, &mut client, theme).await?;
     assert_smoke_render(&mut app, theme)?;
     run_mouse_smoke(&mut app, &mut client).await?;
@@ -780,7 +791,7 @@ fn assert_smoke_typing_render(app: &App, rendered: &str) -> Result<()> {
         .selected_typing_users()
         .filter(|users| !users.is_empty())
     {
-        let typing_label = ui::messages::typing_label(users);
+        let typing_label = ui::messages::typing_label(&users);
         if !rendered.contains(&typing_label) {
             return Err(color_eyre::eyre::eyre!(
                 "smoke render did not include the selected chat typing indicator with Unicode separator"
@@ -1574,6 +1585,7 @@ fn trim_prompt_input_line(line: &str) -> String {
     strip_prompt_line_ending(line).trim().to_string()
 }
 
+#[cfg(test)]
 fn preserve_prompt_input_line_spaces(line: &str) -> String {
     strip_prompt_line_ending(line).to_string()
 }
@@ -1620,9 +1632,158 @@ fn prompt_input(msg: &str) -> Result<String> {
     require_prompt_response(response)
 }
 
-fn prompt_input_preserving_spaces(msg: &str) -> Result<String> {
-    let response = read_prompt_line(msg).map(|line| preserve_prompt_input_line_spaces(&line))?;
-    require_prompt_response(response)
+trait SecretPromptOperations {
+    fn enable_no_echo(&mut self) -> Result<()>;
+    fn write_prompt(&mut self, prompt: &str) -> Result<()>;
+    fn flush_prompt(&mut self) -> Result<()>;
+    fn read_secret(&mut self) -> Result<String>;
+    fn restore_echo(&mut self) -> Result<()>;
+    fn write_newline(&mut self) -> Result<()>;
+}
+
+struct CrosstermSecretPromptOperations;
+
+impl SecretPromptOperations for CrosstermSecretPromptOperations {
+    fn enable_no_echo(&mut self) -> Result<()> {
+        enable_raw_mode().map_err(Into::into)
+    }
+
+    fn write_prompt(&mut self, prompt: &str) -> Result<()> {
+        use std::io::Write;
+        io::stdout()
+            .write_all(prompt.as_bytes())
+            .map_err(Into::into)
+    }
+
+    fn flush_prompt(&mut self) -> Result<()> {
+        use std::io::Write;
+        io::stdout().flush().map_err(Into::into)
+    }
+
+    fn read_secret(&mut self) -> Result<String> {
+        let mut secret = String::new();
+        loop {
+            let event = crossterm::event::read().map_err(|error| {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    color_eyre::eyre::eyre!(PROMPT_EOF_ERROR)
+                } else {
+                    error.into()
+                }
+            })?;
+            match event {
+                Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) => return Ok(secret),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Backspace,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) => {
+                    secret.pop();
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "secret input canceled",
+                    )
+                    .into());
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "secret input canceled",
+                    )
+                    .into());
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(character),
+                    modifiers,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if !modifiers.contains(KeyModifiers::CONTROL) => secret.push(character),
+                _ => {}
+            }
+        }
+    }
+
+    fn restore_echo(&mut self) -> Result<()> {
+        disable_raw_mode().map_err(Into::into)
+    }
+
+    fn write_newline(&mut self) -> Result<()> {
+        use std::io::Write;
+        io::stdout().write_all(b"\n").map_err(Into::into)
+    }
+}
+
+struct SecretPromptGuard<'a, O: SecretPromptOperations> {
+    operations: &'a mut O,
+    restored: bool,
+}
+
+impl<'a, O: SecretPromptOperations> SecretPromptGuard<'a, O> {
+    fn enable(operations: &'a mut O) -> Result<Self> {
+        operations.enable_no_echo()?;
+        Ok(Self {
+            operations,
+            restored: false,
+        })
+    }
+
+    fn operations(&mut self) -> &mut O {
+        self.operations
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        self.restored = true;
+        self.operations.restore_echo()
+    }
+}
+
+impl<O: SecretPromptOperations> Drop for SecretPromptGuard<'_, O> {
+    fn drop(&mut self) {
+        if !self.restored {
+            self.restored = true;
+            let _ = self.operations.restore_echo();
+        }
+    }
+}
+
+fn prompt_secret_with<O: SecretPromptOperations>(
+    operations: &mut O,
+    prompt: &str,
+) -> Result<String> {
+    let mut guard = SecretPromptGuard::enable(operations)?;
+    let read_result = (|| {
+        let operations = guard.operations();
+        operations.write_prompt(prompt)?;
+        operations.flush_prompt()?;
+        operations.read_secret()
+    })();
+    let restore_result = guard.restore();
+    match (read_result, restore_result) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(secret), Ok(())) => {
+            guard.operations().write_newline()?;
+            require_prompt_response(secret)
+        }
+    }
+}
+
+fn prompt_secret(msg: &str) -> Result<String> {
+    prompt_secret_with(&mut CrosstermSecretPromptOperations, msg)
 }
 
 fn wait_for_enter_to_start() -> Result<()> {
@@ -2472,8 +2633,16 @@ fn drain_ready_results<C: TelegramClient + Clone + Send + Sync + 'static>(
     while let Ok(result) = loop_state.initial_state_rx.try_recv() {
         #[cfg(test)]
         loop_state.drain_trace.push("initial".to_string());
+        let chat_last_message_ids = result
+            .result
+            .as_ref()
+            .ok()
+            .map(|load| load.chat_last_message_ids.clone());
         let succeeded = result.result.is_ok();
         apply_initial_state_load_result(app, result, mark_read_loader);
+        if let Some(chat_last_message_ids) = chat_last_message_ids {
+            loop_state.reconciliation_high_water_ids = chat_last_message_ids;
+        }
         loop_state.initial_state_pending = false;
         let now = TokioInstant::now();
         if succeeded {
@@ -5915,6 +6084,7 @@ mod tests {
             id,
             chat_id: 10,
             thread_topic_id: None,
+            sender_identity: None,
             sender_name: "Alice".to_string(),
             content: format!("message {id}"),
             timestamp: Utc::now(),
@@ -6354,6 +6524,63 @@ mod tests {
             ]
         );
         assert_eq!(app.state.error_message.as_deref(), Some("queued"));
+    }
+
+    #[test]
+    fn startup_snapshot_high_water_discards_represented_background_update_once() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        let mut represented = message(10);
+        represented.chat_id = 2;
+        represented.content = "represented".to_string();
+        let mut newer = message(11);
+        newer.chat_id = 2;
+        newer.content = "newer".to_string();
+        loop_state.deferred_updates =
+            vec![Update::NewMessage(represented), Update::NewMessage(newer)];
+        let mut background = chat(2);
+        background.unread_count = 5;
+        let mut high_water = HashMap::new();
+        high_water.insert(2, 10);
+        senders
+            .initial_state
+            .send(InitialStateLoadResult {
+                result: Ok(crate::actions::InitialStateLoad {
+                    folders: vec![all_folder(5)],
+                    chats: vec![chat(1), background],
+                    chat_last_message_ids: high_water,
+                    messages: Ok(Vec::new()),
+                    thread_topics: Vec::new(),
+                }),
+            })
+            .unwrap();
+
+        let client = MockTelegramClient::new();
+        let subscribe_loader =
+            SubscribeUpdatesLoader::new(client.clone(), senders.subscribe_updates);
+        let reconciliation_loader =
+            ReconciliationLoader::new(client.clone(), senders.reconciliation);
+        let chat_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
+        let older_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
+        let folder_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
+        let mark_read_loader = MarkChatReadLoader::new(client.clone());
+        let preview_loader = MediaPreviewLoader::new(client, senders.media_preview);
+        let mut app = App::new();
+
+        assert!(drain_ready_results(
+            &mut loop_state,
+            &mut app,
+            &subscribe_loader,
+            &reconciliation_loader,
+            &chat_loader,
+            &older_loader,
+            &folder_loader,
+            &mark_read_loader,
+            &preview_loader,
+        ));
+        assert_eq!(app.state.chats[1].unread_count, 6);
+        assert_eq!(app.state.chats[1].last_message.as_deref(), Some("newer"));
+        assert!(loop_state.deferred_updates.is_empty());
+        assert_eq!(loop_state.reconciliation_high_water_ids.get(&2), Some(&10));
     }
 
     #[tokio::test]
@@ -8450,6 +8677,7 @@ mod tests {
                 result: Ok(crate::actions::InitialStateLoad {
                     folders: vec![all_folder(0)],
                     chats: vec![chat(1)],
+                    chat_last_message_ids: HashMap::new(),
                     messages: Ok(vec![loaded_message]),
                     thread_topics: Vec::new(),
                 }),
@@ -8492,6 +8720,7 @@ mod tests {
                 result: Ok(crate::actions::InitialStateLoad {
                     folders: vec![all_folder(0)],
                     chats: vec![forum_chat],
+                    chat_last_message_ids: HashMap::new(),
                     messages: Ok(vec![topic_message]),
                     thread_topics: vec![thread_topic(101, 2), thread_topic(102, 2)],
                 }),
@@ -10109,6 +10338,132 @@ mod tests {
                 "Telegram session is not authorized. Run `{APP_COMMAND} --config config.toml` to log in."
             )
         );
+    }
+
+    struct FakeSecretPromptOperations {
+        trace: Vec<&'static str>,
+        output: String,
+        secret: Option<String>,
+        fail_at: Vec<&'static str>,
+        panic_on_read: bool,
+    }
+
+    impl FakeSecretPromptOperations {
+        fn success(secret: &str) -> Self {
+            Self {
+                trace: Vec::new(),
+                output: String::new(),
+                secret: Some(secret.to_string()),
+                fail_at: Vec::new(),
+                panic_on_read: false,
+            }
+        }
+
+        fn step(&mut self, step: &'static str) -> Result<()> {
+            self.trace.push(step);
+            if self.fail_at.contains(&step) {
+                Err(color_eyre::eyre::eyre!(step))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl super::SecretPromptOperations for FakeSecretPromptOperations {
+        fn enable_no_echo(&mut self) -> Result<()> {
+            self.step("enable")
+        }
+        fn write_prompt(&mut self, prompt: &str) -> Result<()> {
+            self.step("write")?;
+            self.output.push_str(prompt);
+            Ok(())
+        }
+        fn flush_prompt(&mut self) -> Result<()> {
+            self.step("flush")
+        }
+        fn read_secret(&mut self) -> Result<String> {
+            self.step("read")?;
+            assert!(!self.panic_on_read, "panicking secret reader");
+            self.secret
+                .take()
+                .ok_or_else(|| color_eyre::eyre::eyre!(PROMPT_EOF_ERROR))
+        }
+        fn restore_echo(&mut self) -> Result<()> {
+            self.step("restore")
+        }
+        fn write_newline(&mut self) -> Result<()> {
+            self.step("newline")?;
+            self.output.push('\n');
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn secret_prompt_enables_before_output_and_restores_on_every_read_path() {
+        let mut success = FakeSecretPromptOperations::success("  pass phrase  ");
+        assert_eq!(
+            super::prompt_secret_with(&mut success, LOGIN_2FA_PROMPT).unwrap(),
+            "  pass phrase  "
+        );
+        assert_eq!(
+            success.trace,
+            ["enable", "write", "flush", "read", "restore", "newline"]
+        );
+        assert_eq!(success.output, format!("{LOGIN_2FA_PROMPT}\n"));
+        assert!(!success.output.contains("pass phrase"));
+
+        for failure in ["write", "flush", "read"] {
+            let mut operations = FakeSecretPromptOperations::success("secret");
+            operations.fail_at = vec![failure];
+            assert_eq!(
+                super::prompt_secret_with(&mut operations, LOGIN_2FA_PROMPT)
+                    .unwrap_err()
+                    .to_string(),
+                failure
+            );
+            assert_eq!(operations.trace.last(), Some(&"restore"));
+            assert!(!operations.trace.contains(&"newline"));
+        }
+
+        let mut eof = FakeSecretPromptOperations::success("secret");
+        eof.secret = None;
+        assert_eq!(
+            super::prompt_secret_with(&mut eof, LOGIN_2FA_PROMPT)
+                .unwrap_err()
+                .to_string(),
+            PROMPT_EOF_ERROR
+        );
+        assert_eq!(eof.trace.last(), Some(&"restore"));
+
+        let mut restore = FakeSecretPromptOperations::success("secret");
+        restore.fail_at = vec!["restore"];
+        assert_eq!(
+            super::prompt_secret_with(&mut restore, LOGIN_2FA_PROMPT)
+                .unwrap_err()
+                .to_string(),
+            "restore"
+        );
+        assert!(!restore.trace.contains(&"newline"));
+
+        let mut read_and_restore = FakeSecretPromptOperations::success("secret");
+        read_and_restore.fail_at = vec!["read", "restore"];
+        assert_eq!(
+            super::prompt_secret_with(&mut read_and_restore, LOGIN_2FA_PROMPT)
+                .unwrap_err()
+                .to_string(),
+            "read"
+        );
+
+        let mut panicking = FakeSecretPromptOperations::success("secret");
+        panicking.panic_on_read = true;
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = super::prompt_secret_with(&mut panicking, LOGIN_2FA_PROMPT);
+            }))
+            .is_err()
+        );
+        assert_eq!(panicking.trace.last(), Some(&"restore"));
+        assert!(!panicking.trace.contains(&"newline"));
     }
 
     #[test]

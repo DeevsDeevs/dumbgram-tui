@@ -562,6 +562,7 @@ mod tests {
             id: -1,
             chat_id: 10,
             thread_topic_id: None,
+            sender_identity: None,
             sender_name: OWN_SENDER_NAME.to_string(),
             content: "failed draft".to_string(),
             timestamp: Utc::now(),

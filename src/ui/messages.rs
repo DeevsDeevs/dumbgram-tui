@@ -416,7 +416,7 @@ pub(crate) fn message_position_label(selected_index: usize, message_count: usize
 fn selected_chat_typing_label(app: &App) -> String {
     app.state
         .selected_typing_users()
-        .map(|users| typing_label(users))
+        .map(|users| typing_label(&users))
         .unwrap_or_default()
 }
 

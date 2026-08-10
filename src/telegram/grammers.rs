@@ -17,8 +17,8 @@ use tokio::sync::mpsc;
 use super::client::{DownloadedMedia, ReconciliationChatList, TelegramClient};
 use super::types::{
     Chat, Folder, Message, MessageMedia, MessageMediaKind, MessageStatus, OWN_SENDER_NAME,
-    ThreadTopic, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update, all_folder,
-    message_display_preview,
+    SenderIdentity, ThreadTopic, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update,
+    all_folder, message_display_preview,
 };
 use crate::diagnostics;
 
@@ -333,10 +333,31 @@ fn typing_user_label(peer: &tl::enums::Peer, user_name: Option<String>) -> Strin
 }
 
 fn send_action_is_typing(action: &tl::enums::SendMessageAction) -> bool {
-    !matches!(
+    matches!(
         action,
-        tl::enums::SendMessageAction::SendMessageCancelAction
+        tl::enums::SendMessageAction::SendMessageTypingAction
     )
+}
+
+fn sender_identity_from_peer(peer: &tl::enums::Peer) -> SenderIdentity {
+    match peer {
+        tl::enums::Peer::User(peer) => SenderIdentity::User(peer.user_id),
+        tl::enums::Peer::Chat(peer) => SenderIdentity::Chat(peer.chat_id),
+        tl::enums::Peer::Channel(peer) => SenderIdentity::Channel(peer.channel_id),
+    }
+}
+
+fn sender_identity_from_chat(chat: &grammers_client::types::Chat) -> SenderIdentity {
+    match chat {
+        grammers_client::types::Chat::User(user) => SenderIdentity::User(user.id()),
+        grammers_client::types::Chat::Channel(channel) => SenderIdentity::Channel(channel.id()),
+        grammers_client::types::Chat::Group(group) => match &group.raw {
+            tl::enums::Chat::Channel(_) | tl::enums::Chat::ChannelForbidden(_) => {
+                SenderIdentity::Channel(group.id())
+            }
+            _ => SenderIdentity::Chat(group.id()),
+        },
+    }
 }
 
 fn typing_status_update_from_raw_with_user_names(
@@ -352,6 +373,7 @@ fn typing_status_update_from_raw_with_user_names(
             Some(Update::TypingStatus {
                 chat_id: update.channel_id,
                 topic_id: update.top_msg_id,
+                sender_identity: sender_identity_from_peer(&update.from_id),
                 user_name: typing_user_label(&update.from_id, user_name),
                 is_typing: send_action_is_typing(&update.action),
             })
@@ -364,6 +386,7 @@ fn typing_status_update_from_raw_with_user_names(
             Some(Update::TypingStatus {
                 chat_id: update.chat_id,
                 topic_id: None,
+                sender_identity: sender_identity_from_peer(&update.from_id),
                 user_name: typing_user_label(&update.from_id, user_name),
                 is_typing: send_action_is_typing(&update.action),
             })
@@ -371,6 +394,7 @@ fn typing_status_update_from_raw_with_user_names(
         tl::enums::Update::UserTyping(update) => Some(Update::TypingStatus {
             chat_id: update.user_id,
             topic_id: None,
+            sender_identity: SenderIdentity::User(update.user_id),
             user_name: user_name_for_id(update.user_id)
                 .unwrap_or_else(|| format!("User {}", update.user_id)),
             is_typing: send_action_is_typing(&update.action),
@@ -481,15 +505,17 @@ fn convert_message(
     let is_outgoing = msg.outgoing();
     let chat = msg.chat();
     let media = message_media(msg.media().as_ref());
+    let sender = msg.sender();
     let thread_topic_id =
         message_thread_topic_id(msg.raw.reply_to.as_ref(), grammers_chat_is_forum(&chat));
     Message {
         id: msg.id(),
         chat_id: chat.id(),
         thread_topic_id,
+        sender_identity: sender.as_ref().map(sender_identity_from_chat),
         sender_name: message_sender_name(
             is_outgoing,
-            msg.sender().map(|s| s.name().to_string()),
+            sender.map(|sender| sender.name().to_string()),
             msg.raw.post_author.clone(),
             Some(chat.name().to_string()),
         ),
@@ -1904,11 +1930,13 @@ mod tests {
         dialog_chats_from_page_parts, dumbgram_init_params, folders_from_dialog_filters,
         input_peers_contain_chat, media_cache_dir, message_sender_name,
         message_status_for_read_state, message_thread_topic_id, publish_downloaded_thumbnail,
-        read_outbox_update_from_raw, thread_topic_from_tl, typing_status_update_from_raw,
+        read_outbox_update_from_raw, send_action_is_typing, sender_identity_from_peer,
+        thread_topic_from_tl, typing_status_update_from_raw,
         typing_status_update_from_raw_with_user_names, update_error_message,
     };
     use crate::telegram::types::{
-        MessageStatus, OWN_SENDER_NAME, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update,
+        MessageStatus, OWN_SENDER_NAME, SenderIdentity, UNKNOWN_DELETE_UPDATE_CHAT_ID,
+        UNKNOWN_SENDER_NAME, Update,
     };
     use grammers_client::grammers_tl_types as tl;
     use grammers_session::{PackedChat, PackedType};
@@ -2309,6 +2337,40 @@ mod tests {
     }
 
     #[test]
+    fn only_actual_typing_action_is_classified_as_typing() {
+        assert!(send_action_is_typing(
+            &tl::enums::SendMessageAction::SendMessageTypingAction
+        ));
+        assert!(!send_action_is_typing(
+            &tl::enums::SendMessageAction::SendMessageCancelAction
+        ));
+        assert!(!send_action_is_typing(
+            &tl::enums::SendMessageAction::SendMessageRecordVideoAction
+        ));
+        assert!(!send_action_is_typing(
+            &tl::enums::SendMessageAction::SendMessageRecordAudioAction
+        ));
+    }
+
+    #[test]
+    fn peer_sender_identities_preserve_telegram_namespace() {
+        assert_eq!(
+            sender_identity_from_peer(&tl::enums::Peer::User(tl::types::PeerUser { user_id: 42 })),
+            SenderIdentity::User(42)
+        );
+        assert_eq!(
+            sender_identity_from_peer(&tl::enums::Peer::Chat(tl::types::PeerChat { chat_id: 42 })),
+            SenderIdentity::Chat(42)
+        );
+        assert_eq!(
+            sender_identity_from_peer(&tl::enums::Peer::Channel(tl::types::PeerChannel {
+                channel_id: 42,
+            })),
+            SenderIdentity::Channel(42)
+        );
+    }
+
+    #[test]
     fn raw_topic_typing_updates_keep_topic_id() {
         let update = typing_status_update_from_raw(&tl::enums::Update::ChannelUserTyping(
             tl::types::UpdateChannelUserTyping {
@@ -2323,11 +2385,13 @@ mod tests {
             Some(Update::TypingStatus {
                 chat_id,
                 topic_id,
+                sender_identity,
                 user_name,
                 is_typing,
             }) => {
                 assert_eq!(chat_id, 99);
                 assert_eq!(topic_id, Some(101));
+                assert_eq!(sender_identity, SenderIdentity::User(42));
                 assert_eq!(user_name, "User 42");
                 assert!(is_typing);
             }
@@ -2368,11 +2432,13 @@ mod tests {
             Some(Update::TypingStatus {
                 chat_id,
                 topic_id,
+                sender_identity,
                 user_name,
                 is_typing,
             }) => {
                 assert_eq!(chat_id, 99);
                 assert_eq!(topic_id, Some(101));
+                assert_eq!(sender_identity, SenderIdentity::User(42));
                 assert_eq!(user_name, "User 42");
                 assert!(!is_typing);
             }

@@ -26,6 +26,13 @@ pub fn message_display_preview(media: Option<&MessageMedia>, content: &str) -> S
     message_preview(&message_display_content(media, content))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SenderIdentity {
+    User(i64),
+    Chat(i64),
+    Channel(i64),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageStatus {
     Sending,
@@ -54,6 +61,7 @@ pub enum Update {
     TypingStatus {
         chat_id: i64,
         topic_id: Option<i32>,
+        sender_identity: SenderIdentity,
         user_name: String,
         is_typing: bool,
     },
@@ -161,6 +169,7 @@ pub struct Message {
     pub id: i32,
     pub chat_id: i64,
     pub thread_topic_id: Option<i32>,
+    pub sender_identity: Option<SenderIdentity>,
     pub sender_name: String,
     pub content: String,
     pub timestamp: DateTime<Utc>,

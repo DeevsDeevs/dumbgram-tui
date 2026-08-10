@@ -1,7 +1,7 @@
 use crate::diagnostics;
 use crate::telegram::types::{
-    Chat, Folder, Message, MessageMediaKind, MessageStatus, OWN_SENDER_NAME, ThreadTopic,
-    UNKNOWN_DELETE_UPDATE_CHAT_ID, Update, is_all_folder, message_display_content,
+    Chat, Folder, Message, MessageMediaKind, MessageStatus, OWN_SENDER_NAME, SenderIdentity,
+    ThreadTopic, UNKNOWN_DELETE_UPDATE_CHAT_ID, Update, is_all_folder, message_display_content,
     message_display_preview,
 };
 use crate::text::{display_width, wrap_display_lines_limited};
@@ -47,6 +47,7 @@ pub(crate) const FOLDER_VIEWPORT_RESERVED_COLUMNS: u16 = 4;
 pub(crate) const MESSAGE_ROW_HEIGHT: usize = 1;
 pub(crate) const REPLY_MESSAGE_ROW_HEIGHT: usize = 2;
 pub(crate) const TYPING_ACTION_COOLDOWN: Duration = Duration::from_secs(4);
+pub(crate) const TYPING_ACTIVITY_LIFETIME: Duration = Duration::from_secs(5);
 pub(crate) const MAX_REMOTE_MESSAGES: usize = 500;
 
 fn last_index(item_count: usize) -> usize {
@@ -218,6 +219,19 @@ struct MessageWindowAnchors {
 struct ConversationScope {
     chat_id: i64,
     topic_id: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TypingActivityKey {
+    chat_id: i64,
+    topic_id: Option<i32>,
+    sender_identity: SenderIdentity,
+}
+
+#[derive(Debug)]
+struct TypingActivity {
+    display_name: String,
+    expires_at: tokio::time::Instant,
 }
 
 #[derive(Debug, Default)]
@@ -445,8 +459,7 @@ pub struct AppState {
     pub status_timestamp: Option<tokio::time::Instant>,
     pub last_downloaded_media: Option<DownloadedMediaReference>,
     pub modal: Option<ModalState>,
-    pub typing_users: HashMap<i64, Vec<String>>,
-    pub thread_typing_users: HashMap<(i64, i32), Vec<String>>,
+    typing_activity: BTreeMap<TypingActivityKey, TypingActivity>,
     pub conversation_load_status: ConversationLoadStatus,
     last_typing_action_context: Option<(i64, Option<i32>)>,
     last_typing_action_at: Option<Instant>,
@@ -502,8 +515,7 @@ impl AppState {
             status_timestamp: None,
             last_downloaded_media: None,
             modal: None,
-            typing_users: HashMap::new(),
-            thread_typing_users: HashMap::new(),
+            typing_activity: BTreeMap::new(),
             conversation_load_status: ConversationLoadStatus::Idle,
             last_typing_action_context: None,
             last_typing_action_at: None,
@@ -2360,8 +2372,7 @@ impl AppState {
             self.clear_selected_scope_older_history_exhausted();
         }
 
-        self.typing_users.clear();
-        self.thread_typing_users.clear();
+        self.typing_activity.clear();
         self.revalidate_reconciled_targets();
         if selected_chat_changed {
             self.clear_input_mode();
@@ -2467,11 +2478,8 @@ impl AppState {
                     return None;
                 }
 
-                self.clear_typing_user(msg.chat_id, &msg.sender_name);
-                if let Some(topic_id) = msg.thread_topic_id {
-                    self.clear_thread_typing_user(msg.chat_id, topic_id, &msg.sender_name);
-                } else {
-                    self.clear_thread_typing_user_for_chat(msg.chat_id, &msg.sender_name);
+                if let Some(sender_identity) = msg.sender_identity {
+                    self.clear_typing_activity(msg.chat_id, msg.thread_topic_id, sender_identity);
                 }
 
                 let was_following_tail = should_append_to_loaded_messages
@@ -2598,24 +2606,25 @@ impl AppState {
             Update::TypingStatus {
                 chat_id,
                 topic_id,
+                sender_identity,
                 user_name,
                 is_typing,
             } => {
+                let key = TypingActivityKey {
+                    chat_id,
+                    topic_id,
+                    sender_identity,
+                };
                 if is_typing {
-                    let users = if let Some(topic_id) = topic_id {
-                        self.thread_typing_users
-                            .entry((chat_id, topic_id))
-                            .or_default()
-                    } else {
-                        self.typing_users.entry(chat_id).or_default()
-                    };
-                    if !users.contains(&user_name) {
-                        users.push(user_name);
-                    }
-                } else if let Some(topic_id) = topic_id {
-                    self.clear_thread_typing_user(chat_id, topic_id, &user_name);
+                    self.typing_activity.insert(
+                        key,
+                        TypingActivity {
+                            display_name: user_name,
+                            expires_at: tokio::time::Instant::now() + TYPING_ACTIVITY_LIFETIME,
+                        },
+                    );
                 } else {
-                    self.clear_typing_user(chat_id, &user_name);
+                    self.typing_activity.remove(&key);
                 }
             }
             Update::Error(error) => self.set_error(error),
@@ -2623,41 +2632,29 @@ impl AppState {
         presented_incoming
     }
 
-    pub fn selected_typing_users(&self) -> Option<&Vec<String>> {
+    pub fn selected_typing_users(&self) -> Option<Vec<String>> {
         let chat_id = self.selected_chat_id()?;
-        if let Some(topic) = self.selected_thread_topic() {
-            self.thread_typing_users.get(&(chat_id, topic.id))
-        } else {
-            self.typing_users.get(&chat_id)
-        }
+        let topic_id = self.selected_thread_topic().map(|topic| topic.id);
+        let users = self
+            .typing_activity
+            .iter()
+            .filter(|(key, _)| key.chat_id == chat_id && key.topic_id == topic_id)
+            .map(|(_, activity)| activity.display_name.clone())
+            .collect::<Vec<_>>();
+        (!users.is_empty()).then_some(users)
     }
 
-    fn clear_typing_user(&mut self, chat_id: i64, user_name: &str) {
-        if let Some(users) = self.typing_users.get_mut(&chat_id) {
-            users.retain(|user| user != user_name);
-            if users.is_empty() {
-                self.typing_users.remove(&chat_id);
-            }
-        }
-    }
-
-    fn clear_thread_typing_user(&mut self, chat_id: i64, topic_id: i32, user_name: &str) {
-        if let Some(users) = self.thread_typing_users.get_mut(&(chat_id, topic_id)) {
-            users.retain(|user| user != user_name);
-            if users.is_empty() {
-                self.thread_typing_users.remove(&(chat_id, topic_id));
-            }
-        }
-    }
-
-    fn clear_thread_typing_user_for_chat(&mut self, chat_id: i64, user_name: &str) {
-        self.thread_typing_users
-            .retain(|(typing_chat_id, _), users| {
-                if *typing_chat_id == chat_id {
-                    users.retain(|user| user != user_name);
-                }
-                !users.is_empty()
-            });
+    fn clear_typing_activity(
+        &mut self,
+        chat_id: i64,
+        topic_id: Option<i32>,
+        sender_identity: SenderIdentity,
+    ) {
+        self.typing_activity.remove(&TypingActivityKey {
+            chat_id,
+            topic_id,
+            sender_identity,
+        });
     }
 
     pub fn chat_visible_capacity(&self) -> usize {
@@ -3153,6 +3150,7 @@ impl AppState {
             id: temp_id,
             chat_id,
             thread_topic_id,
+            sender_identity: None,
             sender_name: OWN_SENDER_NAME.to_string(),
             content,
             timestamp: Utc::now(),
@@ -3308,11 +3306,20 @@ impl AppState {
     }
 
     pub fn notification_deadline(&self) -> Option<tokio::time::Instant> {
-        match (self.error_timestamp, self.status_timestamp) {
+        let notification = match (self.error_timestamp, self.status_timestamp) {
             (Some(error), Some(status)) => Some(error.min(status)),
             (error, status) => error.or(status),
         }
-        .map(|timestamp| timestamp + NOTIFICATION_LIFETIME)
+        .map(|timestamp| timestamp + NOTIFICATION_LIFETIME);
+        let typing = self
+            .typing_activity
+            .values()
+            .map(|activity| activity.expires_at)
+            .min();
+        match (notification, typing) {
+            (Some(notification), Some(typing)) => Some(notification.min(typing)),
+            (notification, typing) => notification.or(typing),
+        }
     }
 
     pub fn check_notification_timeout(&mut self) -> bool {
@@ -3330,8 +3337,11 @@ impl AppState {
         if clear_status {
             self.clear_status();
         }
+        let typing_count = self.typing_activity.len();
+        self.typing_activity
+            .retain(|_, activity| now < activity.expires_at);
 
-        clear_error || clear_status
+        clear_error || clear_status || self.typing_activity.len() != typing_count
     }
 }
 
@@ -3353,13 +3363,13 @@ mod tests {
         NOTIFICATION_LIFETIME, PANEL_BORDER_RESERVED_COLUMNS, PANEL_BORDER_RESERVED_ROWS,
         PresentedIncomingMessage, REMOTE_EDIT_WHILE_EDITING_STATUS, REPLY_MESSAGE_ROW_HEIGHT,
         REPLY_SENT_STATUS, ReconciliationApply, ReconciliationSnapshot, SPLIT_RATIO_STEP,
-        TYPING_ACTION_COOLDOWN, delete_failed_error, delete_update_matches_chat, edit_failed_error,
-        last_index, message_visible_row_height, message_visible_row_height_for_width,
-        reply_failed_error, send_failed_error,
+        TYPING_ACTION_COOLDOWN, TYPING_ACTIVITY_LIFETIME, delete_failed_error,
+        delete_update_matches_chat, edit_failed_error, last_index, message_visible_row_height,
+        message_visible_row_height_for_width, reply_failed_error, send_failed_error,
     };
     use crate::telegram::types::{
-        Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, ThreadTopic,
-        UNKNOWN_DELETE_UPDATE_CHAT_ID, Update, all_folder,
+        Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, SenderIdentity,
+        ThreadTopic, UNKNOWN_DELETE_UPDATE_CHAT_ID, Update, all_folder,
     };
     use chrono::Utc;
     use ratatui::layout::Rect;
@@ -3442,6 +3452,7 @@ mod tests {
             id,
             chat_id: 10,
             thread_topic_id: None,
+            sender_identity: None,
             sender_name: "Alice".to_string(),
             content: format!("message {}", id),
             timestamp: Utc::now(),
@@ -3461,6 +3472,7 @@ mod tests {
             id,
             chat_id,
             thread_topic_id: None,
+            sender_identity: Some(SenderIdentity::User(if is_own { 0 } else { 1 })),
             sender_name: if is_own { OWN_SENDER_NAME } else { "Alice" }.to_string(),
             content: content.to_string(),
             timestamp: Utc::now(),
@@ -3472,6 +3484,22 @@ mod tests {
             can_edit: is_own,
             can_delete: is_own,
             error: None,
+        }
+    }
+
+    fn typing_update(
+        chat_id: i64,
+        topic_id: Option<i32>,
+        user_id: i64,
+        user_name: &str,
+        is_typing: bool,
+    ) -> Update {
+        Update::TypingStatus {
+            chat_id,
+            topic_id,
+            sender_identity: SenderIdentity::User(user_id),
+            user_name: user_name.to_string(),
+            is_typing,
         }
     }
 
@@ -3786,12 +3814,11 @@ mod tests {
     }
 
     #[test]
-    fn incoming_message_clears_sender_typing_indicator() {
+    fn incoming_message_clears_only_matching_sender_typing_identity() {
         let mut state = AppState::new();
         state.chats = vec![chat_with_unread(1, "Chat 1", 0, Some(2))];
-        state
-            .typing_users
-            .insert(1, vec!["Alice".to_string(), "Bob".to_string()]);
+        state.apply_update(typing_update(1, None, 1, "Same name", true));
+        state.apply_update(typing_update(1, None, 2, "Same name", true));
 
         state.apply_update(Update::NewMessage(update_message(
             10,
@@ -3800,7 +3827,10 @@ mod tests {
             false,
         )));
 
-        assert_eq!(state.typing_users.get(&1), Some(&vec!["Bob".to_string()]));
+        assert_eq!(
+            state.selected_typing_users(),
+            Some(vec!["Same name".to_string()])
+        );
     }
 
     #[test]
@@ -3816,24 +3846,41 @@ mod tests {
             is_pinned: false,
         }]);
 
-        state.apply_update(Update::TypingStatus {
-            chat_id: 1,
-            topic_id: Some(101),
-            user_name: "Alice".to_string(),
-            is_typing: true,
-        });
-        state.apply_update(Update::TypingStatus {
-            chat_id: 1,
-            topic_id: None,
-            user_name: "Bob".to_string(),
-            is_typing: true,
-        });
+        state.apply_update(typing_update(1, Some(101), 1, "Alice", true));
+        state.apply_update(typing_update(1, None, 2, "Bob", true));
 
         assert_eq!(
             state.selected_typing_users(),
-            Some(&vec!["Alice".to_string()])
+            Some(vec!["Alice".to_string()])
         );
-        assert_eq!(state.typing_users.get(&1), Some(&vec!["Bob".to_string()]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_activity_keeps_stable_identities_refreshes_labels_and_expires() {
+        let mut state = AppState::new();
+        state.chats = vec![chat_with_unread(1, "Chat", 0, None)];
+        state.apply_update(typing_update(1, None, 1, "Same", true));
+        state.apply_update(typing_update(1, None, 2, "Same", true));
+        assert_eq!(
+            state.selected_typing_users(),
+            Some(vec!["Same".to_string(), "Same".to_string()])
+        );
+
+        tokio::time::advance(StdDuration::from_secs(1)).await;
+        state.apply_update(typing_update(1, None, 1, "Renamed", true));
+        state.apply_update(typing_update(1, None, 2, "Same", false));
+        assert_eq!(
+            state.selected_typing_users(),
+            Some(vec!["Renamed".to_string()])
+        );
+        assert_eq!(
+            state.notification_deadline(),
+            Some(tokio::time::Instant::now() + TYPING_ACTIVITY_LIFETIME)
+        );
+
+        tokio::time::advance(TYPING_ACTIVITY_LIFETIME).await;
+        assert!(state.check_notification_timeout());
+        assert_eq!(state.selected_typing_users(), None);
     }
 
     #[test]
@@ -3929,46 +3976,27 @@ mod tests {
     }
 
     #[test]
-    fn incoming_message_clears_thread_typing_indicator_for_sender() {
+    fn incoming_topic_message_clears_only_matching_scope_and_identity() {
         let mut state = AppState::new();
         state.chats = vec![chat_with_unread(1, "Forum", 0, None)];
-        state
-            .thread_typing_users
-            .insert((1, 101), vec!["Alice".to_string(), "Bob".to_string()]);
-
-        state.apply_update(Update::NewMessage(update_message(
-            10,
-            1,
-            "topic message",
-            false,
-        )));
-
-        assert_eq!(
-            state.thread_typing_users.get(&(1, 101)),
-            Some(&vec!["Bob".to_string()])
-        );
-    }
-
-    #[test]
-    fn incoming_topic_message_clears_only_matching_thread_typing_indicator_for_sender() {
-        let mut state = AppState::new();
-        state.chats = vec![chat_with_unread(1, "Forum", 0, None)];
-        state
-            .thread_typing_users
-            .insert((1, 101), vec!["Alice".to_string()]);
-        state
-            .thread_typing_users
-            .insert((1, 102), vec!["Alice".to_string()]);
+        state.apply_loaded_selected_chat_thread_topics(vec![
+            thread_topic(101, "General"),
+            thread_topic(102, "Deployments"),
+        ]);
+        state.apply_update(typing_update(1, Some(101), 1, "Alice", true));
+        state.apply_update(typing_update(1, Some(102), 1, "Alice", true));
 
         let mut topic_message = update_message(10, 1, "topic message", false);
         topic_message.thread_topic_id = Some(102);
         state.apply_update(Update::NewMessage(topic_message));
 
+        state.select_thread_topic_at(0);
         assert_eq!(
-            state.thread_typing_users.get(&(1, 101)),
-            Some(&vec!["Alice".to_string()])
+            state.selected_typing_users(),
+            Some(vec!["Alice".to_string()])
         );
-        assert!(!state.thread_typing_users.contains_key(&(1, 102)));
+        state.select_thread_topic_at(1);
+        assert_eq!(state.selected_typing_users(), None);
     }
 
     #[test]

@@ -711,6 +711,7 @@ pub async fn load_older_selected_chat_messages<C: TelegramClient>(
 pub struct InitialStateLoad {
     pub folders: Vec<Folder>,
     pub chats: Vec<Chat>,
+    pub chat_last_message_ids: HashMap<i64, i32>,
     pub messages: std::result::Result<Vec<Message>, String>,
     pub thread_topics: Vec<ThreadTopic>,
 }
@@ -741,24 +742,30 @@ pub async fn fetch_initial_state<C: TelegramClient + Sync>(
         }
     };
 
-    let (chats, messages, thread_topics) = if let Some(folder) = folders.first() {
-        let folder_id = folder_filter_id(folder);
-        match fetch_folder_chats_and_selected_messages(client, folder_id).await {
-            Ok(load) => (load.chats, load.messages, load.thread_topics),
-            Err(error) => {
-                diagnostics::event(
-                    "initial_load_error",
-                    format!(
-                        "stage=chats elapsed_ms={} error={error}",
-                        started.elapsed().as_millis()
-                    ),
-                );
-                return Err(error);
+    let (chats, chat_last_message_ids, messages, thread_topics) =
+        if let Some(folder) = folders.first() {
+            let folder_id = folder_filter_id(folder);
+            match fetch_folder_chats_and_selected_messages(client, folder_id).await {
+                Ok(load) => (
+                    load.chats,
+                    load.chat_last_message_ids,
+                    load.messages,
+                    load.thread_topics,
+                ),
+                Err(error) => {
+                    diagnostics::event(
+                        "initial_load_error",
+                        format!(
+                            "stage=chats elapsed_ms={} error={error}",
+                            started.elapsed().as_millis()
+                        ),
+                    );
+                    return Err(error);
+                }
             }
-        }
-    } else {
-        (Vec::new(), Ok(Vec::new()), Vec::new())
-    };
+        } else {
+            (Vec::new(), HashMap::new(), Ok(Vec::new()), Vec::new())
+        };
 
     diagnostics::event(
         "initial_load_finish",
@@ -775,6 +782,7 @@ pub async fn fetch_initial_state<C: TelegramClient + Sync>(
     Ok(InitialStateLoad {
         folders,
         chats,
+        chat_last_message_ids,
         messages,
         thread_topics,
     })
@@ -1325,6 +1333,7 @@ mod tests {
             id,
             chat_id,
             thread_topic_id: None,
+            sender_identity: None,
             sender_name: OWN_SENDER_NAME.to_string(),
             content: content.to_string(),
             timestamp: Utc::now(),
@@ -2026,6 +2035,12 @@ mod tests {
             .expect("mock initial state should fetch");
         assert_eq!(load.folders.len(), 3);
         assert_eq!(load.chats.len(), 4);
+        assert_eq!(load.chat_last_message_ids.len(), load.chats.len());
+        assert!(
+            load.chats
+                .iter()
+                .all(|chat| load.chat_last_message_ids.contains_key(&chat.id))
+        );
         assert_eq!(
             load.messages
                 .as_ref()
@@ -2514,15 +2529,9 @@ mod tests {
             unexpected_client_call("typing client", "fetch older messages")
         }
 
-        fn send_typing_action(
-            &self,
-            chat_id: i64,
-            topic_id: Option<i32>,
-        ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
-            async move {
-                *self.typed.lock().unwrap() = Some((chat_id, topic_id));
-                Ok(())
-            }
+        async fn send_typing_action(&self, chat_id: i64, topic_id: Option<i32>) -> Result<()> {
+            *self.typed.lock().unwrap() = Some((chat_id, topic_id));
+            Ok(())
         }
 
         async fn send_message(&self, _chat_id: i64, _content: String) -> Result<Message> {
@@ -2610,16 +2619,14 @@ mod tests {
             Ok(vec![first, latest])
         }
 
-        fn mark_thread_read(
+        async fn mark_thread_read(
             &self,
             chat_id: i64,
             topic_id: i32,
             max_message_id: i32,
-        ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
-            async move {
-                *self.marked.lock().unwrap() = Some((chat_id, topic_id, max_message_id));
-                Ok(())
-            }
+        ) -> Result<()> {
+            *self.marked.lock().unwrap() = Some((chat_id, topic_id, max_message_id));
+            Ok(())
         }
 
         async fn send_message(&self, _chat_id: i64, _content: String) -> Result<Message> {
