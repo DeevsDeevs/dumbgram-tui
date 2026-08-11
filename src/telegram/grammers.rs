@@ -25,6 +25,7 @@ use crate::diagnostics;
 const CHAT_NOT_FOUND_IN_CACHE_PREFIX: &str = "Chat not found in cache";
 const CHAT_CACHE_LOCK_FAILED: &str = "Chat cache lock failed";
 const UPDATE_ERROR_PREFIX: &str = "Update error";
+const MAX_DOWNLOAD_COPY_INDEX: u32 = 10_000;
 static MEDIA_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const TELEGRAM_RECONNECT_POLICY: FixedReconnect = FixedReconnect {
@@ -189,14 +190,20 @@ impl GrammersClient {
         let mut chats = Vec::new();
         let mut last_message_ids = HashMap::new();
 
+        let filter_snapshot_unix_time = Utc::now().timestamp();
         while let Some(dialog) = iter.next().await? {
             if chats.len() >= limit {
                 break;
             }
+            if matches!(&dialog.raw, tl::enums::Dialog::Folder(_)) {
+                continue;
+            }
             let dialog_folder_id = dialog_folder_id(&dialog);
             let matches_selected_folder = match (folder_id, dialog_filter.as_ref()) {
                 (None, _) => true,
-                (Some(_), Some(filter)) => dialog_matches_filter(&dialog, filter),
+                (Some(_), Some(filter)) => {
+                    dialog_matches_filter(&dialog, filter, filter_snapshot_unix_time)
+                }
                 (Some(folder_id), None) => dialog_folder_id == Some(folder_id),
             };
             if !matches_selected_folder {
@@ -800,30 +807,85 @@ fn download_extension_for_mime(mime_type: &str) -> Option<&'static str> {
     }
 }
 
+fn truncate_utf8_bytes(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+}
+
+fn trim_download_component_end(value: &mut String) {
+    value.truncate(value.trim_end_matches([' ', '.']).len());
+}
+
+fn is_windows_reserved_device_name(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([' ', '.'])
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem.len() == 4
+            && (stem.as_bytes().starts_with(b"COM") || stem.as_bytes().starts_with(b"LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9')
+}
+
 fn sanitize_download_file_name(name: &str) -> Option<String> {
-    let sanitized = name
+    let mut sanitized = name
         .chars()
         .map(|ch| match ch {
-            '/' | '\\' | ':' | '\0' => '_',
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '\0' => '_',
             ch if ch.is_control() => '_',
             ch => ch,
         })
         .collect::<String>()
         .trim()
         .trim_matches('.')
-        .chars()
-        .take(120)
-        .collect::<String>();
-
-    (!sanitized.is_empty()).then_some(sanitized)
+        .to_string();
+    truncate_utf8_bytes(&mut sanitized, 120);
+    trim_download_component_end(&mut sanitized);
+    if sanitized.is_empty() {
+        return None;
+    }
+    if is_windows_reserved_device_name(&sanitized) {
+        truncate_utf8_bytes(&mut sanitized, 119);
+        trim_download_component_end(&mut sanitized);
+        sanitized.insert(0, '_');
+    }
+    Some(sanitized)
 }
 
-fn available_download_path(destination_dir: &Path, file_name: &str) -> PathBuf {
-    let candidate = destination_dir.join(file_name);
-    if !candidate.exists() {
-        return candidate;
+struct ReservedDownloadPath {
+    path: PathBuf,
+}
+
+impl ReservedDownloadPath {
+    fn path(&self) -> &Path {
+        &self.path
     }
 
+    fn persist(mut self) -> PathBuf {
+        std::mem::take(&mut self.path)
+    }
+}
+
+impl Drop for ReservedDownloadPath {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn reserve_available_download_path(
+    destination_dir: &Path,
+    file_name: &str,
+) -> std::io::Result<ReservedDownloadPath> {
     let path = Path::new(file_name);
     let stem = path
         .file_stem()
@@ -832,18 +894,31 @@ fn available_download_path(destination_dir: &Path, file_name: &str) -> PathBuf {
         .unwrap_or("dumbgram-media");
     let extension = path.extension().and_then(|extension| extension.to_str());
 
-    for copy_index in 1.. {
-        let candidate_name = if let Some(extension) = extension {
-            format!("{stem}-{copy_index}.{extension}")
+    for copy_index in 0..=MAX_DOWNLOAD_COPY_INDEX {
+        let candidate = if copy_index == 0 {
+            destination_dir.join(file_name)
+        } else if let Some(extension) = extension {
+            destination_dir.join(format!("{stem}-{copy_index}.{extension}"))
         } else {
-            format!("{stem}-{copy_index}")
+            destination_dir.join(format!("{stem}-{copy_index}"))
         };
-        let candidate = destination_dir.join(candidate_name);
-        if !candidate.exists() {
-            return candidate;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                drop(file);
+                return Ok(ReservedDownloadPath { path: candidate });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
         }
     }
-    unreachable!("unbounded copy-index loop must return an available path")
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no available media download filename",
+    ))
 }
 
 fn media_thumbnail(media: &grammers_client::types::Media) -> Option<PhotoSize> {
@@ -901,6 +976,47 @@ fn dialog_folder_metadata(dialog: &grammers_client::types::Dialog) -> Option<(i3
         }
         tl::enums::Dialog::Dialog(_) => None,
     }
+}
+
+fn add_dialog_to_folder_unread_snapshot(
+    dialog: &grammers_client::types::Dialog,
+    unfiled_unread_count: &mut usize,
+    concrete_folder_unread_counts: &mut HashMap<i32, usize>,
+    aggregate_folder_unread_counts: &mut HashMap<i32, usize>,
+    folder_names: &mut HashMap<i32, String>,
+) {
+    let unread_count = dialog_unread_count(dialog);
+    match &dialog.raw {
+        tl::enums::Dialog::Dialog(raw) => {
+            if let Some(folder_id) = raw.folder_id {
+                *concrete_folder_unread_counts.entry(folder_id).or_default() += unread_count;
+            } else {
+                *unfiled_unread_count += unread_count;
+            }
+        }
+        tl::enums::Dialog::Folder(_) => {
+            if let Some((folder_id, folder_name)) = dialog_folder_metadata(dialog) {
+                folder_names.entry(folder_id).or_insert(folder_name);
+                aggregate_folder_unread_counts.insert(folder_id, unread_count);
+            }
+        }
+    }
+}
+
+fn merge_folder_unread_snapshot(
+    unfiled_unread_count: usize,
+    mut concrete_folder_unread_counts: HashMap<i32, usize>,
+    aggregate_folder_unread_counts: HashMap<i32, usize>,
+) -> (usize, HashMap<i32, usize>) {
+    for (folder_id, unread_count) in aggregate_folder_unread_counts {
+        concrete_folder_unread_counts.insert(folder_id, unread_count);
+    }
+    let all_unread_count = concrete_folder_unread_counts
+        .values()
+        .fold(unfiled_unread_count, |total, count| {
+            total.saturating_add(*count)
+        });
+    (all_unread_count, concrete_folder_unread_counts)
 }
 
 #[cfg(test)]
@@ -989,20 +1105,26 @@ fn dialog_chats_from_page_parts(
     chats
 }
 
-fn folder_from_dialog_filter(filter: &tl::enums::DialogFilter) -> Option<Folder> {
+fn dialog_filter_id(filter: &tl::enums::DialogFilter) -> Option<i32> {
     match filter {
-        tl::enums::DialogFilter::Filter(filter) if filter.id > 0 => Some(Folder {
-            id: filter.id,
-            name: filter.title.clone(),
-            unread_count: 0,
-        }),
-        tl::enums::DialogFilter::Chatlist(filter) if filter.id > 0 => Some(Folder {
-            id: filter.id,
-            name: filter.title.clone(),
-            unread_count: 0,
-        }),
+        tl::enums::DialogFilter::Filter(filter) if filter.id > 0 => Some(filter.id),
+        tl::enums::DialogFilter::Chatlist(filter) if filter.id > 0 => Some(filter.id),
         _ => None,
     }
+}
+
+fn folder_from_dialog_filter(filter: &tl::enums::DialogFilter) -> Option<Folder> {
+    let id = dialog_filter_id(filter)?;
+    let name = match filter {
+        tl::enums::DialogFilter::Filter(filter) => filter.title.clone(),
+        tl::enums::DialogFilter::Chatlist(filter) => filter.title.clone(),
+        _ => return None,
+    };
+    Some(Folder {
+        id,
+        name,
+        unread_count: 0,
+    })
 }
 
 fn input_peer_matches_chat(
@@ -1051,25 +1173,55 @@ fn chat_matches_filter_categories(
     }
 }
 
+fn dialog_has_unread(dialog: &grammers_client::types::Dialog) -> bool {
+    match &dialog.raw {
+        tl::enums::Dialog::Dialog(raw) => raw.unread_count > 0 || raw.unread_mark,
+        tl::enums::Dialog::Folder(raw) => {
+            raw.unread_muted_messages_count > 0 || raw.unread_unmuted_messages_count > 0
+        }
+    }
+}
+
+fn dialog_is_muted(dialog: &grammers_client::types::Dialog, snapshot_unix_time: i64) -> bool {
+    match &dialog.raw {
+        tl::enums::Dialog::Dialog(raw) => match &raw.notify_settings {
+            tl::enums::PeerNotifySettings::Settings(settings) => settings
+                .mute_until
+                .is_some_and(|mute_until| i64::from(mute_until) > snapshot_unix_time),
+        },
+        tl::enums::Dialog::Folder(_) => false,
+    }
+}
+
 fn dialog_matches_filter(
     dialog: &grammers_client::types::Dialog,
     filter: &tl::enums::DialogFilter,
+    snapshot_unix_time: i64,
 ) -> bool {
+    if matches!(&dialog.raw, tl::enums::Dialog::Folder(_)) {
+        return false;
+    }
     let chat = dialog.chat();
     match filter {
         tl::enums::DialogFilter::Filter(filter) => {
-            if filter.exclude_read && dialog_unread_count(dialog) == 0 {
+            if input_peers_contain_chat(&filter.exclude_peers, chat) {
+                return false;
+            }
+            if input_peers_contain_chat(&filter.pinned_peers, chat)
+                || input_peers_contain_chat(&filter.include_peers, chat)
+            {
+                return true;
+            }
+            if filter.exclude_muted && dialog_is_muted(dialog, snapshot_unix_time) {
+                return false;
+            }
+            if filter.exclude_read && !dialog_has_unread(dialog) {
                 return false;
             }
             if filter.exclude_archived && dialog_folder_id(dialog) == Some(1) {
                 return false;
             }
-            if input_peers_contain_chat(&filter.exclude_peers, chat) {
-                return false;
-            }
-            input_peers_contain_chat(&filter.pinned_peers, chat)
-                || input_peers_contain_chat(&filter.include_peers, chat)
-                || chat_matches_filter_categories(filter, chat)
+            chat_matches_filter_categories(filter, chat)
         }
         tl::enums::DialogFilter::Chatlist(filter) => {
             input_peers_contain_chat(&filter.pinned_peers, chat)
@@ -1079,10 +1231,28 @@ fn dialog_matches_filter(
     }
 }
 
+fn add_dialog_to_filter_unread_counts(
+    dialog: &grammers_client::types::Dialog,
+    filters: &[tl::enums::DialogFilter],
+    snapshot_unix_time: i64,
+    filter_unread_counts: &mut HashMap<i32, usize>,
+) {
+    let unread_count = dialog_unread_count(dialog);
+    for filter in filters {
+        let Some(folder_id) = dialog_filter_id(filter) else {
+            continue;
+        };
+        if dialog_matches_filter(dialog, filter, snapshot_unix_time) {
+            *filter_unread_counts.entry(folder_id).or_default() += unread_count;
+        }
+    }
+}
+
 fn folders_from_dialog_filters(
     filters: Vec<tl::enums::DialogFilter>,
     all_unread_count: usize,
-    mut folder_unread_counts: HashMap<i32, usize>,
+    mut filter_unread_counts: HashMap<i32, usize>,
+    folder_unread_counts: HashMap<i32, usize>,
     mut folder_names: HashMap<i32, String>,
 ) -> Vec<Folder> {
     let mut folders = vec![all_folder(all_unread_count)];
@@ -1096,7 +1266,7 @@ fn folders_from_dialog_filters(
             continue;
         }
 
-        folder.unread_count = folder_unread_counts.remove(&folder.id).unwrap_or_default();
+        folder.unread_count = filter_unread_counts.remove(&folder.id).unwrap_or_default();
         folder_names.remove(&folder.id);
         folders.push(folder);
     }
@@ -1465,15 +1635,18 @@ impl TelegramClient for GrammersClient {
             let media = message
                 .media()
                 .ok_or_else(|| color_eyre::eyre::eyre!("No downloadable media"))?;
-            let path = available_download_path(
+            let reservation = reserve_available_download_path(
                 &destination_dir,
                 &media_download_file_name(chat_id, message_id, &media),
-            );
+            )?;
             self.client
-                .download_media(&Downloadable::Media(media), &path)
+                .download_media(&Downloadable::Media(media), reservation.path())
                 .await?;
-            let bytes = std::fs::metadata(&path).map(|metadata| metadata.len())?;
-            Ok(DownloadedMedia { path, bytes })
+            let bytes = std::fs::metadata(reservation.path()).map(|metadata| metadata.len())?;
+            Ok(DownloadedMedia {
+                path: reservation.persist(),
+                bytes,
+            })
         }
     }
 
@@ -1775,38 +1948,51 @@ impl TelegramClient for GrammersClient {
     #[allow(clippy::manual_async_fn)]
     fn get_folders(&self) -> impl std::future::Future<Output = Result<Vec<Folder>>> + Send + '_ {
         async move {
-            let mut iter = self.client.iter_dialogs();
-            let mut all_unread_count = 0usize;
-            let mut folder_unread_counts = HashMap::new();
-            let mut folder_names = HashMap::new();
-
-            while let Some(dialog) = iter.next().await? {
-                self.cache_dialog_read_state(&dialog)?;
-                let unread_count = dialog_unread_count(&dialog);
-                all_unread_count += unread_count;
-                if let Some((folder_id, folder_name)) = dialog_folder_metadata(&dialog) {
-                    folder_names.entry(folder_id).or_insert(folder_name);
-                    *folder_unread_counts.entry(folder_id).or_default() += unread_count;
-                } else if let Some(folder_id) = dialog_folder_id(&dialog) {
-                    *folder_unread_counts.entry(folder_id).or_default() += unread_count;
-                }
-            }
-
             let dialog_filters = match self
                 .client
                 .invoke(&tl::functions::messages::GetDialogFilters {})
-                .await
+                .await?
             {
-                Ok(tl::enums::messages::DialogFilters::Filters(dialog_filters)) => {
+                tl::enums::messages::DialogFilters::Filters(dialog_filters) => {
                     dialog_filters.filters
                 }
-                Err(_) => Vec::new(),
             };
             self.cache_dialog_filters(&dialog_filters)?;
+
+            let mut iter = self.client.iter_dialogs();
+            let mut unfiled_unread_count = 0usize;
+            let mut filter_unread_counts = HashMap::new();
+            let mut concrete_folder_unread_counts = HashMap::new();
+            let mut aggregate_folder_unread_counts = HashMap::new();
+            let mut folder_names = HashMap::new();
+            let filter_snapshot_unix_time = Utc::now().timestamp();
+
+            while let Some(dialog) = iter.next().await? {
+                self.cache_dialog_read_state(&dialog)?;
+                add_dialog_to_filter_unread_counts(
+                    &dialog,
+                    &dialog_filters,
+                    filter_snapshot_unix_time,
+                    &mut filter_unread_counts,
+                );
+                add_dialog_to_folder_unread_snapshot(
+                    &dialog,
+                    &mut unfiled_unread_count,
+                    &mut concrete_folder_unread_counts,
+                    &mut aggregate_folder_unread_counts,
+                    &mut folder_names,
+                );
+            }
+            let (all_unread_count, folder_unread_counts) = merge_folder_unread_snapshot(
+                unfiled_unread_count,
+                concrete_folder_unread_counts,
+                aggregate_folder_unread_counts,
+            );
 
             Ok(folders_from_dialog_filters(
                 dialog_filters,
                 all_unread_count,
+                filter_unread_counts,
                 folder_unread_counts,
                 folder_names,
             ))
@@ -1923,15 +2109,17 @@ impl TelegramClient for GrammersClient {
 mod tests {
     use super::{
         BoundedChatReadRequest, CHAT_CACHE_LOCK_FAILED, CHAT_NOT_FOUND_IN_CACHE_PREFIX,
-        DialogPageParts, UPDATE_ERROR_PREFIX, bounded_chat_read_request,
+        DialogPageParts, UPDATE_ERROR_PREFIX, add_dialog_to_filter_unread_counts,
+        add_dialog_to_folder_unread_snapshot, bounded_chat_read_request,
         cached_media_thumbnail_path, canonical_session_identity, chat_cache_lock_failed_message,
         chat_matches_filter_categories, chat_not_found_in_cache_message, complete_private_download,
         create_private_download_dir_with, delete_message_updates, delete_update_chat_id,
-        dialog_chats_from_page_parts, dumbgram_init_params, folders_from_dialog_filters,
-        input_peers_contain_chat, media_cache_dir, message_sender_name,
-        message_status_for_read_state, message_thread_topic_id, publish_downloaded_thumbnail,
-        read_outbox_update_from_raw, send_action_is_typing, sender_identity_from_peer,
-        thread_topic_from_tl, typing_status_update_from_raw,
+        dialog_chats_from_page_parts, dialog_matches_filter, dumbgram_init_params,
+        folders_from_dialog_filters, input_peers_contain_chat, media_cache_dir,
+        merge_folder_unread_snapshot, message_sender_name, message_status_for_read_state,
+        message_thread_topic_id, publish_downloaded_thumbnail, read_outbox_update_from_raw,
+        reserve_available_download_path, sanitize_download_file_name, send_action_is_typing,
+        sender_identity_from_peer, thread_topic_from_tl, typing_status_update_from_raw,
         typing_status_update_from_raw_with_user_names, update_error_message,
     };
     use crate::telegram::types::{
@@ -2048,6 +2236,55 @@ mod tests {
         }
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn media_download_paths_are_atomically_reserved_and_cleaned_until_persisted() {
+        let root = private_test_dir("media-save-reservation");
+        let first = reserve_available_download_path(&root, "report.pdf").unwrap();
+        let second = reserve_available_download_path(&root, "report.pdf").unwrap();
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+
+        assert_eq!(first_path.file_name().unwrap(), "report.pdf");
+        assert_eq!(second_path.file_name().unwrap(), "report-1.pdf");
+        assert!(first_path.is_file());
+        assert!(second_path.is_file());
+
+        drop(first);
+        drop(second);
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn media_download_names_are_portable_and_utf8_byte_bounded() {
+        assert_eq!(
+            sanitize_download_file_name("a<b>c:d\"e/f\\g|h?i*j").as_deref(),
+            Some("a_b_c_d_e_f_g_h_i_j")
+        );
+        assert_eq!(
+            sanitize_download_file_name("cOn.tar.gz").as_deref(),
+            Some("_cOn.tar.gz")
+        );
+        assert_eq!(
+            sanitize_download_file_name("Lpt9.any.more").as_deref(),
+            Some("_Lpt9.any.more")
+        );
+        assert_eq!(
+            sanitize_download_file_name(&format!("CON{}x", " ".repeat(117))).as_deref(),
+            Some("_CON")
+        );
+        assert_eq!(
+            sanitize_download_file_name(" name...   ").as_deref(),
+            Some("name")
+        );
+        assert!(sanitize_download_file_name("...").is_none());
+
+        let multibyte = sanitize_download_file_name(&"🙂".repeat(40)).unwrap();
+        assert_eq!(multibyte.len(), 120);
+        assert_eq!(multibyte.chars().count(), 30);
     }
 
     #[cfg(unix)]
@@ -2564,6 +2801,25 @@ mod tests {
         })
     }
 
+    fn dialog(
+        chat_id: i64,
+        unread_count: i32,
+        folder_id: Option<i32>,
+        mute_until: Option<i32>,
+    ) -> grammers_client::types::Dialog {
+        let mut raw = raw_dialog(chat_id, 1, unread_count, folder_id);
+        let tl::enums::Dialog::Dialog(raw_dialog) = &mut raw else {
+            unreachable!("test dialog should be a regular dialog");
+        };
+        let tl::enums::PeerNotifySettings::Settings(settings) = &mut raw_dialog.notify_settings;
+        settings.mute_until = mute_until;
+        grammers_client::types::Dialog {
+            raw,
+            chat: grammers_client::types::Chat::from_raw(raw_chat(chat_id, "Test chat")),
+            last_message: None,
+        }
+    }
+
     fn raw_message(chat_id: i64, message_id: i32, text: &str) -> tl::enums::Message {
         tl::enums::Message::Message(tl::types::Message {
             out: false,
@@ -2650,6 +2906,143 @@ mod tests {
     }
 
     #[test]
+    fn dialog_filter_excludes_muted_categories_but_keeps_explicit_includes() {
+        let muted = dialog(42, 3, None, Some(i32::MAX));
+        let mut filter = dialog_filter(2, "Groups");
+        if let tl::enums::DialogFilter::Filter(filter_data) = &mut filter {
+            filter_data.groups = true;
+            filter_data.exclude_muted = true;
+        }
+
+        assert!(!dialog_matches_filter(&muted, &filter, 0));
+
+        if let tl::enums::DialogFilter::Filter(filter_data) = &mut filter {
+            filter_data
+                .include_peers
+                .push(tl::enums::InputPeer::Chat(tl::types::InputPeerChat {
+                    chat_id: 42,
+                }));
+        }
+        assert!(dialog_matches_filter(&muted, &filter, 0));
+
+        if let tl::enums::DialogFilter::Filter(filter_data) = &mut filter {
+            filter_data
+                .exclude_peers
+                .push(tl::enums::InputPeer::Chat(tl::types::InputPeerChat {
+                    chat_id: 42,
+                }));
+        }
+        assert!(!dialog_matches_filter(&muted, &filter, 0));
+    }
+
+    #[test]
+    fn dialog_filter_treats_manual_unread_mark_as_unread() {
+        let mut marked = dialog(42, 0, None, None);
+        let tl::enums::Dialog::Dialog(raw) = &mut marked.raw else {
+            unreachable!("test dialog should be regular");
+        };
+        raw.unread_mark = true;
+        let mut filter = dialog_filter(2, "Unread groups");
+        if let tl::enums::DialogFilter::Filter(filter) = &mut filter {
+            filter.groups = true;
+            filter.exclude_read = true;
+        }
+
+        assert!(dialog_matches_filter(&marked, &filter, 0));
+    }
+
+    #[test]
+    fn pseudo_folder_dialogs_do_not_enter_custom_filter_membership() {
+        let pseudo = grammers_client::types::Dialog {
+            raw: tl::enums::Dialog::Folder(tl::types::DialogFolder {
+                pinned: false,
+                folder: tl::types::Folder {
+                    autofill_new_broadcasts: false,
+                    autofill_public_groups: false,
+                    autofill_new_correspondents: false,
+                    id: 1,
+                    title: "Archived".to_string(),
+                    photo: None,
+                }
+                .into(),
+                peer: peer_chat(42),
+                top_message: 1,
+                unread_muted_peers_count: 1,
+                unread_unmuted_peers_count: 1,
+                unread_muted_messages_count: 2,
+                unread_unmuted_messages_count: 3,
+            }),
+            chat: grammers_client::types::Chat::from_raw(raw_chat(42, "Representative")),
+            last_message: None,
+        };
+        let mut filter = dialog_filter(2, "Groups");
+        if let tl::enums::DialogFilter::Filter(filter) = &mut filter {
+            filter.groups = true;
+        }
+        let mut counts = HashMap::new();
+
+        assert!(!dialog_matches_filter(&pseudo, &filter, 0));
+        add_dialog_to_filter_unread_counts(&pseudo, &[filter], 0, &mut counts);
+        assert!(counts.is_empty());
+        assert_eq!(super::dialog_unread_count(&pseudo), 5);
+        assert_eq!(
+            super::dialog_folder_metadata(&pseudo),
+            Some((1, "Archived".to_string()))
+        );
+
+        let mut unfiled = 0;
+        let mut concrete = HashMap::new();
+        let mut aggregates = HashMap::new();
+        let mut names = HashMap::new();
+        for row in [dialog(43, 2, Some(1), None), dialog(44, 4, None, None)] {
+            add_dialog_to_folder_unread_snapshot(
+                &row,
+                &mut unfiled,
+                &mut concrete,
+                &mut aggregates,
+                &mut names,
+            );
+        }
+        add_dialog_to_folder_unread_snapshot(
+            &pseudo,
+            &mut unfiled,
+            &mut concrete,
+            &mut aggregates,
+            &mut names,
+        );
+        let (all, merged) = merge_folder_unread_snapshot(unfiled, concrete, aggregates);
+        assert_eq!(merged, HashMap::from([(1, 5)]));
+        assert_eq!(all, 9);
+        assert_eq!(names, HashMap::from([(1, "Archived".to_string())]));
+    }
+
+    #[test]
+    fn overlapping_dialog_filters_each_receive_membership_unread() {
+        let mut personal = dialog_filter(2, "Personal");
+        let mut work = dialog_filter(3, "Work");
+        for filter in [&mut personal, &mut work] {
+            let tl::enums::DialogFilter::Filter(filter) = filter else {
+                panic!("expected dialog filter");
+            };
+            filter
+                .include_peers
+                .push(tl::enums::InputPeer::Chat(tl::types::InputPeerChat {
+                    chat_id: 42,
+                }));
+        }
+        let filters = vec![personal, work];
+        let mut counts = HashMap::new();
+
+        add_dialog_to_filter_unread_counts(&dialog(42, 3, None, None), &filters, 0, &mut counts);
+
+        assert_eq!(counts, HashMap::from([(2, 3), (3, 3)]));
+        let folders =
+            folders_from_dialog_filters(filters, 3, counts, HashMap::new(), HashMap::new());
+        assert_eq!(folders[1].unread_count, 3);
+        assert_eq!(folders[2].unread_count, 3);
+    }
+
+    #[test]
     fn folder_scoped_dialog_chats_use_requested_folder_and_preview() {
         let chats = dialog_chats_from_page_parts(
             DialogPageParts {
@@ -2681,6 +3074,7 @@ mod tests {
             5,
             HashMap::from([(2, 3), (3, 2)]),
             HashMap::new(),
+            HashMap::new(),
         );
 
         assert_eq!(folders.len(), 3);
@@ -2699,6 +3093,7 @@ mod tests {
         let folders = folders_from_dialog_filters(
             vec![tl::enums::DialogFilter::Default],
             4,
+            HashMap::new(),
             HashMap::from([(9, 4)]),
             HashMap::new(),
         );
@@ -2714,6 +3109,7 @@ mod tests {
         let folders = folders_from_dialog_filters(
             Vec::new(),
             4,
+            HashMap::new(),
             HashMap::from([(1, 4)]),
             HashMap::from([(1, "Archived".to_string())]),
         );

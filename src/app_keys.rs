@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppKeyOutcome {
@@ -9,17 +9,18 @@ pub enum AppKeyOutcome {
 }
 
 pub fn handle_app_key(state: &mut AppState, key: KeyEvent) -> AppKeyOutcome {
+    let plain_or_shift = matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT);
     match key.code {
-        KeyCode::Char('q') => AppKeyOutcome::Quit,
-        KeyCode::Char('<') => {
+        KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => AppKeyOutcome::Quit,
+        KeyCode::Char('<') if plain_or_shift => {
             state.adjust_split_left();
             AppKeyOutcome::Handled
         }
-        KeyCode::Char('>') => {
+        KeyCode::Char('>') if plain_or_shift => {
             state.adjust_split_right();
             AppKeyOutcome::Handled
         }
-        KeyCode::Char('?') => {
+        KeyCode::Char('?') if plain_or_shift => {
             state.toggle_help_bar();
             AppKeyOutcome::Handled
         }
@@ -83,6 +84,52 @@ mod tests {
             AppKeyOutcome::Handled
         );
         assert_eq!(state.split_ratio, initial);
+    }
+
+    #[test]
+    fn app_keys_accept_shift_reported_glyphs_and_reject_modified_commands() {
+        let mut state = AppState::new();
+        let initial = state.split_ratio;
+
+        assert_eq!(
+            handle_app_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('<'), KeyModifiers::SHIFT),
+            ),
+            AppKeyOutcome::Handled
+        );
+        assert!(state.split_ratio < initial);
+        assert_eq!(
+            handle_app_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT),
+            ),
+            AppKeyOutcome::Handled
+        );
+        assert_eq!(state.split_ratio, initial);
+        assert_eq!(
+            handle_app_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            ),
+            AppKeyOutcome::Handled
+        );
+
+        for (character, modifiers) in [
+            ('q', KeyModifiers::CONTROL),
+            ('q', KeyModifiers::ALT),
+            ('?', KeyModifiers::META),
+            ('<', KeyModifiers::SUPER),
+            ('>', KeyModifiers::SHIFT | KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(
+                handle_app_key(
+                    &mut state,
+                    KeyEvent::new(KeyCode::Char(character), modifiers),
+                ),
+                AppKeyOutcome::Ignored
+            );
+        }
     }
 
     #[test]
