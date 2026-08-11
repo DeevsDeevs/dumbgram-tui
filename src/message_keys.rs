@@ -1,5 +1,5 @@
 use crate::state::{AppState, FocusedPanel};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKeyOutcome {
@@ -13,7 +13,9 @@ pub enum MessageKeyOutcome {
 }
 
 pub fn handle_message_key(state: &mut AppState, key: KeyEvent) -> MessageKeyOutcome {
-    if state.focused_panel != FocusedPanel::Messages {
+    if state.focused_panel != FocusedPanel::Messages
+        || matches!(key.code, KeyCode::Char(_)) && key.modifiers != KeyModifiers::NONE
+    {
         return MessageKeyOutcome::Ignored;
     }
 
@@ -130,6 +132,36 @@ mod tests {
         assert!(state.delete_confirmation().is_some_and(|confirmation| {
             confirmation.chat_id == 7 && confirmation.message_id == 42
         }));
+    }
+
+    #[test]
+    fn message_keys_ignore_modified_character_actions() {
+        let mut state = AppState::new();
+        state.focused_panel = FocusedPanel::Messages;
+        state.messages = vec![message(42)];
+
+        assert_eq!(
+            handle_message_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            ),
+            MessageKeyOutcome::Ignored
+        );
+        assert!(state.delete_confirmation().is_none());
+        assert_eq!(
+            handle_message_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT),
+            ),
+            MessageKeyOutcome::Ignored
+        );
+        assert_eq!(
+            handle_message_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            ),
+            MessageKeyOutcome::Ignored
+        );
     }
 
     #[test]

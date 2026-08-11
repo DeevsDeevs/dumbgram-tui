@@ -8,6 +8,7 @@ use std::{env, fs, io::Cursor, io::Write, path::Path};
 
 const KITTY_ESCAPE_START: &str = "\x1b_G";
 const KITTY_ESCAPE_END: &str = "\x1b\\";
+const KITTY_PAYLOAD_CHUNK_BYTES: usize = 4096;
 const MAX_IMAGE_COLUMNS: u16 = 40;
 const MAX_IMAGE_ROWS: u16 = 12;
 const TERMINAL_CELL_HEIGHT_TO_WIDTH_RATIO: f32 = 2.0;
@@ -55,9 +56,29 @@ fn clear_terminal_images_for_support<W: Write>(
 
 pub(crate) fn kitty_png_image_sequence(bytes: &[u8], columns: u16, rows: u16) -> String {
     let encoded_image = base64::engine::general_purpose::STANDARD.encode(bytes);
-    format!(
-        "{KITTY_ESCAPE_START}a=T,f=100,q=2,z=1,c={columns},r={rows};{encoded_image}{KITTY_ESCAPE_END}"
-    )
+    if encoded_image.is_empty() {
+        return format!(
+            "{KITTY_ESCAPE_START}a=T,f=100,q=2,z=1,c={columns},r={rows},m=0;{KITTY_ESCAPE_END}"
+        );
+    }
+
+    let chunks = encoded_image.as_bytes().chunks(KITTY_PAYLOAD_CHUNK_BYTES);
+    let chunk_count = chunks.len();
+    let mut sequence = String::with_capacity(encoded_image.len() + chunk_count * 32);
+    for (index, chunk) in chunks.enumerate() {
+        let more = usize::from(index + 1 < chunk_count);
+        let chunk = std::str::from_utf8(chunk).expect("Base64 output is ASCII");
+        if index == 0 {
+            sequence.push_str(&format!(
+                "{KITTY_ESCAPE_START}a=T,f=100,q=2,z=1,c={columns},r={rows},m={more};{chunk}{KITTY_ESCAPE_END}"
+            ));
+        } else {
+            sequence.push_str(&format!(
+                "{KITTY_ESCAPE_START}m={more};{chunk}{KITTY_ESCAPE_END}"
+            ));
+        }
+    }
+    sequence
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +96,21 @@ impl ImagePayloadSourceFormat {
     }
 }
 
+fn kitty_png_image_at_sequence(
+    bytes: &[u8],
+    column: u16,
+    row: u16,
+    columns: u16,
+    rows: u16,
+) -> String {
+    format!(
+        "\x1b7\x1b[{};{}H{}\x1b8",
+        row.saturating_add(1),
+        column.saturating_add(1),
+        kitty_png_image_sequence(bytes, columns, rows)
+    )
+}
+
 pub(crate) fn kitty_png_file_image_at_sequence(
     path: &Path,
     column: u16,
@@ -86,12 +122,7 @@ pub(crate) fn kitty_png_file_image_at_sequence(
     let geometry = fit_image_cells(payload.width, payload.height, max_columns, max_rows);
     let byte_len = payload.bytes.len();
     Ok((
-        format!(
-            "\x1b7\x1b[{};{}H{}\x1b8",
-            row.saturating_add(1),
-            column.saturating_add(1),
-            kitty_png_image_sequence(&payload.bytes, geometry.columns, geometry.rows)
-        ),
+        kitty_png_image_at_sequence(&payload.bytes, column, row, geometry.columns, geometry.rows),
         byte_len,
         payload.source_format,
         geometry.columns,
@@ -386,6 +417,7 @@ mod tests {
         kitty_png_image_sequence, terminal_env_supports_kitty_graphics,
     };
     use crate::app::App;
+    use base64::Engine;
     use image::{DynamicImage, ImageFormat, RgbImage};
     use std::{fs, io::Cursor, path::Path};
 
@@ -415,9 +447,60 @@ mod tests {
 
         assert!(sequence.starts_with("\x1b_G"));
         assert!(sequence.ends_with("\x1b\\"));
-        assert!(sequence.contains("a=T,f=100,q=2,z=1,c=20,r=8;"));
+        assert!(sequence.contains("a=T,f=100,q=2,z=1,c=20,r=8,m=0;"));
         assert!(sequence.contains("cG5nLWJ5dGVz"));
         assert!(!sequence.contains("png-bytes"));
+    }
+
+    #[test]
+    fn kitty_png_image_sequence_chunks_large_payloads() {
+        let bytes = vec![0x5a; 7_000];
+        let wrapped = super::kitty_png_image_at_sequence(&bytes, 2, 3, 20, 8);
+        assert!(wrapped.starts_with("\x1b7\x1b[4;3H\x1b_G"));
+        assert!(wrapped.ends_with("\x1b\\\x1b8"));
+        let sequence = wrapped
+            .strip_prefix("\x1b7\x1b[4;3H")
+            .unwrap()
+            .strip_suffix("\x1b8")
+            .unwrap();
+        let commands = sequence
+            .split(super::KITTY_ESCAPE_END)
+            .filter(|command| !command.is_empty())
+            .map(|command| {
+                command
+                    .strip_prefix(super::KITTY_ESCAPE_START)
+                    .unwrap()
+                    .split_once(';')
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(commands.len() >= 3);
+        assert_eq!(
+            commands.first().unwrap().0,
+            "a=T,f=100,q=2,z=1,c=20,r=8,m=1"
+        );
+        assert!(
+            commands[1..commands.len() - 1]
+                .iter()
+                .all(|(control, _)| *control == "m=1")
+        );
+        assert_eq!(commands.last().unwrap().0, "m=0");
+        assert!(
+            commands
+                .iter()
+                .all(|(_, payload)| payload.len() <= super::KITTY_PAYLOAD_CHUNK_BYTES)
+        );
+        let encoded = commands
+            .iter()
+            .map(|(_, payload)| *payload)
+            .collect::<String>();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            bytes
+        );
     }
 
     #[test]
@@ -467,7 +550,7 @@ mod tests {
         assert_eq!((columns, rows), (8, 4));
         assert!(sequence.starts_with("\x1b7\x1b[4;3H\x1b_G"));
         assert!(sequence.ends_with("\x1b\\\x1b8"));
-        assert!(sequence.contains("a=T,f=100,q=2,z=1,c=8,r=4;"));
+        assert!(sequence.contains("a=T,f=100,q=2,z=1,c=8,r=4,m=0;"));
         fs::remove_file(path).ok();
     }
 

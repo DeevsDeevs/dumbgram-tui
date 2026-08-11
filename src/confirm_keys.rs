@@ -9,7 +9,10 @@ pub enum ConfirmKeyOutcome {
 
 pub fn handle_confirm_key(key: KeyEvent) -> ConfirmKeyOutcome {
     match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => ConfirmKeyOutcome::Confirm,
+        KeyCode::Char('y') if key.modifiers == KeyModifiers::NONE => ConfirmKeyOutcome::Confirm,
+        KeyCode::Char('Y') if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            ConfirmKeyOutcome::Confirm
+        }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             ConfirmKeyOutcome::Cancel
         }
@@ -32,7 +35,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_keys_accept_upper_or_lower_yes() {
+    fn confirm_keys_accept_plain_yes_and_shift_only_uppercase_yes() {
         assert_eq!(
             handle_confirm_key(key(KeyCode::Char('y'))),
             ConfirmKeyOutcome::Confirm
@@ -41,6 +44,31 @@ mod tests {
             handle_confirm_key(key(KeyCode::Char('Y'))),
             ConfirmKeyOutcome::Confirm
         );
+        assert_eq!(
+            handle_confirm_key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT,)),
+            ConfirmKeyOutcome::Confirm
+        );
+    }
+
+    #[test]
+    fn confirm_keys_reject_modified_yes_chords() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::META,
+            KeyModifiers::SUPER,
+            KeyModifiers::HYPER,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            assert_eq!(
+                handle_confirm_key(KeyEvent::new(KeyCode::Char('y'), modifiers)),
+                ConfirmKeyOutcome::Ignored
+            );
+            assert_eq!(
+                handle_confirm_key(KeyEvent::new(KeyCode::Char('Y'), modifiers)),
+                ConfirmKeyOutcome::Ignored
+            );
+        }
     }
 
     #[test]
