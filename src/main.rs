@@ -36,12 +36,13 @@ use ratatui::{
     Terminal,
     backend::{CrosstermBackend, TestBackend},
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::{pending, poll_fn};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -65,6 +66,15 @@ const MAX_DEFERRED_UPDATES: usize = 100;
 const RECONCILIATION_RETRY_DELAY: Duration = Duration::from_secs(10);
 const OPENER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const OPENER_KILL_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(not(test))]
+const MUTATION_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const MUTATION_TIMEOUT: Duration = Duration::from_millis(10);
+const MUTATION_UNKNOWN_ERROR: &str =
+    "Delivery unknown — verify Telegram before retrying or quitting";
+const QUIT_WAITING_STATUS: &str = "Waiting for pending actions · Esc stay";
+const MUTATION_UNKNOWN_ACK_HELP: &str = "Esc acknowledge · q acknowledge and quit";
+const QUIT_MUTATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 static MUTATION_SUBMISSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const UPDATE_SUBSCRIPTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const LINK_OPENED_STATUS: &str = "Link opened";
@@ -1954,12 +1964,20 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
     let mut chat_message_loader = ChatMessageLoader::new(client.clone(), senders.chat_message);
     let mut older_message_loader = OlderMessageLoader::new(client.clone(), senders.older_message);
     let mut folder_chat_loader = FolderChatLoader::new(client.clone(), senders.folder_chat);
-    let mark_read_loader =
-        MarkChatReadLoader::new_with_results(client.clone(), senders.manual_mark_read);
-    let send_message_loader = SendMessageLoader::new(client.clone(), senders.send_message);
-    let delete_message_loader = DeleteMessageLoader::new(client.clone(), senders.delete_message);
-    let edit_message_loader = EditMessageLoader::new(client.clone(), senders.edit_message);
-    let reply_message_loader = ReplyMessageLoader::new(client.clone(), senders.reply_message);
+    let mutations = MutationTaskTracker::default();
+    let mark_read_loader = MarkChatReadLoader::new_tracked(
+        client.clone(),
+        senders.manual_mark_read,
+        mutations.clone(),
+    );
+    let send_message_loader =
+        SendMessageLoader::new_tracked(client.clone(), senders.send_message, mutations.clone());
+    let delete_message_loader =
+        DeleteMessageLoader::new_tracked(client.clone(), senders.delete_message, mutations.clone());
+    let edit_message_loader =
+        EditMessageLoader::new_tracked(client.clone(), senders.edit_message, mutations.clone());
+    let reply_message_loader =
+        ReplyMessageLoader::new_tracked(client.clone(), senders.reply_message, mutations.clone());
     let download_media_loader = DownloadMediaLoader::new(client.clone(), senders.download_media);
     let mut media_preview_loader = MediaPreviewLoader::new(client.clone(), senders.media_preview);
     let mut open_target_loader = OpenTargetLoader::new(senders.open_target);
@@ -1987,13 +2005,65 @@ async fn run_app<C: TelegramClient + Clone + Send + Sync + 'static>(
         &download_media_loader,
         &mut media_preview_loader,
         &mut open_target_loader,
+        &mutations,
     )
     .await;
 
+    mutations.join_all().await;
+    drain_ready_results(
+        &mut loop_state,
+        app,
+        &subscribe_updates_loader,
+        &reconciliation_loader,
+        &chat_message_loader,
+        &older_message_loader,
+        &folder_chat_loader,
+        &mark_read_loader,
+        &media_preview_loader,
+    );
     open_target_loader.shutdown().await;
     drop(events);
     diagnostics::event("terminal_event_stream_stopped", "before_restore=true");
     result
+}
+
+fn begin_quit_or_exit(
+    app: &mut App,
+    loop_state: &mut EventLoopState,
+    mutations: &MutationTaskTracker,
+) -> bool {
+    if !app.should_quit {
+        return false;
+    }
+    if app.state.gap_submit_pending() {
+        app.should_quit = false;
+        app.state.set_status(REFRESHING_LATEST_BEFORE_SEND_STATUS);
+        return false;
+    }
+    if loop_state.mutation_failed_this_step {
+        app.should_quit = false;
+        return false;
+    }
+    if mutations.is_empty() {
+        return true;
+    }
+    app.should_quit = false;
+    loop_state.quit_waiting = true;
+    loop_state.quit_blocked = false;
+    app.state.set_status(QUIT_WAITING_STATUS);
+    false
+}
+
+fn finish_quit_wait(loop_state: &mut EventLoopState, mutations: &MutationTaskTracker) -> bool {
+    if !loop_state.quit_waiting || !mutations.is_empty() {
+        return false;
+    }
+    if loop_state.quit_blocked {
+        loop_state.quit_waiting = false;
+        loop_state.quit_blocked = false;
+        return false;
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2017,10 +2087,12 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
     download_media_loader: &DownloadMediaLoader<C>,
     media_preview_loader: &mut MediaPreviewLoader<C>,
     open_target_loader: &mut OpenTargetLoader,
+    mutations: &MutationTaskTracker,
 ) -> Result<()> {
     let mut frames = FrameScheduler::new(true);
     draw_due_frame(terminal, app, theme, &mut frames)?;
     loop {
+        mutations.join_finished().await;
         let now = TokioInstant::now();
         if loop_state
             .next_subscription_at
@@ -2056,6 +2128,10 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
         if step.dirty {
             frames.mark_dirty(TokioInstant::now());
         }
+        if finish_quit_wait(loop_state, mutations) {
+            diagnostics::event("run_loop_quit", "pending_mutations_settled=true");
+            break;
+        }
         if let Some(event) = step.terminal_event
             && dispatch_terminal_event(
                 terminal,
@@ -2081,15 +2157,33 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
 
         media_preview_loader.request(app.state.selected_media_preview_request());
 
-        if app.should_quit {
+        if begin_quit_or_exit(app, loop_state, mutations) {
             diagnostics::event("run_loop_quit", "should_quit=true");
             break;
         }
+        if loop_state.quit_waiting {
+            app.state.status_message = Some(QUIT_WAITING_STATUS.to_string());
+            app.state.status_timestamp = None;
+            frames.mark_dirty(TokioInstant::now());
+        }
 
+        if app.state.mutation_outcome_unknown {
+            app.state.status_message = Some(MUTATION_UNKNOWN_ACK_HELP.to_string());
+            app.state.status_timestamp = None;
+        }
         release_gap_submit_if_ready(app, send_message_loader, reply_message_loader);
-        draw_due_frame(terminal, app, theme, &mut frames)?;
+        if draw_due_frame(terminal, app, theme, &mut frames)? {
+            loop_state.mutation_failed_this_step = false;
+        }
 
-        let service_deadline = loop_state.service_deadline();
+        let service_deadline = if loop_state.quit_waiting && !mutations.is_empty() {
+            Some(loop_state.service_deadline().map_or(
+                TokioInstant::now() + QUIT_MUTATION_POLL_INTERVAL,
+                |deadline| deadline.min(TokioInstant::now() + QUIT_MUTATION_POLL_INTERVAL),
+            ))
+        } else {
+            loop_state.service_deadline()
+        };
         match wait_for_loop_wake(
             events,
             &loop_state.wake,
@@ -2235,6 +2329,26 @@ fn gap_submit_allows_terminal_event(app: &App, event: &Event) -> bool {
     }
 }
 
+fn handle_quit_waiting_event(
+    app: &mut App,
+    loop_state: &mut EventLoopState,
+    event: &Event,
+) -> Option<bool> {
+    if !loop_state.quit_waiting {
+        return None;
+    }
+    match event {
+        Event::Key(key) if is_cancel_key(*key) => {
+            loop_state.quit_waiting = false;
+            loop_state.quit_blocked = false;
+            app.state.clear_status();
+            Some(true)
+        }
+        Event::Resize(_, _) | Event::FocusLost | Event::FocusGained => None,
+        _ => Some(false),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_terminal_event<C: TelegramClient + Clone + Send + Sync + 'static>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -2253,6 +2367,9 @@ async fn dispatch_terminal_event<C: TelegramClient + Clone + Send + Sync + 'stat
     download_media_loader: &DownloadMediaLoader<C>,
     open_target_loader: &mut OpenTargetLoader,
 ) -> Result<bool> {
+    if let Some(dirty) = handle_quit_waiting_event(app, loop_state, &event) {
+        return Ok(dirty);
+    }
     match classify_terminal_event(event) {
         TerminalAction::Key(key) => {
             let mut progress = UiProgress::Live { terminal };
@@ -2569,6 +2686,9 @@ struct EventLoopState {
     deferred_conversation_updates_overflowed: bool,
     staged_update: Option<Update>,
     staged_terminal_event: Option<Event>,
+    quit_waiting: bool,
+    quit_blocked: bool,
+    mutation_failed_this_step: bool,
     #[cfg(test)]
     drain_trace: Vec<String>,
 }
@@ -2624,6 +2744,9 @@ impl EventLoopState {
                 deferred_conversation_updates_overflowed: false,
                 staged_update: None,
                 staged_terminal_event: None,
+                quit_waiting: false,
+                quit_blocked: false,
+                mutation_failed_this_step: false,
                 #[cfg(test)]
                 drain_trace: Vec::new(),
             },
@@ -2644,6 +2767,13 @@ impl EventLoopState {
                 reconciliation,
             },
         )
+    }
+
+    fn record_mutation_result(&mut self, failed: bool) {
+        if failed {
+            self.mutation_failed_this_step = true;
+            self.quit_blocked |= self.quit_waiting;
+        }
     }
 
     fn schedule_reconciliation_at(&mut self, deadline: TokioInstant) {
@@ -2863,14 +2993,17 @@ fn drain_ready_results<C: TelegramClient + Clone + Send + Sync + 'static>(
         }
     }
     while let Ok(result) = loop_state.send_message_rx.try_recv() {
+        loop_state.record_mutation_result(result.result.is_err());
         apply_send_message_result(app, result);
         dirty = true;
     }
     while let Ok(result) = loop_state.delete_message_rx.try_recv() {
+        loop_state.record_mutation_result(result.result.is_err());
         apply_delete_message_result(app, result);
         dirty = true;
     }
     while let Ok(result) = loop_state.manual_mark_read_rx.try_recv() {
+        loop_state.record_mutation_result(result.result.is_err());
         dirty |= apply_manual_mark_chat_read_result(
             loop_state,
             app,
@@ -2879,10 +3012,12 @@ fn drain_ready_results<C: TelegramClient + Clone + Send + Sync + 'static>(
         );
     }
     while let Ok(result) = loop_state.edit_message_rx.try_recv() {
+        loop_state.record_mutation_result(result.result.is_err());
         apply_edit_message_result(app, result);
         dirty = true;
     }
     while let Ok(result) = loop_state.reply_message_rx.try_recv() {
+        loop_state.record_mutation_result(result.result.is_err());
         apply_reply_message_result(app, result);
         dirty = true;
     }
@@ -3618,6 +3753,7 @@ struct MarkChatReadLoader<C> {
     client: C,
     manual_result_tx: Option<UiSender<ManualMarkChatReadResult>>,
     latest_manual_request_id: Cell<u64>,
+    mutations: MutationTaskTracker,
 }
 
 impl<C> MarkChatReadLoader<C>
@@ -3630,17 +3766,28 @@ where
             client,
             manual_result_tx: None,
             latest_manual_request_id: Cell::new(0),
+            mutations: MutationTaskTracker::default(),
         }
     }
 
+    #[cfg(test)]
     fn new_with_results(
         client: C,
         manual_result_tx: impl Into<UiSender<ManualMarkChatReadResult>>,
+    ) -> Self {
+        Self::new_tracked(client, manual_result_tx, MutationTaskTracker::default())
+    }
+
+    fn new_tracked(
+        client: C,
+        manual_result_tx: impl Into<UiSender<ManualMarkChatReadResult>>,
+        mutations: MutationTaskTracker,
     ) -> Self {
         Self {
             client,
             manual_result_tx: Some(manual_result_tx.into()),
             latest_manual_request_id: Cell::new(0),
+            mutations,
         }
     }
 
@@ -3657,14 +3804,29 @@ where
             "manual_mark_chat_read_spawn",
             format!("request_id={request_id} chat_id={chat_id}"),
         );
-        tokio::spawn(async move {
-            let result = actions::mark_chat_read_result(&client, chat_id).await;
-            let _ = tx.send(ManualMarkChatReadResult {
-                request_id,
-                chat_id,
-                result,
-            });
-        });
+        let fallback_tx = tx.clone();
+        self.mutations.spawn(
+            MutationTaskKey {
+                kind: "mark_read",
+                id: request_id,
+            },
+            async move {
+                let result =
+                    mutation_result(actions::mark_chat_read_result(&client, chat_id)).await;
+                let _ = tx.send(ManualMarkChatReadResult {
+                    request_id,
+                    chat_id,
+                    result,
+                });
+            },
+            move || {
+                let _ = fallback_tx.send(ManualMarkChatReadResult {
+                    request_id,
+                    chat_id,
+                    result: Err(MUTATION_UNKNOWN_ERROR.to_string()),
+                });
+            },
+        );
         request_id
     }
 
@@ -3953,24 +4115,120 @@ struct FolderChatLoader<C> {
     current_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+async fn mutation_result<T>(
+    future: impl std::future::Future<Output = std::result::Result<T, String>>,
+) -> std::result::Result<T, String> {
+    match tokio::time::timeout(MUTATION_TIMEOUT, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(format!("{MUTATION_UNKNOWN_ERROR}: {error}")),
+        Err(_) => Err(MUTATION_UNKNOWN_ERROR.to_string()),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MutationTaskKey {
+    kind: &'static str,
+    id: u64,
+}
+
+type UnknownMutationReporter = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>>;
+
+struct PendingMutationTask {
+    key: MutationTaskKey,
+    handle: tokio::task::JoinHandle<()>,
+    report_unknown: UnknownMutationReporter,
+}
+
+#[derive(Clone, Default)]
+struct MutationTaskTracker {
+    pending: Rc<RefCell<Vec<PendingMutationTask>>>,
+}
+
+impl MutationTaskTracker {
+    fn spawn(
+        &self,
+        key: MutationTaskKey,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+        report_unknown: impl FnOnce() + Send + 'static,
+    ) {
+        let report_unknown: UnknownMutationReporter =
+            Arc::new(std::sync::Mutex::new(Some(Box::new(report_unknown))));
+        let task_reporter = report_unknown.clone();
+        let handle = tokio::spawn(async move {
+            if tokio::spawn(future).await.is_err() {
+                report_unknown_mutation(&task_reporter);
+            }
+        });
+        self.pending.borrow_mut().push(PendingMutationTask {
+            key,
+            handle,
+            report_unknown,
+        });
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.borrow().is_empty()
+    }
+
+    async fn join_finished(&self) {
+        let (finished, pending) = self
+            .pending
+            .borrow_mut()
+            .drain(..)
+            .partition(|task| task.handle.is_finished());
+        *self.pending.borrow_mut() = pending;
+        self.join_tasks(finished).await;
+    }
+
+    async fn join_all(&self) {
+        let pending = self.pending.borrow_mut().drain(..).collect();
+        self.join_tasks(pending).await;
+    }
+
+    async fn join_tasks(&self, tasks: Vec<PendingMutationTask>) {
+        for task in tasks {
+            if task.handle.await.is_err() {
+                diagnostics::event(
+                    "mutation_task_join_error",
+                    format!("kind={} id={}", task.key.kind, task.key.id),
+                );
+                report_unknown_mutation(&task.report_unknown);
+            }
+        }
+    }
+}
+
+fn report_unknown_mutation(reporter: &UnknownMutationReporter) {
+    let mut reporter = reporter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(report_unknown) = reporter.take() {
+        report_unknown();
+    }
+}
+
 struct SendMessageLoader<C> {
     client: C,
     tx: UiSender<SendMessageResult>,
+    mutations: MutationTaskTracker,
 }
 
 struct DeleteMessageLoader<C> {
     client: C,
     tx: UiSender<DeleteMessageResult>,
+    mutations: MutationTaskTracker,
 }
 
 struct EditMessageLoader<C> {
     client: C,
     tx: UiSender<EditMessageResult>,
+    mutations: MutationTaskTracker,
 }
 
 struct ReplyMessageLoader<C> {
     client: C,
     tx: UiSender<ReplyMessageResult>,
+    mutations: MutationTaskTracker,
 }
 
 struct DownloadMediaLoader<C> {
@@ -4113,10 +4371,20 @@ impl<C> SendMessageLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
+    #[cfg(test)]
     fn new(client: C, tx: impl Into<UiSender<SendMessageResult>>) -> Self {
+        Self::new_tracked(client, tx, MutationTaskTracker::default())
+    }
+
+    fn new_tracked(
+        client: C,
+        tx: impl Into<UiSender<SendMessageResult>>,
+        mutations: MutationTaskTracker,
+    ) -> Self {
         Self {
             client,
             tx: tx.into(),
+            mutations,
         }
     }
 
@@ -4131,23 +4399,41 @@ where
                 pending.temp_id, pending.chat_id
             ),
         );
-        tokio::spawn(async move {
-            let result = actions::send_message_result(
-                &client,
-                pending.chat_id,
-                pending.thread_top_message_id,
-                pending.content.clone(),
-            )
-            .await;
-            let _ = tx.send(SendMessageResult {
-                submission_id,
-                temp_id: pending.temp_id,
-                chat_id: pending.chat_id,
-                topic_id: pending.thread_top_message_id,
-                content: pending.content,
-                result,
-            });
-        });
+        let fallback_tx = tx.clone();
+        let fallback = SendMessageResult {
+            submission_id,
+            temp_id: pending.temp_id,
+            chat_id: pending.chat_id,
+            topic_id: pending.thread_top_message_id,
+            content: pending.content.clone(),
+            result: Err(MUTATION_UNKNOWN_ERROR.to_string()),
+        };
+        self.mutations.spawn(
+            MutationTaskKey {
+                kind: "send",
+                id: submission_id,
+            },
+            async move {
+                let result = mutation_result(actions::send_message_result(
+                    &client,
+                    pending.chat_id,
+                    pending.thread_top_message_id,
+                    pending.content.clone(),
+                ))
+                .await;
+                let _ = tx.send(SendMessageResult {
+                    submission_id,
+                    temp_id: pending.temp_id,
+                    chat_id: pending.chat_id,
+                    topic_id: pending.thread_top_message_id,
+                    content: pending.content,
+                    result,
+                });
+            },
+            move || {
+                let _ = fallback_tx.send(fallback);
+            },
+        );
         submission_id
     }
 }
@@ -4156,10 +4442,20 @@ impl<C> DeleteMessageLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
+    #[cfg(test)]
     fn new(client: C, tx: impl Into<UiSender<DeleteMessageResult>>) -> Self {
+        Self::new_tracked(client, tx, MutationTaskTracker::default())
+    }
+
+    fn new_tracked(
+        client: C,
+        tx: impl Into<UiSender<DeleteMessageResult>>,
+        mutations: MutationTaskTracker,
+    ) -> Self {
         Self {
             client,
             tx: tx.into(),
+            mutations,
         }
     }
 
@@ -4174,14 +4470,29 @@ where
                 confirmation.chat_id, confirmation.message_id
             ),
         );
-        tokio::spawn(async move {
-            let result = actions::delete_message_result(&client, confirmation).await;
-            let _ = tx.send(DeleteMessageResult {
-                submission_id,
-                confirmation,
-                result,
-            });
-        });
+        let fallback_tx = tx.clone();
+        self.mutations.spawn(
+            MutationTaskKey {
+                kind: "delete",
+                id: submission_id,
+            },
+            async move {
+                let result =
+                    mutation_result(actions::delete_message_result(&client, confirmation)).await;
+                let _ = tx.send(DeleteMessageResult {
+                    submission_id,
+                    confirmation,
+                    result,
+                });
+            },
+            move || {
+                let _ = fallback_tx.send(DeleteMessageResult {
+                    submission_id,
+                    confirmation,
+                    result: Err(MUTATION_UNKNOWN_ERROR.to_string()),
+                });
+            },
+        );
         submission_id
     }
 }
@@ -4190,10 +4501,20 @@ impl<C> EditMessageLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
+    #[cfg(test)]
     fn new(client: C, tx: impl Into<UiSender<EditMessageResult>>) -> Self {
+        Self::new_tracked(client, tx, MutationTaskTracker::default())
+    }
+
+    fn new_tracked(
+        client: C,
+        tx: impl Into<UiSender<EditMessageResult>>,
+        mutations: MutationTaskTracker,
+    ) -> Self {
         Self {
             client,
             tx: tx.into(),
+            mutations,
         }
     }
 
@@ -4213,18 +4534,41 @@ where
                 "submission_id={submission_id} chat_id={chat_id} topic_id={topic_id:?} message_id={message_id}"
             ),
         );
-        tokio::spawn(async move {
-            let result =
-                actions::edit_message_result(&client, chat_id, message_id, content.clone()).await;
-            let _ = tx.send(EditMessageResult {
-                submission_id,
-                chat_id,
-                topic_id,
-                message_id,
-                content,
-                result,
-            });
-        });
+        let fallback_tx = tx.clone();
+        let fallback_content = content.clone();
+        self.mutations.spawn(
+            MutationTaskKey {
+                kind: "edit",
+                id: submission_id,
+            },
+            async move {
+                let result = mutation_result(actions::edit_message_result(
+                    &client,
+                    chat_id,
+                    message_id,
+                    content.clone(),
+                ))
+                .await;
+                let _ = tx.send(EditMessageResult {
+                    submission_id,
+                    chat_id,
+                    topic_id,
+                    message_id,
+                    content,
+                    result,
+                });
+            },
+            move || {
+                let _ = fallback_tx.send(EditMessageResult {
+                    submission_id,
+                    chat_id,
+                    topic_id,
+                    message_id,
+                    content: fallback_content,
+                    result: Err(MUTATION_UNKNOWN_ERROR.to_string()),
+                });
+            },
+        );
         submission_id
     }
 }
@@ -4233,10 +4577,20 @@ impl<C> ReplyMessageLoader<C>
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
+    #[cfg(test)]
     fn new(client: C, tx: impl Into<UiSender<ReplyMessageResult>>) -> Self {
+        Self::new_tracked(client, tx, MutationTaskTracker::default())
+    }
+
+    fn new_tracked(
+        client: C,
+        tx: impl Into<UiSender<ReplyMessageResult>>,
+        mutations: MutationTaskTracker,
+    ) -> Self {
         Self {
             client,
             tx: tx.into(),
+            mutations,
         }
     }
 
@@ -4256,24 +4610,42 @@ where
                 "submission_id={submission_id} chat_id={chat_id} topic_id={thread_top_message_id:?} message_id={message_id}"
             ),
         );
-        tokio::spawn(async move {
-            let result = actions::reply_message_result(
-                &client,
-                chat_id,
-                thread_top_message_id,
-                message_id,
-                content.clone(),
-            )
-            .await;
-            let _ = tx.send(ReplyMessageResult {
-                submission_id,
-                chat_id,
-                topic_id: thread_top_message_id,
-                message_id,
-                content,
-                result,
-            });
-        });
+        let fallback_tx = tx.clone();
+        let fallback_content = content.clone();
+        self.mutations.spawn(
+            MutationTaskKey {
+                kind: "reply",
+                id: submission_id,
+            },
+            async move {
+                let result = mutation_result(actions::reply_message_result(
+                    &client,
+                    chat_id,
+                    thread_top_message_id,
+                    message_id,
+                    content.clone(),
+                ))
+                .await;
+                let _ = tx.send(ReplyMessageResult {
+                    submission_id,
+                    chat_id,
+                    topic_id: thread_top_message_id,
+                    message_id,
+                    content,
+                    result,
+                });
+            },
+            move || {
+                let _ = fallback_tx.send(ReplyMessageResult {
+                    submission_id,
+                    chat_id,
+                    topic_id: thread_top_message_id,
+                    message_id,
+                    content: fallback_content,
+                    result: Err(MUTATION_UNKNOWN_ERROR.to_string()),
+                });
+            },
+        );
         submission_id
     }
 }
@@ -4610,7 +4982,12 @@ fn apply_send_message_result(app: &mut App, load: SendMessageResult) {
                 load.topic_id,
                 load.content,
             );
-            app.state.set_error(state::send_failed_error(error));
+            if error.contains(MUTATION_UNKNOWN_ERROR) {
+                app.state
+                    .set_mutation_outcome_unknown(state::send_failed_error(error));
+            } else {
+                app.state.set_error(state::send_failed_error(error));
+            }
         }
     }
 }
@@ -4630,7 +5007,12 @@ fn apply_delete_message_result(app: &mut App, load: DeleteMessageResult) {
         diagnostics::event("delete_message_result_ignored", "reason=stale_owner");
         return;
     }
-    actions::apply_delete_message_result(&mut app.state, load.confirmation, load.result);
+    match load.result {
+        Err(error) if error.contains(MUTATION_UNKNOWN_ERROR) => app
+            .state
+            .set_mutation_outcome_unknown(state::delete_failed_error(error)),
+        result => actions::apply_delete_message_result(&mut app.state, load.confirmation, result),
+    }
 }
 
 fn apply_manual_mark_chat_read_result(
@@ -4667,7 +5049,12 @@ fn apply_manual_mark_chat_read_result(
                 diagnostics::event("manual_mark_chat_read_result_ignored", "reason=stale_owner");
                 return false;
             }
-            app.state.set_error(state::mark_read_failed_error(error));
+            if error.contains(MUTATION_UNKNOWN_ERROR) {
+                app.state
+                    .set_mutation_outcome_unknown(state::mark_read_failed_error(error));
+            } else {
+                app.state.set_error(state::mark_read_failed_error(error));
+            }
             true
         }
     }
@@ -4723,7 +5110,12 @@ fn apply_edit_message_result(app: &mut App, load: EditMessageResult) {
                 load.content,
                 owns_compose,
             );
-            app.state.set_error(state::edit_failed_error(error));
+            if error.contains(MUTATION_UNKNOWN_ERROR) {
+                app.state
+                    .set_mutation_outcome_unknown(state::edit_failed_error(error));
+            } else {
+                app.state.set_error(state::edit_failed_error(error));
+            }
         }
     }
 }
@@ -4770,7 +5162,12 @@ fn apply_reply_message_result(app: &mut App, load: ReplyMessageResult) {
                 load.content,
                 owns_compose,
             );
-            app.state.set_error(state::reply_failed_error(error));
+            if error.contains(MUTATION_UNKNOWN_ERROR) {
+                app.state
+                    .set_mutation_outcome_unknown(state::reply_failed_error(error));
+            } else {
+                app.state.set_error(state::reply_failed_error(error));
+            }
         }
     }
 }
@@ -5485,6 +5882,17 @@ async fn handle_key_event_with_progress<C: TelegramClient + Clone + Send + Sync 
             key.modifiers
         ),
     );
+    if app.state.mutation_outcome_unknown {
+        if is_cancel_key(key) {
+            app.state.acknowledge_mutation_outcome_unknown();
+            return Ok(());
+        }
+        if key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::NONE {
+            app.state.acknowledge_mutation_outcome_unknown();
+            app.quit();
+        }
+        return Ok(());
+    }
     if app.state.gap_submit_pending() {
         if is_cancel_key(key) {
             app.state.cancel_gap_submit();
@@ -6227,6 +6635,9 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
     progress: &mut UiProgress<'_>,
     mut loaders: HandlerLoaders<'_, C>,
 ) -> Result<()> {
+    if app.state.mutation_outcome_unknown {
+        return Ok(());
+    }
     if app.state.gap_submit_pending() && !matches!(mouse_event.kind, MouseEventKind::Up(_)) {
         app.state.set_status(REFRESHING_LATEST_BEFORE_SEND_STATUS);
         return Ok(());
@@ -6324,25 +6735,26 @@ mod tests {
         LOGIN_REQUESTING_CODE_STATUS, LOGIN_SESSION_SAVED_STATUS, LOGIN_SIGNED_IN_PREFIX,
         LOGIN_SIGNING_IN_STATUS, LOGIN_START_PROMPT, MAX_DEFERRED_UPDATES, MIN_FRAME_INTERVAL,
         ManualMarkChatReadResult, MarkChatReadLoader, MediaPreviewLoader, MediaPreviewResult,
-        OlderMessageLoadResult, OlderMessageLoader, OlderMessageNavigation, OpenTargetKind,
-        OpenTargetLoader, PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR, RECONCILIATION_INTERVAL,
-        ReconciliationLoader, ReconciliationResult, ReplyMessageLoader, ReplyMessageResult,
-        RunMode, SAVING_EDIT_STATUS, SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS,
-        SETUP_ERROR_EXIT_CODE, SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT,
-        SMOKE_OK_PREFIX, SendMessageLoader, SendMessageResult, SubscribeUpdatesLoader,
-        SubscribeUpdatesResult, TerminalAction, TerminalSetupOperations, TokioInstant,
-        UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress, abort_running_task,
+        MutationTaskTracker, OlderMessageLoadResult, OlderMessageLoader, OlderMessageNavigation,
+        OpenTargetKind, OpenTargetLoader, PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR,
+        RECONCILIATION_INTERVAL, ReconciliationLoader, ReconciliationResult, ReplyMessageLoader,
+        ReplyMessageResult, RunMode, SAVING_EDIT_STATUS, SENDING_MESSAGE_STATUS,
+        SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE, SMOKE_CHECK_AUTH_CONFLICT,
+        SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_OK_PREFIX, SendMessageLoader, SendMessageResult,
+        SubscribeUpdatesLoader, SubscribeUpdatesResult, TerminalAction, TerminalSetupOperations,
+        TokioInstant, UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress, abort_running_task,
         apply_chat_message_load_result, apply_delete_message_result, apply_edit_message_result,
         apply_folder_chat_load_result, apply_initial_state_load_result,
         apply_manual_mark_chat_read_result, apply_media_preview_result,
         apply_older_message_load_result, apply_open_target_result, apply_reconciliation_result,
         apply_reply_message_result, apply_send_message_result, apply_subscribe_updates_result,
-        apply_update_with_read_ack, check_auth_ok_message, check_auth_unauthorized_message,
-        check_config_message, check_config_session_status, classify_terminal_event,
-        default_config_path_string, defer_update,
+        apply_update_with_read_ack, begin_quit_or_exit, check_auth_ok_message,
+        check_auth_unauthorized_message, check_config_message, check_config_session_status,
+        classify_terminal_event, default_config_path_string, defer_update,
         discard_deferred_conversation_updates_represented_by_snapshot, drain_ready_results,
-        handle_input_focused, handle_key_event, handle_key_event_with_progress, handle_mouse_event,
-        handle_received_update, handle_received_update_with_conversation_load, load_checked_config,
+        finish_quit_wait, handle_input_focused, handle_key_event, handle_key_event_with_progress,
+        handle_mouse_event, handle_quit_waiting_event, handle_received_update,
+        handle_received_update_with_conversation_load, load_checked_config,
         load_checked_config_with_session_parent, loaded_read_ack, login_2fa_hint_message,
         login_2fa_signed_in_message, login_code_sent_message, login_failed_message,
         login_signed_in_message, message_submit_action_status, older_message_key_navigation,
@@ -8809,6 +9221,66 @@ mod tests {
     #[derive(Clone)]
     struct HangingReconciliationClient;
 
+    #[derive(Clone)]
+    struct HangingSendClient;
+
+    impl TelegramClient for HangingSendClient {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_folders(&self) -> Result<Vec<Folder>> {
+            panic!("hanging-send client should not fetch folders")
+        }
+
+        async fn get_chats(&self, _folder_id: Option<i32>, _limit: usize) -> Result<Vec<Chat>> {
+            panic!("hanging-send client should not fetch chats")
+        }
+
+        async fn get_messages(&self, _chat_id: i64, _limit: usize) -> Result<Vec<Message>> {
+            panic!("hanging-send client should not fetch messages")
+        }
+
+        async fn get_messages_before(
+            &self,
+            _chat_id: i64,
+            _before_message_id: i32,
+            _limit: usize,
+        ) -> Result<Vec<Message>> {
+            panic!("hanging-send client should not fetch older messages")
+        }
+
+        async fn send_message(&self, _chat_id: i64, _content: String) -> Result<Message> {
+            std::future::pending().await
+        }
+
+        async fn edit_message(
+            &self,
+            _chat_id: i64,
+            _message_id: i32,
+            _content: String,
+        ) -> Result<()> {
+            panic!("hanging-send client should not edit messages")
+        }
+
+        async fn reply_to_message(
+            &self,
+            _chat_id: i64,
+            _reply_to: i32,
+            _content: String,
+        ) -> Result<Message> {
+            panic!("hanging-send client should not reply")
+        }
+
+        async fn delete_message(&self, _chat_id: i64, _message_id: i32) -> Result<()> {
+            panic!("hanging-send client should not delete messages")
+        }
+
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
+            panic!("hanging-send client should not subscribe")
+        }
+    }
+
     impl TelegramClient for HangingReconciliationClient {
         async fn connect(&mut self) -> Result<()> {
             Ok(())
@@ -10779,6 +11251,195 @@ mod tests {
         let sent = result.result.expect("mock send should succeed");
         assert_eq!(sent.chat_id, 1);
         assert_eq!(sent.content, "hello");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quit_waits_for_hanging_send_and_restores_unknown_text() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        let mutations = MutationTaskTracker::default();
+        let loader = SendMessageLoader::new_tracked(
+            HangingSendClient,
+            senders.send_message,
+            mutations.clone(),
+        );
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        let pending = crate::actions::begin_send_message(
+            &mut app.state,
+            1,
+            None,
+            "do not lose me".to_string(),
+        );
+        let submission_id = loader.spawn_send_message(pending);
+        app.state
+            .register_mutation_submission(submission_id, 1, None);
+        tokio::task::yield_now().await;
+
+        app.quit();
+        assert!(!begin_quit_or_exit(&mut app, &mut loop_state, &mutations));
+        assert!(loop_state.quit_waiting);
+        assert!(!app.should_quit);
+
+        tokio::time::advance(super::MUTATION_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        mutations.join_finished().await;
+        let result = loop_state
+            .send_message_rx
+            .try_recv()
+            .expect("timed-out send should report an owned result");
+        loop_state.quit_blocked = result.result.is_err();
+        apply_send_message_result(&mut app, result);
+
+        assert!(!finish_quit_wait(&mut loop_state, &mutations));
+        assert!(!loop_state.quit_waiting);
+        assert!(mutations.is_empty());
+        assert_eq!(app.state.input_buffer, "do not lose me");
+        assert!(
+            app.state
+                .error_message
+                .as_deref()
+                .is_some_and(|error| error.contains(super::MUTATION_UNKNOWN_ERROR))
+        );
+        assert!(app.state.mutation_outcome_unknown);
+        app.state.set_status("unrelated completion");
+        assert!(
+            app.state
+                .error_message
+                .as_deref()
+                .is_some_and(|error| error.contains(super::MUTATION_UNKNOWN_ERROR))
+        );
+    }
+
+    #[tokio::test]
+    async fn quit_joins_successful_send_before_exiting() {
+        let (mut loop_state, senders) = EventLoopState::new();
+        let mutations = MutationTaskTracker::default();
+        let loader = SendMessageLoader::new_tracked(
+            MockTelegramClient::new(),
+            senders.send_message,
+            mutations.clone(),
+        );
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        let pending =
+            crate::actions::begin_send_message(&mut app.state, 1, None, "hello".to_string());
+        let submission_id = loader.spawn_send_message(pending);
+        app.state
+            .register_mutation_submission(submission_id, 1, None);
+        tokio::task::yield_now().await;
+
+        app.quit();
+        assert!(!begin_quit_or_exit(&mut app, &mut loop_state, &mutations));
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !mutations.pending.borrow()[0].handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mock send should finish");
+        mutations.join_finished().await;
+        let result = loop_state
+            .send_message_rx
+            .try_recv()
+            .expect("successful send should remain queued until final drain");
+        apply_send_message_result(&mut app, result);
+
+        assert!(finish_quit_wait(&mut loop_state, &mutations));
+        assert!(mutations.is_empty());
+        assert_eq!(app.state.messages.len(), 1);
+        assert_eq!(app.state.messages[0].content, "hello");
+    }
+
+    #[tokio::test]
+    async fn panicked_mutation_reports_unknown_and_joins() {
+        let mutations = MutationTaskTracker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        mutations.spawn(
+            super::MutationTaskKey {
+                kind: "test",
+                id: 1,
+            },
+            async { panic!("simulated mutation panic") },
+            move || {
+                let _ = tx.send(super::MUTATION_UNKNOWN_ERROR);
+            },
+        );
+
+        mutations.join_all().await;
+
+        assert!(mutations.is_empty());
+        assert_eq!(rx.try_recv(), Ok(super::MUTATION_UNKNOWN_ERROR));
+    }
+
+    #[tokio::test]
+    async fn unknown_acknowledgement_preserves_recovered_text_and_allows_quit_from_input() {
+        let mut app = App::new();
+        app.state.input_buffer = "recovered".to_string();
+        app.state.focused_panel = FocusedPanel::Input;
+        app.state
+            .set_mutation_outcome_unknown(super::MUTATION_UNKNOWN_ERROR.to_string());
+        let mut client = MockTelegramClient::new();
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.state.input_buffer, "recovered");
+        assert!(!app.state.mutation_outcome_unknown);
+
+        app.state
+            .set_mutation_outcome_unknown(super::MUTATION_UNKNOWN_ERROR.to_string());
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut client,
+        )
+        .await
+        .unwrap();
+        assert!(app.should_quit);
+        assert_eq!(app.state.input_buffer, "recovered");
+    }
+
+    #[test]
+    fn same_step_mutation_failure_refuses_quit_after_result_drain() {
+        let (mut loop_state, _) = EventLoopState::new();
+        let mutations = MutationTaskTracker::default();
+        let mut app = App::new();
+        loop_state.mutation_failed_this_step = true;
+        app.quit();
+
+        assert!(!begin_quit_or_exit(&mut app, &mut loop_state, &mutations));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn quit_wait_suppresses_input_and_escape_cancels_wait() {
+        let (mut loop_state, _) = EventLoopState::new();
+        let mut app = App::new();
+        loop_state.quit_waiting = true;
+        app.state.set_status(super::QUIT_WAITING_STATUS);
+
+        assert_eq!(
+            handle_quit_waiting_event(
+                &mut app,
+                &mut loop_state,
+                &Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            ),
+            Some(false)
+        );
+        assert!(loop_state.quit_waiting);
+        assert_eq!(
+            handle_quit_waiting_event(
+                &mut app,
+                &mut loop_state,
+                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ),
+            Some(true)
+        );
+        assert!(!loop_state.quit_waiting);
     }
 
     #[test]

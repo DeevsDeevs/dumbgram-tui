@@ -469,6 +469,7 @@ pub struct AppState {
     pub replying_to_message_id: Option<i32>,
     pub error_message: Option<String>,
     pub error_timestamp: Option<tokio::time::Instant>,
+    pub mutation_outcome_unknown: bool,
     pub status_message: Option<String>,
     pub status_timestamp: Option<tokio::time::Instant>,
     pub last_downloaded_media: Option<DownloadedMediaReference>,
@@ -529,6 +530,7 @@ impl AppState {
             replying_to_message_id: None,
             error_message: None,
             error_timestamp: None,
+            mutation_outcome_unknown: false,
             status_message: None,
             status_timestamp: None,
             last_downloaded_media: None,
@@ -3487,17 +3489,39 @@ impl AppState {
     }
 
     pub fn set_error(&mut self, error: String) {
+        if self.mutation_outcome_unknown {
+            return;
+        }
         self.error_message = Some(error);
         self.error_timestamp = Some(tokio::time::Instant::now());
         self.clear_status();
     }
 
+    pub fn set_mutation_outcome_unknown(&mut self, error: String) {
+        self.error_message = Some(error);
+        self.error_timestamp = None;
+        self.mutation_outcome_unknown = true;
+        self.clear_status();
+    }
+
+    pub fn acknowledge_mutation_outcome_unknown(&mut self) {
+        self.mutation_outcome_unknown = false;
+        self.clear_error();
+        self.clear_status();
+    }
+
     pub fn clear_error(&mut self) {
+        if self.mutation_outcome_unknown {
+            return;
+        }
         self.error_message = None;
         self.error_timestamp = None;
     }
 
     pub fn set_status(&mut self, status: impl Into<String>) {
+        if self.mutation_outcome_unknown {
+            return;
+        }
         self.clear_error();
         self.status_message = Some(status.into());
         self.status_timestamp = Some(tokio::time::Instant::now());
