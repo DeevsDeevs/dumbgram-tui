@@ -2053,13 +2053,20 @@ fn begin_quit_or_exit(
     false
 }
 
-fn finish_quit_wait(loop_state: &mut EventLoopState, mutations: &MutationTaskTracker) -> bool {
+fn finish_quit_wait(
+    app: &mut App,
+    loop_state: &mut EventLoopState,
+    mutations: &MutationTaskTracker,
+) -> bool {
     if !loop_state.quit_waiting || !mutations.is_empty() {
         return false;
     }
     if loop_state.quit_blocked {
         loop_state.quit_waiting = false;
         loop_state.quit_blocked = false;
+        if !app.state.mutation_outcome_unknown {
+            app.state.clear_status();
+        }
         return false;
     }
     true
@@ -2127,7 +2134,7 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
         if step.dirty {
             frames.mark_dirty(TokioInstant::now());
         }
-        if finish_quit_wait(loop_state, mutations) {
+        if finish_quit_wait(app, loop_state, mutations) {
             diagnostics::event("run_loop_quit", "pending_mutations_settled=true");
             break;
         }
@@ -2993,18 +3000,21 @@ fn drain_ready_results<C: TelegramClient + Clone + Send + Sync + 'static>(
         dirty = true;
     }
     while let Ok(result) = loop_state.delete_message_rx.try_recv() {
-        loop_state.record_mutation_result(result.result.is_err());
-        apply_delete_message_result(app, result);
-        dirty = true;
+        let failed = result.result.is_err();
+        let applied = apply_delete_message_result(app, result);
+        loop_state.record_mutation_result(failed && applied);
+        dirty |= applied;
     }
     while let Ok(result) = loop_state.manual_mark_read_rx.try_recv() {
-        loop_state.record_mutation_result(result.result.is_err());
-        dirty |= apply_manual_mark_chat_read_result(
+        let failed = result.result.is_err();
+        let applied = apply_manual_mark_chat_read_result(
             loop_state,
             app,
             result,
             reconciliation_loader.latest_request_id(),
         );
+        loop_state.record_mutation_result(failed && applied);
+        dirty |= applied;
     }
     while let Ok(result) = loop_state.edit_message_rx.try_recv() {
         loop_state.record_mutation_result(result.result.is_err());
@@ -4987,7 +4997,7 @@ fn apply_send_message_result(app: &mut App, load: SendMessageResult) {
     }
 }
 
-fn apply_delete_message_result(app: &mut App, load: DeleteMessageResult) {
+fn apply_delete_message_result(app: &mut App, load: DeleteMessageResult) -> bool {
     diagnostics::event(
         "delete_message_result",
         format!(
@@ -5000,7 +5010,7 @@ fn apply_delete_message_result(app: &mut App, load: DeleteMessageResult) {
         .finish_delete_submission(load.submission_id, load.confirmation)
     {
         diagnostics::event("delete_message_result_ignored", "reason=stale_owner");
-        return;
+        return false;
     }
     match load.result {
         Err(error) if error.contains(MUTATION_UNKNOWN_ERROR) => app
@@ -5008,6 +5018,7 @@ fn apply_delete_message_result(app: &mut App, load: DeleteMessageResult) {
             .set_mutation_outcome_unknown(state::delete_failed_error(error)),
         result => actions::apply_delete_message_result(&mut app.state, load.confirmation, result),
     }
+    true
 }
 
 fn apply_manual_mark_chat_read_result(
@@ -11285,7 +11296,7 @@ mod tests {
         loop_state.quit_blocked = result.result.is_err();
         apply_send_message_result(&mut app, result);
 
-        assert!(!finish_quit_wait(&mut loop_state, &mutations));
+        assert!(!finish_quit_wait(&mut app, &mut loop_state, &mutations));
         assert!(!loop_state.quit_waiting);
         assert!(mutations.is_empty());
         assert_eq!(app.state.input_buffer, "do not lose me");
@@ -11339,7 +11350,7 @@ mod tests {
             .expect("successful send should remain queued until final drain");
         apply_send_message_result(&mut app, result);
 
-        assert!(finish_quit_wait(&mut loop_state, &mutations));
+        assert!(finish_quit_wait(&mut app, &mut loop_state, &mutations));
         assert!(mutations.is_empty());
         assert_eq!(app.state.messages.len(), 1);
         assert_eq!(app.state.messages[0].content, "hello");
@@ -11946,6 +11957,35 @@ mod tests {
 
         assert!(app.state.messages.is_empty());
         assert_eq!(app.state.delete_confirmation(), Some(newer_confirmation));
+    }
+
+    #[test]
+    fn confirmed_delete_update_does_not_block_quit_on_stale_rpc_error() {
+        let (mut loop_state, _) = EventLoopState::new();
+        let mutations = MutationTaskTracker::default();
+        let mut app = App::new();
+        let confirmation = DeleteConfirmation {
+            chat_id: 1,
+            message_id: 7,
+        };
+        assert!(app.state.begin_delete_submission(1, confirmation));
+        app.state.finish_delete_submissions_for_update(1, 7);
+        loop_state.quit_waiting = true;
+        app.state.set_status(super::QUIT_WAITING_STATUS);
+
+        let result = DeleteMessageResult {
+            submission_id: 1,
+            confirmation,
+            result: Err(super::MUTATION_UNKNOWN_ERROR.to_string()),
+        };
+        let failed = result.result.is_err();
+        let applied = apply_delete_message_result(&mut app, result);
+        loop_state.record_mutation_result(failed && applied);
+
+        assert!(!applied);
+        assert!(finish_quit_wait(&mut app, &mut loop_state, &mutations));
+        assert!(!loop_state.quit_blocked);
+        assert!(!app.state.mutation_outcome_unknown);
     }
 
     #[test]
