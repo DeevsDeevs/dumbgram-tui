@@ -73,7 +73,6 @@ const MUTATION_TIMEOUT: Duration = Duration::from_millis(10);
 const MUTATION_UNKNOWN_ERROR: &str =
     "Delivery unknown — verify Telegram before retrying or quitting";
 const QUIT_WAITING_STATUS: &str = "Waiting for pending actions · Esc stay";
-const MUTATION_UNKNOWN_ACK_HELP: &str = "Esc acknowledge · q acknowledge and quit";
 const QUIT_MUTATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 static MUTATION_SUBMISSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const UPDATE_SUBSCRIPTION_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -2167,10 +2166,6 @@ async fn run_event_loop<C: TelegramClient + Clone + Send + Sync + 'static>(
             frames.mark_dirty(TokioInstant::now());
         }
 
-        if app.state.mutation_outcome_unknown {
-            app.state.status_message = Some(MUTATION_UNKNOWN_ACK_HELP.to_string());
-            app.state.status_timestamp = None;
-        }
         release_gap_submit_if_ready(app, send_message_loader, reply_message_loader);
         if draw_due_frame(terminal, app, theme, &mut frames)? {
             loop_state.mutation_failed_this_step = false;

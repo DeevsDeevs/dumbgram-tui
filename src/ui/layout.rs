@@ -127,7 +127,12 @@ pub fn render_layout(frame: &mut Frame, app: &mut App, theme: &Theme) {
 
     let banner_index = 2 + usize::from(show_help_bar);
     if let Some(error) = app.state.error_message.as_ref() {
-        render_error_banner(frame, main_chunks[banner_index], error, theme);
+        let error = if app.state.mutation_outcome_unknown {
+            "Delivery unknown — verify Telegram · Esc keep editing · q quit".to_string()
+        } else {
+            error.clone()
+        };
+        render_error_banner(frame, main_chunks[banner_index], &error, theme);
     } else if let Some(status) = app.state.status_message.as_ref() {
         render_status_banner(frame, main_chunks[banner_index], status, theme);
     }
@@ -229,7 +234,9 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 }
 
 fn help_bar_controls(app: &App) -> String {
-    if app.state.delete_confirmation().is_some() {
+    if app.state.mutation_outcome_unknown {
+        join_help_controls(&["Delivery unknown", "Esc keep editing", "q quit"])
+    } else if app.state.delete_confirmation().is_some() {
         join_help_controls(&["Confirm delete: y yes", "n/Esc/Ctrl-C cancel"])
     } else if app.state.context_menu().is_some() {
         join_help_controls(&["Menu: Up/Down choose", "Enter select", "Esc close"])
@@ -656,6 +663,32 @@ mod tests {
             !rendered.contains(&format!("{STATUS_BANNER_PREFIX} saved")),
             "status banner should not render while an error is active"
         );
+    }
+
+    #[test]
+    fn unknown_delivery_renders_only_acknowledgement_controls_with_recovered_input() {
+        let mut app = App::new();
+        app.state.focused_panel = FocusedPanel::Input;
+        app.state.input_buffer = "recovered text".to_string();
+        app.state
+            .set_mutation_outcome_unknown("Delivery unknown — verify Telegram".to_string());
+
+        let rendered = render_app_to_string_for_test(&mut app);
+        let controls = help_bar_controls(&app);
+
+        assert!(rendered.contains("recovered text"));
+        assert!(rendered.contains("Esc keep editing"));
+        assert!(rendered.contains("q quit"));
+        assert!(controls.contains("Delivery unknown"));
+        assert!(controls.contains("Esc keep editing"));
+        assert!(controls.contains("q quit"));
+        assert!(!controls.contains("Enter"));
+        assert!(!controls.contains("cancel"));
+
+        app.state.show_help_bar = false;
+        let hidden_help = render_app_to_string_for_test(&mut app);
+        assert!(hidden_help.contains("Esc keep editing"));
+        assert!(hidden_help.contains("q quit"));
     }
 
     #[test]
