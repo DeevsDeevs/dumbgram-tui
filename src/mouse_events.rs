@@ -1,7 +1,7 @@
 use crate::{
     state::{
         AppState, ContextMenuAction, ContextMenuTarget, FocusedPanel,
-        message_visible_row_height_for_width_capped,
+        message_reply_preview_visible, message_visible_row_height_for_width_capped,
     },
     telegram::types::message_display_content,
     text::{char_display_width, display_width},
@@ -233,6 +233,11 @@ fn message_link_at_click(state: &AppState, x: u16, y: u16) -> Option<String> {
         );
         if relative_y < current_row + message_height {
             let line_index = relative_y - current_row;
+            if message_reply_preview_visible(message, remaining_rows)
+                && line_index + 1 == message_height
+            {
+                return None;
+            }
             let time_str = message.timestamp.format("%H:%M").to_string();
             let metadata = ui::messages::message_metadata(
                 &time_str,
@@ -875,6 +880,30 @@ mod tests {
                 )
             ),
             MouseClickOutcome::OpenLink("https://example.org".to_string())
+        );
+        assert_eq!(state.focused_panel, FocusedPanel::Messages);
+        assert_eq!(state.selected_message_index, 0);
+    }
+
+    #[test]
+    fn reply_preview_row_does_not_open_url_from_hidden_body_line() {
+        let mut state = AppState::new();
+        state.messages_area = Rect::new(30, 5, 35, 4);
+        let mut reply = message_with_content(1, "prefix https://example.org/path");
+        reply.reply_to_content = Some("visible reply preview".to_string());
+        state.messages = vec![reply];
+
+        let hidden_url_column = 30 + 1 + 2 + 4 + 2;
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    hidden_url_column,
+                    7
+                )
+            ),
+            MouseClickOutcome::Handled
         );
         assert_eq!(state.focused_panel, FocusedPanel::Messages);
         assert_eq!(state.selected_message_index, 0);

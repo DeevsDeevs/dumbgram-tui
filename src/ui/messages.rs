@@ -4,7 +4,7 @@ use crate::{
     config::Theme,
     state::{
         ConversationLoadStatus, FOLDER_LEFT_SCROLL_INDICATOR, FOLDER_RIGHT_SCROLL_INDICATOR,
-        FOLDER_SEPARATOR, FocusedPanel,
+        FOLDER_SEPARATOR, FocusedPanel, message_reply_preview_visible,
     },
     telegram::types::{MessageStatus, ThreadTopic, message_display_content},
     text::{display_width, truncate_with_ellipsis, wrap_display_lines_limited},
@@ -266,7 +266,7 @@ fn message_item(
     } else {
         theme.other_message
     };
-    let reply_rows = usize::from(msg.reply_to_content.is_some() && max_rows > 1);
+    let reply_rows = usize::from(message_reply_preview_visible(msg, max_rows));
     let content_rows = max_rows.saturating_sub(reply_rows).max(1);
     let mut lines = message_lines(
         &msg.sender_name,

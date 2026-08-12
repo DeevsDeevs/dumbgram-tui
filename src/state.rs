@@ -60,6 +60,10 @@ pub(crate) fn message_visible_row_height_for_width(message: &Message, text_width
     message_visible_row_height_for_width_capped(message, text_width, usize::MAX)
 }
 
+pub(crate) fn message_reply_preview_visible(message: &Message, max_height: usize) -> bool {
+    message.reply_to_content.is_some() && max_height > 1
+}
+
 pub(crate) fn message_visible_row_height_for_width_capped(
     message: &Message,
     text_width: usize,
@@ -84,7 +88,7 @@ pub(crate) fn message_visible_row_height_for_width_capped(
     )
     .len()
     .max(MESSAGE_ROW_HEIGHT);
-    if message.reply_to_content.is_some() && rows < max_height {
+    if message_reply_preview_visible(message, max_height) && rows < max_height {
         rows += REPLY_MESSAGE_ROW_HEIGHT - MESSAGE_ROW_HEIGHT;
     }
     rows

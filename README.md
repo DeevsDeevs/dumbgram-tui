@@ -148,7 +148,7 @@ Search uses substring and simple fuzzy/subsequence matching over the currently l
 - `c` — copy selected message text through OSC52.
 - `o` — open the first web link using the operating system URL opener.
 - `s` — save supported media under `$HOME/Downloads`, or `./Downloads` if `HOME` is unavailable.
-- `v` — save when needed, then launch the operating system file opener.
+- `v` — open media previously saved for the selected message; press `s` first when needed.
 - `y` — confirm deletion; `n`, `Esc`, or `Ctrl-C` cancels.
 
 Telegram may reject an edit or delete even when Dumbgram offers it. Downloaded links and files are untrusted; inspect them before opening.
