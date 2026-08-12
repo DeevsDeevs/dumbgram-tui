@@ -396,6 +396,10 @@ mod unix {
         Ok(())
     }
 
+    pub fn secure_trusted_directory(path: &Path) -> Result<()> {
+        validate_ancestor_chain(path)
+    }
+
     pub fn secure_private_directory(path: &Path) -> Result<()> {
         let file = File::from(open_absolute_directory(path)?);
         fchmod(&file, PRIVATE_DIR_MODE)?;
@@ -441,6 +445,10 @@ mod unix {
 
     pub fn secure_private_file(path: &Path) -> Result<()> {
         open_private_file(path).map(drop)
+    }
+
+    pub fn secure_private_file_handle(file: &File, path: &Path) -> Result<()> {
+        secure_regular_file(file, path)
     }
 
     pub fn verify_private_file_identity(file: &File, path: &Path) -> Result<()> {
@@ -650,7 +658,8 @@ mod unix {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use unix::{
     PlatformSecureSessionFile as SecureSessionFile, cleanup_private_download, open_private_file,
-    secure_private_directory, secure_private_file, verify_private_file_identity,
+    secure_private_directory, secure_private_file, secure_private_file_handle,
+    secure_trusted_directory, verify_private_file_identity,
 };
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -665,7 +674,21 @@ pub fn secure_private_directory(_path: &Path) -> Result<()> {
 pub fn cleanup_private_download(_temp_dir: &Path, _temp_file: &Path) {}
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn secure_trusted_directory(path: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        Ok(())
+    } else {
+        color_eyre::eyre::bail!("mock storage parent is not a directory")
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn open_private_file(_path: &Path) -> Result<std::fs::File> {
+    color_eyre::eyre::bail!("private Telegram cache storage is supported only on Linux and macOS")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn secure_private_file_handle(_file: &std::fs::File, _path: &Path) -> Result<()> {
     color_eyre::eyre::bail!("private Telegram cache storage is supported only on Linux and macOS")
 }
 

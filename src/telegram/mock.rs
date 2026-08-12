@@ -1,4 +1,7 @@
 use super::client::{DownloadedMedia, ReconciliationChatList, TelegramClient};
+use super::session_file::secure_trusted_directory;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::session_file::{secure_private_directory, secure_private_file_handle};
 use super::types::{
     Chat, Folder, Message, MessageMedia, MessageStatus, OWN_SENDER_NAME, SenderIdentity,
     ThreadTopic, Update, all_folder,
@@ -8,16 +11,19 @@ use chrono::Utc;
 use color_eyre::Result;
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 use tokio::sync::mpsc;
 
 const UPDATE_CHANNEL_CAPACITY: usize = 100;
+const MAX_MOCK_PATH_ATTEMPTS: u64 = 10_000;
 const UPDATE_CHANNEL_SATURATED: &str =
     "Mock update buffer saturated; refreshing authoritative state";
 
@@ -49,19 +55,106 @@ impl MockTelegramClient {
 }
 
 const MOCK_IMAGE_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAKAAAABQCAIAAAARP+ljAAAA2klEQVR42u3bMQ0AIAxFwYpABBKRiKuioVMTegnzG/6tJdbJ0su7S0+/tx8GAgwAMADA+oD1AesD1gcM2ECAAQAGAFgfsD5gfcBjgQ36dx8wYACAAQDWB6wPWB+wPmDABgIMADAAwPqA9QHrA54LbFAXHQAAAwCsD1gfsD5gfcCADQQYAGAAgPUB6wPWBwzYQP4HG9RFBwDA+oD1AesD1gcMGABgAID1AesD1gesDxiwgQAD8D8YmIsOfcD6gPUBAzYQYACAAQDWB6wPWB+wPmDABgIMALB+a/8BI+/vC6JSYoIAAAAASUVORK5CYII=";
+static MOCK_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MOCK_IMAGE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn secure_mock_directory(path: &Path) -> std::io::Result<()> {
+    secure_private_directory(path).map_err(std::io::Error::other)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn secure_mock_directory(path: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(path)?.is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("mock media path is not a directory"))
+    }
+}
+
+fn secure_mock_parent(path: &Path) -> std::io::Result<()> {
+    secure_trusted_directory(path).map_err(std::io::Error::other)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn secure_mock_file_handle(file: &fs::File, path: &Path) -> std::io::Result<()> {
+    secure_private_file_handle(file, path).map_err(std::io::Error::other)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn secure_mock_file_handle(file: &fs::File, path: &Path) -> std::io::Result<()> {
+    if file.metadata()?.is_file() && fs::symlink_metadata(path)?.is_file() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("mock media path is not a file"))
+    }
+}
+
+fn private_mock_dir() -> Option<PathBuf> {
+    let root = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| secure_mock_parent(home).is_ok())?;
+    for _ in 0..MAX_MOCK_PATH_ATTEMPTS {
+        let id = MOCK_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!(".dumbgram-tui-mock-{}-{id}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                if secure_mock_directory(&path).is_ok() {
+                    return Some(path);
+                }
+                let _ = fs::remove_dir(&path);
+                return None;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn create_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    secure_mock_file_handle(&file, path)
+}
 
 fn mock_image_path() -> Option<PathBuf> {
-    let path = std::env::temp_dir()
-        .join("dumbgram-tui-media")
-        .join("mock")
-        .join("photo.png");
+    MOCK_IMAGE_PATH
+        .get_or_init(|| {
+            let path = private_mock_dir()?.join("photo.png");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(MOCK_IMAGE_PNG_BASE64)
+                .ok()?;
+            create_private_file(&path, &bytes).ok()?;
+            Some(path)
+        })
+        .clone()
+}
 
-    std::fs::create_dir_all(path.parent()?).ok()?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(MOCK_IMAGE_PNG_BASE64)
-        .ok()?;
-    std::fs::write(&path, bytes).ok()?;
-    Some(path)
+fn reserve_mock_download(destination_dir: &Path, message_id: i32, bytes: &[u8]) -> Result<PathBuf> {
+    fs::create_dir_all(destination_dir)?;
+    for index in 0..MAX_MOCK_PATH_ATTEMPTS {
+        let suffix = if index == 0 {
+            String::new()
+        } else {
+            format!(" ({index})")
+        };
+        let path = destination_dir.join(format!("dumbgram-mock-message-{message_id}{suffix}.png"));
+        match create_private_file(&path, bytes) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    color_eyre::eyre::bail!("could not reserve a mock media download path")
 }
 
 #[cfg(test)]
@@ -124,10 +217,8 @@ impl TelegramClient for MockTelegramClient {
         destination_dir: PathBuf,
     ) -> impl std::future::Future<Output = Result<DownloadedMedia>> + Send + '_ {
         async move {
-            std::fs::create_dir_all(&destination_dir)?;
-            let path = destination_dir.join(format!("dumbgram-mock-message-{message_id}.png"));
             let bytes = base64::engine::general_purpose::STANDARD.decode(MOCK_IMAGE_PNG_BASE64)?;
-            std::fs::write(&path, &bytes)?;
+            let path = reserve_mock_download(&destination_dir, message_id, &bytes)?;
             Ok(DownloadedMedia {
                 path,
                 bytes: bytes.len() as u64,
@@ -746,7 +837,7 @@ impl TelegramClient for MockTelegramClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{MOCK_IMAGE_PNG_BASE64, MockTelegramClient, mock_photo_media};
+    use super::{MOCK_IMAGE_PNG_BASE64, MockTelegramClient, mock_photo_media, private_mock_dir};
     use crate::telegram::TelegramClient;
     use base64::Engine;
 
@@ -862,6 +953,24 @@ mod tests {
         assert!(client.get_thread_topics(1, 10).await.unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn mock_media_download_never_overwrites_an_existing_file() {
+        let client = MockTelegramClient::new();
+        let root = private_mock_dir().expect("private mock directory should be available");
+        let existing = root.join("dumbgram-mock-message-42.png");
+        std::fs::write(&existing, b"keep me").unwrap();
+
+        let saved = client
+            .download_message_media(1, 42, root.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(existing).unwrap(), b"keep me");
+        assert_ne!(saved.path, root.join("dumbgram-mock-message-42.png"));
+        assert!(saved.path.ends_with("dumbgram-mock-message-42 (1).png"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn mock_photo_media_has_local_preview_file_for_kitty_smoke() {
         let media = mock_photo_media();
@@ -871,6 +980,27 @@ mod tests {
             .expect("mock photo should have a local preview image");
         assert!(path.exists());
         assert!(std::fs::metadata(path).unwrap().len() > 200);
+        assert!(
+            path.parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".dumbgram-tui-mock-")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap()).unwrap().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().uid(),
+                std::fs::metadata(path.parent().unwrap()).unwrap().uid()
+            );
+        }
 
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(MOCK_IMAGE_PNG_BASE64)
