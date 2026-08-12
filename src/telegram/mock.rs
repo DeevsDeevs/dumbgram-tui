@@ -1,5 +1,5 @@
 use super::client::{DownloadedMedia, ReconciliationChatList, TelegramClient};
-use super::session_file::secure_trusted_directory;
+use super::session_file::{open_private_directory, secure_trusted_directory};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::session_file::{secure_private_directory, secure_private_file_handle};
 use super::types::{
@@ -15,7 +15,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -32,6 +32,7 @@ pub struct MockTelegramClient {
     connected: bool,
     typing_action_count: Arc<AtomicUsize>,
     preview_load_count: Arc<AtomicUsize>,
+    media: Arc<MockMediaArtifact>,
 }
 
 impl MockTelegramClient {
@@ -40,6 +41,7 @@ impl MockTelegramClient {
             connected: false,
             typing_action_count: Arc::new(AtomicUsize::new(0)),
             preview_load_count: Arc::new(AtomicUsize::new(0)),
+            media: Arc::new(MockMediaArtifact::new()),
         }
     }
 
@@ -56,7 +58,58 @@ impl MockTelegramClient {
 
 const MOCK_IMAGE_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAKAAAABQCAIAAAARP+ljAAAA2klEQVR42u3bMQ0AIAxFwYpABBKRiKuioVMTegnzG/6tJdbJ0su7S0+/tx8GAgwAMADA+oD1AesD1gcM2ECAAQAGAFgfsD5gfcBjgQ36dx8wYACAAQDWB6wPWB+wPmDABgIMADAAwPqA9QHrA54LbFAXHQAAAwCsD1gfsD5gfcCADQQYAGAAgPUB6wPWBwzYQP4HG9RFBwDA+oD1AesD1gcMGABgAID1AesD1gesDxiwgQAD8D8YmIsOfcD6gPUBAzYQYACAAQDWB6wPWB+wPmDABgIMALB+a/8BI+/vC6JSYoIAAAAASUVORK5CYII=";
 static MOCK_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
-static MOCK_IMAGE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+struct MockMediaArtifact {
+    directory_path: Option<PathBuf>,
+    directory: Option<fs::File>,
+    file_path: Option<PathBuf>,
+    file: Option<fs::File>,
+}
+
+impl MockMediaArtifact {
+    fn new() -> Self {
+        let Some(directory_path) = private_mock_dir() else {
+            return Self {
+                directory_path: None,
+                directory: None,
+                file_path: None,
+                file: None,
+            };
+        };
+        let mut artifact = Self {
+            directory_path: Some(directory_path.clone()),
+            directory: None,
+            file_path: None,
+            file: None,
+        };
+        artifact.directory = open_private_directory(&directory_path).ok();
+        let file_path = directory_path.join("photo.png");
+        artifact.file_path = Some(file_path.clone());
+        artifact.file = base64::engine::general_purpose::STANDARD
+            .decode(MOCK_IMAGE_PNG_BASE64)
+            .ok()
+            .and_then(|bytes| create_private_file(&file_path, &bytes).ok());
+        artifact
+    }
+
+    fn path(&self) -> Option<PathBuf> {
+        self.file.as_ref()?;
+        self.file_path.clone()
+    }
+}
+
+impl Drop for MockMediaArtifact {
+    fn drop(&mut self) {
+        if let Some(path) = self.file_path.take() {
+            let _ = fs::remove_file(path);
+        }
+        drop(self.file.take());
+        if let Some(path) = self.directory_path.take() {
+            let _ = fs::remove_dir(path);
+        }
+        drop(self.directory.take());
+    }
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn secure_mock_directory(path: &Path) -> std::io::Result<()> {
@@ -112,7 +165,7 @@ fn private_mock_dir() -> Option<PathBuf> {
     None
 }
 
-fn create_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn create_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -123,20 +176,8 @@ fn create_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    secure_mock_file_handle(&file, path)
-}
-
-fn mock_image_path() -> Option<PathBuf> {
-    MOCK_IMAGE_PATH
-        .get_or_init(|| {
-            let path = private_mock_dir()?.join("photo.png");
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(MOCK_IMAGE_PNG_BASE64)
-                .ok()?;
-            create_private_file(&path, &bytes).ok()?;
-            Some(path)
-        })
-        .clone()
+    secure_mock_file_handle(&file, path)?;
+    Ok(file)
 }
 
 fn reserve_mock_download(destination_dir: &Path, message_id: i32, bytes: &[u8]) -> Result<PathBuf> {
@@ -149,7 +190,10 @@ fn reserve_mock_download(destination_dir: &Path, message_id: i32, bytes: &[u8]) 
         };
         let path = destination_dir.join(format!("dumbgram-mock-message-{message_id}{suffix}.png"));
         match create_private_file(&path, bytes) {
-            Ok(()) => return Ok(path),
+            Ok(file) => {
+                drop(file);
+                return Ok(path);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
         }
@@ -158,10 +202,13 @@ fn reserve_mock_download(destination_dir: &Path, message_id: i32, bytes: &[u8]) 
 }
 
 #[cfg(test)]
-fn mock_photo_media() -> MessageMedia {
-    mock_image_path().map_or_else(MessageMedia::photo, |path| {
-        MessageMedia::photo().with_local_path(path)
-    })
+fn mock_photo_media(client: &MockTelegramClient) -> MessageMedia {
+    client
+        .media
+        .path()
+        .map_or_else(MessageMedia::photo, |path| {
+            MessageMedia::photo().with_local_path(path)
+        })
 }
 
 impl Default for MockTelegramClient {
@@ -187,7 +234,7 @@ impl TelegramClient for MockTelegramClient {
         _message_id: i32,
     ) -> Result<Option<PathBuf>> {
         self.preview_load_count.fetch_add(1, Ordering::Relaxed);
-        Ok(mock_image_path())
+        Ok(self.media.path())
     }
 
     #[allow(clippy::manual_async_fn)]
@@ -953,6 +1000,20 @@ mod tests {
         assert!(client.get_thread_topics(1, 10).await.unwrap().is_empty());
     }
 
+    #[test]
+    fn mock_preview_artifact_lives_until_the_last_client_clone_drops() {
+        let client = MockTelegramClient::new();
+        let clone = client.clone();
+        let path = client.media.path().expect("mock preview should exist");
+        let parent = path.parent().unwrap().to_path_buf();
+
+        drop(client);
+        assert!(path.exists());
+        drop(clone);
+        assert!(!path.exists());
+        assert!(!parent.exists());
+    }
+
     #[tokio::test]
     async fn mock_media_download_never_overwrites_an_existing_file() {
         let client = MockTelegramClient::new();
@@ -973,7 +1034,8 @@ mod tests {
 
     #[test]
     fn mock_photo_media_has_local_preview_file_for_kitty_smoke() {
-        let media = mock_photo_media();
+        let client = MockTelegramClient::new();
+        let media = mock_photo_media(&client);
 
         let path = media
             .local_image_path()

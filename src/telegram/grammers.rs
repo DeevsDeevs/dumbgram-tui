@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 
 use super::client::{DownloadedMedia, ReconciliationChatList, TelegramClient};
 use super::session_file::{
-    SecureSessionFile, cleanup_private_download, open_private_file, secure_private_directory,
-    secure_private_file, verify_private_file_identity,
+    BoundPrivateDirectory, SecureSessionFile, cleanup_private_download, open_private_file,
+    secure_private_directory, secure_private_file, verify_private_file_identity,
 };
 use super::types::{
     Chat, Folder, Message, MessageMedia, MessageMediaKind, MessageStatus, OWN_SENDER_NAME,
@@ -860,32 +860,11 @@ fn sanitize_download_file_name(name: &str) -> Option<String> {
     Some(sanitized)
 }
 
-struct ReservedDownloadPath {
-    path: PathBuf,
-}
-
-impl ReservedDownloadPath {
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn persist(mut self) -> PathBuf {
-        std::mem::take(&mut self.path)
-    }
-}
-
-impl Drop for ReservedDownloadPath {
-    fn drop(&mut self) {
-        if !self.path.as_os_str().is_empty() {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-fn reserve_available_download_path(
-    destination_dir: &Path,
+fn publish_available_download_path(
+    stage: &super::session_file::PrivateStage,
+    file: &std::fs::File,
     file_name: &str,
-) -> std::io::Result<ReservedDownloadPath> {
+) -> Result<PathBuf> {
     let path = Path::new(file_name);
     let stem = path
         .file_stem()
@@ -896,29 +875,22 @@ fn reserve_available_download_path(
 
     for copy_index in 0..=MAX_DOWNLOAD_COPY_INDEX {
         let candidate = if copy_index == 0 {
-            destination_dir.join(file_name)
+            OsString::from(file_name)
         } else if let Some(extension) = extension {
-            destination_dir.join(format!("{stem}-{copy_index}.{extension}"))
+            OsString::from(format!("{stem}-{copy_index}.{extension}"))
         } else {
-            destination_dir.join(format!("{stem}-{copy_index}"))
+            OsString::from(format!("{stem}-{copy_index}"))
         };
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => {
-                drop(file);
-                return Ok(ReservedDownloadPath { path: candidate });
+        match stage.publish_no_replace("media", &candidate) {
+            Ok(path) => {
+                verify_private_file_identity(file, &path)?;
+                return Ok(path);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "no available media download filename",
-    ))
+    color_eyre::eyre::bail!("no available media download filename")
 }
 
 fn media_thumbnail(media: &grammers_client::types::Media) -> Option<PhotoSize> {
@@ -1629,7 +1601,6 @@ impl TelegramClient for GrammersClient {
     ) -> impl std::future::Future<Output = Result<DownloadedMedia>> + Send + '_ {
         async move {
             let chat = self.cached_chat(chat_id)?;
-            std::fs::create_dir_all(&destination_dir)?;
             let mut messages = self.client.get_messages_by_id(&chat, &[message_id]).await?;
             let message = messages
                 .pop()
@@ -1638,18 +1609,17 @@ impl TelegramClient for GrammersClient {
             let media = message
                 .media()
                 .ok_or_else(|| color_eyre::eyre::eyre!("No downloadable media"))?;
-            let reservation = reserve_available_download_path(
-                &destination_dir,
-                &media_download_file_name(chat_id, message_id, &media),
-            )?;
+            let file_name = media_download_file_name(chat_id, message_id, &media);
+            let destination = BoundPrivateDirectory::bind(&destination_dir)?;
+            let stage = destination.stage("dumbgram-download")?;
+            let dependency_path = stage.path("media");
             self.client
-                .download_media(&Downloadable::Media(media), reservation.path())
+                .download_media(&Downloadable::Media(media), &dependency_path)
                 .await?;
-            let bytes = std::fs::metadata(reservation.path()).map(|metadata| metadata.len())?;
-            Ok(DownloadedMedia {
-                path: reservation.persist(),
-                bytes,
-            })
+            let file = stage.open_file("media")?;
+            let bytes = file.metadata()?.len();
+            let path = publish_available_download_path(&stage, &file, &file_name)?;
+            Ok(DownloadedMedia { path, bytes })
         }
     }
 
@@ -2121,8 +2091,8 @@ mod tests {
         dialog_chats_from_page_parts, dialog_matches_filter, dumbgram_init_params,
         folders_from_dialog_filters, forward_bounded_update, input_peers_contain_chat,
         media_cache_dir, merge_folder_unread_snapshot, message_sender_name,
-        message_status_for_read_state, message_thread_topic_id, publish_downloaded_thumbnail,
-        read_outbox_update_from_raw, reserve_available_download_path, sanitize_download_file_name,
+        message_status_for_read_state, message_thread_topic_id, publish_available_download_path,
+        publish_downloaded_thumbnail, read_outbox_update_from_raw, sanitize_download_file_name,
         send_action_is_typing, sender_identity_from_peer, thread_topic_from_tl,
         topic_send_random_id, typing_status_update_from_raw,
         typing_status_update_from_raw_with_user_names, update_error_message,
@@ -2275,22 +2245,18 @@ mod tests {
     }
 
     #[test]
-    fn media_download_paths_are_atomically_reserved_and_cleaned_until_persisted() {
+    fn media_download_paths_publish_without_replacing_existing_names() {
         let root = private_test_dir("media-save-reservation");
-        let first = reserve_available_download_path(&root, "report.pdf").unwrap();
-        let second = reserve_available_download_path(&root, "report.pdf").unwrap();
-        let first_path = first.path().to_path_buf();
-        let second_path = second.path().to_path_buf();
+        std::fs::write(root.join("report.pdf"), b"existing").unwrap();
+        let destination =
+            crate::telegram::session_file::BoundPrivateDirectory::bind(&root).unwrap();
+        let stage = destination.stage("download-test").unwrap();
+        let file = stage.write_file("media", b"download").unwrap();
+        let path = publish_available_download_path(&stage, &file, "report.pdf").unwrap();
 
-        assert_eq!(first_path.file_name().unwrap(), "report.pdf");
-        assert_eq!(second_path.file_name().unwrap(), "report-1.pdf");
-        assert!(first_path.is_file());
-        assert!(second_path.is_file());
-
-        drop(first);
-        drop(second);
-        assert!(!first_path.exists());
-        assert!(!second_path.exists());
+        assert_eq!(std::fs::read(root.join("report.pdf")).unwrap(), b"existing");
+        assert_eq!(path.file_name().unwrap(), "report-1.pdf");
+        assert_eq!(std::fs::read(&path).unwrap(), b"download");
         std::fs::remove_dir_all(root).unwrap();
     }
 

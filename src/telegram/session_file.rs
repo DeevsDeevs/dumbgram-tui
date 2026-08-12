@@ -400,10 +400,15 @@ mod unix {
         validate_ancestor_chain(path)
     }
 
-    pub fn secure_private_directory(path: &Path) -> Result<()> {
+    pub fn open_private_directory(path: &Path) -> Result<File> {
         let file = File::from(open_absolute_directory(path)?);
         fchmod(&file, PRIVATE_DIR_MODE)?;
-        secure_directory(&file, path, false, true)
+        secure_directory(&file, path, false, true)?;
+        Ok(file)
+    }
+
+    pub fn secure_private_directory(path: &Path) -> Result<()> {
+        open_private_directory(path).map(drop)
     }
 
     pub fn cleanup_private_download(temp_dir: &Path, temp_file: &Path) {
@@ -458,6 +463,134 @@ mod unix {
             color_eyre::eyre::bail!("private file identity changed: {}", path.display())
         }
         verify_acl_and_identity(file, path)
+    }
+
+    pub struct BoundPrivateDirectory {
+        fd: File,
+        path: PathBuf,
+    }
+
+    pub struct PrivateStage {
+        parent_fd: File,
+        parent_path: PathBuf,
+        fd: File,
+        path: PathBuf,
+        name: OsString,
+    }
+
+    impl BoundPrivateDirectory {
+        pub fn bind(path: &Path) -> Result<Self> {
+            let (fd, path) = secure_parent(path)?;
+            secure_directory(&fd, &path, false, false)?;
+            Ok(Self { fd, path })
+        }
+
+        pub fn stage(&self, prefix: &str) -> Result<PrivateStage> {
+            for _ in 0..MAX_STAGE_ATTEMPTS {
+                let counter = STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let name = OsString::from(format!(".{prefix}-{}-{counter}", std::process::id()));
+                match mkdirat(&self.fd, &name, PRIVATE_DIR_MODE) {
+                    Ok(()) => {
+                        let path = self.path.join(&name);
+                        let fd = open_created_directory(&self.fd, &name, &path)?;
+                        return Ok(PrivateStage {
+                            parent_fd: self.fd.try_clone()?,
+                            parent_path: self.path.clone(),
+                            fd,
+                            path,
+                            name,
+                        });
+                    }
+                    Err(error) if error == rustix::io::Errno::EXIST => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            color_eyre::eyre::bail!("could not reserve a private staging directory")
+        }
+
+        pub fn open_file_optional(&self, name: &OsStr) -> Result<Option<File>> {
+            reject_unsafe_component(name)?;
+            let fd = match openat(
+                &self.fd,
+                name,
+                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let file = File::from(fd);
+            secure_regular_file(&file, &self.path.join(name))?;
+            Ok(Some(file))
+        }
+    }
+
+    impl PrivateStage {
+        pub fn path(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+
+        pub fn write_file(&self, name: &str, bytes: &[u8]) -> Result<File> {
+            let file = File::from(openat(
+                &self.fd,
+                name,
+                OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                PRIVATE_FILE_MODE,
+            )?);
+            let mut writer = &file;
+            writer.write_all(bytes)?;
+            file.sync_all()?;
+            secure_regular_file(&file, &self.path(name))?;
+            fsync(&self.fd)?;
+            Ok(file)
+        }
+
+        pub fn open_file(&self, name: &str) -> Result<File> {
+            let file = File::from(openat(
+                &self.fd,
+                name,
+                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )?);
+            secure_regular_file(&file, &self.path(name))?;
+            Ok(file)
+        }
+
+        pub fn publish_no_replace(
+            &self,
+            source: &str,
+            destination: &OsStr,
+        ) -> std::io::Result<PathBuf> {
+            reject_unsafe_component(destination).map_err(std::io::Error::other)?;
+            renameat_with(
+                &self.fd,
+                source,
+                &self.parent_fd,
+                destination,
+                RenameFlags::NOREPLACE,
+            )?;
+            fsync(&self.fd)?;
+            fsync(&self.parent_fd)?;
+            Ok(self.parent_path.join(destination))
+        }
+
+        pub fn publish_replace(&self, source: &str, destination: &OsStr) -> Result<PathBuf> {
+            reject_unsafe_component(destination)?;
+            renameat(&self.fd, source, &self.parent_fd, destination)?;
+            fsync(&self.fd)?;
+            fsync(&self.parent_fd)?;
+            Ok(self.parent_path.join(destination))
+        }
+    }
+
+    impl Drop for PrivateStage {
+        fn drop(&mut self) {
+            for name in ["media", "preferences"] {
+                let _ = unlinkat(&self.fd, name, AtFlags::empty());
+            }
+            let _ = unlinkat(&self.parent_fd, &self.name, AtFlags::REMOVEDIR);
+        }
     }
 
     pub use SecureSessionFile as PlatformSecureSessionFile;
@@ -643,6 +776,34 @@ mod unix {
         }
 
         #[test]
+        fn bound_stage_ignores_later_lexical_destination_alias_replacement() {
+            let root = private_test_dir("bound-stage-alias");
+            let trusted = root.join("trusted");
+            let replacement = root.join("replacement");
+            fs::create_dir(&trusted).unwrap();
+            fs::create_dir(&replacement).unwrap();
+            fs::set_permissions(&trusted, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+            let alias = root.join("alias");
+            symlink(&trusted, &alias).unwrap();
+            let directory = BoundPrivateDirectory::bind(&alias).unwrap();
+            let stage = directory.stage("download").unwrap();
+            let dependency_path = stage.path("media");
+            fs::remove_file(&alias).unwrap();
+            symlink(&replacement, &alias).unwrap();
+            let file = stage.write_file("media", b"download").unwrap();
+            let published = stage
+                .publish_no_replace("media", OsStr::new("result"))
+                .unwrap();
+            verify_private_file_identity(&file, &published).unwrap();
+
+            assert!(dependency_path.starts_with(&trusted));
+            assert_eq!(fs::read(trusted.join("result")).unwrap(), b"download");
+            assert!(!replacement.join("result").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
         fn published_identity_matches_open_stage_identity() {
             let root = private_test_dir("identity");
             let path = root.join("session.dat");
@@ -657,13 +818,139 @@ mod unix {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use unix::{
-    PlatformSecureSessionFile as SecureSessionFile, cleanup_private_download, open_private_file,
-    secure_private_directory, secure_private_file, secure_private_file_handle,
-    secure_trusted_directory, verify_private_file_identity,
+    BoundPrivateDirectory, PlatformSecureSessionFile as SecureSessionFile, PrivateStage,
+    cleanup_private_download, open_private_directory, open_private_file, secure_private_directory,
+    secure_private_file, secure_private_file_handle, secure_trusted_directory,
+    verify_private_file_identity,
 };
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub struct SecureSessionFile;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub struct BoundPrivateDirectory {
+    path: std::path::PathBuf,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub struct PrivateStage {
+    parent: std::path::PathBuf,
+    path: std::path::PathBuf,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl BoundPrivateDirectory {
+    pub fn bind(path: &Path) -> Result<Self> {
+        std::fs::create_dir_all(path)?;
+        if !std::fs::symlink_metadata(path)?.is_dir() {
+            color_eyre::eyre::bail!("private storage parent is not a directory")
+        }
+        Ok(Self {
+            path: std::fs::canonicalize(path)?,
+        })
+    }
+
+    pub fn stage(&self, prefix: &str) -> Result<PrivateStage> {
+        for index in 0..100_u32 {
+            let path = self
+                .path
+                .join(format!(".{prefix}-{}-{index}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    return Ok(PrivateStage {
+                        parent: self.path.clone(),
+                        path,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        color_eyre::eyre::bail!("could not reserve private staging directory")
+    }
+
+    pub fn open_file_optional(&self, name: &std::ffi::OsStr) -> Result<Option<std::fs::File>> {
+        let path = self.path.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)?,
+            )),
+            Ok(_) => color_eyre::eyre::bail!("private storage entry is not a regular file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl PrivateStage {
+    pub fn path(&self, name: &str) -> std::path::PathBuf {
+        self.path.join(name)
+    }
+
+    pub fn write_file(&self, name: &str, bytes: &[u8]) -> Result<std::fs::File> {
+        use std::io::Write;
+        let path = self.path(name);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(file)
+    }
+
+    pub fn open_file(&self, name: &str) -> Result<std::fs::File> {
+        Ok(std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.path(name))?)
+    }
+
+    pub fn publish_no_replace(
+        &self,
+        source: &str,
+        destination: &std::ffi::OsStr,
+    ) -> std::io::Result<std::path::PathBuf> {
+        let source = self.path(source);
+        let destination = self.parent.join(destination);
+        std::fs::hard_link(&source, &destination)?;
+        std::fs::remove_file(source)?;
+        Ok(destination)
+    }
+
+    pub fn publish_replace(
+        &self,
+        source: &str,
+        destination: &std::ffi::OsStr,
+    ) -> Result<std::path::PathBuf> {
+        let destination = self.parent.join(destination);
+        std::fs::rename(self.path(source), &destination)?;
+        Ok(destination)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl Drop for PrivateStage {
+    fn drop(&mut self) {
+        for name in ["media", "preferences"] {
+            let _ = std::fs::remove_file(self.path(name));
+        }
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn open_private_directory(path: &Path) -> Result<std::fs::File> {
+    if !std::fs::symlink_metadata(path)?.is_dir() {
+        color_eyre::eyre::bail!("private storage path is not a directory")
+    }
+    Ok(std::fs::File::open(path)?)
+}
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn secure_private_directory(_path: &Path) -> Result<()> {
@@ -698,8 +985,12 @@ pub fn secure_private_file(_path: &Path) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn verify_private_file_identity(_file: &std::fs::File, _path: &Path) -> Result<()> {
-    color_eyre::eyre::bail!("private Telegram cache storage is supported only on Linux and macOS")
+pub fn verify_private_file_identity(file: &std::fs::File, path: &Path) -> Result<()> {
+    let named = std::fs::symlink_metadata(path)?;
+    if !file.metadata()?.is_file() || !named.is_file() || named.file_type().is_symlink() {
+        color_eyre::eyre::bail!("private storage entry is not a regular file")
+    }
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

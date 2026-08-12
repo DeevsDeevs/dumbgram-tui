@@ -1,8 +1,11 @@
-use crate::state::{AppState, DEFAULT_SPLIT_RATIO, MAX_SPLIT_RATIO, MIN_SPLIT_RATIO};
+use crate::{
+    state::{AppState, DEFAULT_SPLIT_RATIO, MAX_SPLIT_RATIO, MIN_SPLIT_RATIO},
+    telegram::session_file::BoundPrivateDirectory,
+};
 use color_eyre::Result;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -31,24 +34,37 @@ impl Default for UiPreferences {
 
 impl AppPreferences {
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let name = path
+            .file_name()
+            .ok_or_else(|| color_eyre::eyre::eyre!("preferences path must name a file"))?;
+        let directory = BoundPrivateDirectory::bind(parent)?;
+        let Some(mut file) = directory.open_file_optional(name)? else {
             return Ok(Self::default());
-        }
-
-        let content = fs::read_to_string(path)?;
+        };
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
         let mut preferences: Self = toml::from_str(&content)?;
         preferences.ui.split_ratio = clamp_split_ratio(preferences.ui.split_ratio);
         Ok(preferences)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path
+        let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, toml::to_string_pretty(self)?)?;
+            .unwrap_or(Path::new("."));
+        let name = path
+            .file_name()
+            .ok_or_else(|| color_eyre::eyre::eyre!("preferences path must name a file"))?;
+        let directory = BoundPrivateDirectory::bind(parent)?;
+        let stage = directory.stage("dumbgram-preferences")?;
+        let file = stage.write_file("preferences", toml::to_string_pretty(self)?.as_bytes())?;
+        let published = stage.publish_replace("preferences", name)?;
+        crate::telegram::session_file::verify_private_file_identity(&file, &published)?;
         Ok(())
     }
 
@@ -97,6 +113,28 @@ fn clamp_split_ratio(split_ratio: f32) -> f32 {
 mod tests {
     use super::{AppPreferences, state_path_for_config};
     use crate::state::{AppState, MAX_SPLIT_RATIO};
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn private_test_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+            ".dumbgram-preferences-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        path
+    }
 
     #[test]
     fn state_path_sits_next_to_config_path() {
@@ -122,6 +160,43 @@ mod tests {
 
         assert!(!restored.show_help_bar);
         assert_eq!(restored.split_ratio, 0.75);
+    }
+
+    #[test]
+    fn preferences_save_replaces_symlink_without_truncating_target() {
+        let root = private_test_dir("symlink");
+        let target = root.join("target");
+        std::fs::write(&target, b"keep me").unwrap();
+        let path = root.join("config.state.toml");
+        assert_eq!(
+            AppPreferences::load(&path).unwrap(),
+            AppPreferences::default()
+        );
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(&path, b"old").unwrap();
+        let preferences = AppPreferences::default();
+
+        preferences.save(&path).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(AppPreferences::load(&path).unwrap(), preferences);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

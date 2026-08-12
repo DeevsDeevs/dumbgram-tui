@@ -9139,7 +9139,9 @@ mod tests {
 
     #[test]
     fn app_preferences_are_saved_when_help_or_split_changes() {
-        let path = unique_temp_session_path().with_extension("state.toml");
+        let unique = unique_temp_session_path().with_extension("state.toml");
+        let path = std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join(unique.file_name().unwrap());
         let mut app = App::new();
         app.preferences_path = Some(path.clone());
         let before = crate::preferences::AppPreferences::from_state(&app.state);
