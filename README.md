@@ -185,7 +185,7 @@ Typing non-empty text sends Telegram typing activity on a cooldown. Outbound com
 | Session | The configured `session_file`, relative to the config when not absolute. Reusable authorization material; revocation must be done in Telegram. |
 | UI state | `<config-stem>.state.toml` beside the config. Stores help visibility and pane width. |
 | Thumbnail cache | A persistent sibling directory named `<session-file>.dumbgram-media-cache`. Selecting an image may download a thumbnail even if the terminal cannot render it. Remove it manually while Dumbgram is stopped. |
-| Saved media | `$HOME/Downloads`, falling back to `./Downloads`. Names are sanitized and existing files are not overwritten, but content remains untrusted and file permissions follow the process umask. |
+| Saved media | `$HOME/Downloads`, falling back to `./Downloads`. Names are sanitized and existing files are not overwritten. On Linux and macOS files are restricted to mode `0600`; content remains untrusted. |
 | Diagnostics | The path passed to `--log`. Logs append rather than truncate and do not rotate automatically. |
 
 Displaying a selected conversation can acknowledge its loaded messages as read whenever Dumbgram believes the terminal is focused. Terminals without focus-event support may therefore mark a selected conversation read while their window is in the background.

@@ -98,6 +98,10 @@ const SMOKE_CHECK_CONFIG_CONFLICT: &str =
     "--smoke cannot be combined with --check-config because smoke is mock-only";
 const SMOKE_CHECK_AUTH_CONFLICT: &str =
     "--smoke cannot be combined with --check-auth because smoke is mock-only";
+const MOCK_CHECK_CONFIG_CONFLICT: &str =
+    "--mock cannot be combined with --check-config; choose mock TUI or config diagnostics";
+const MOCK_CHECK_AUTH_CONFLICT: &str =
+    "--mock cannot be combined with --check-auth because check-auth connects to Telegram";
 const CHECK_CONFIG_AUTH_CONFLICT: &str =
     "--check-config cannot be combined with --check-auth; choose one diagnostic";
 const CONFIG_PATH_ARGUMENT_REQUIRED: &str = "--config requires a path argument";
@@ -271,6 +275,14 @@ where
 
     if cli.check_config && cli.check_auth {
         return Err(color_eyre::eyre::eyre!(CHECK_CONFIG_AUTH_CONFLICT));
+    }
+
+    if cli.mode == RunMode::Mock && cli.check_config {
+        return Err(color_eyre::eyre::eyre!(MOCK_CHECK_CONFIG_CONFLICT));
+    }
+
+    if cli.mode == RunMode::Mock && cli.check_auth {
+        return Err(color_eyre::eyre::eyre!(MOCK_CHECK_AUTH_CONFLICT));
     }
 
     if cli.smoke {
@@ -6740,15 +6752,16 @@ mod tests {
         LOGIN_CODE_SENT_PREFIX, LOGIN_FAILED_PREFIX, LOGIN_HEADER, LOGIN_PHONE_PROMPT,
         LOGIN_REQUESTING_CODE_STATUS, LOGIN_SESSION_SAVED_STATUS, LOGIN_SIGNED_IN_PREFIX,
         LOGIN_SIGNING_IN_STATUS, LOGIN_START_PROMPT, MAX_DEFERRED_UPDATES, MIN_FRAME_INTERVAL,
-        ManualMarkChatReadResult, MarkChatReadLoader, MediaPreviewLoader, MediaPreviewResult,
-        MutationTaskTracker, OlderMessageLoadResult, OlderMessageLoader, OlderMessageNavigation,
-        OpenTargetKind, OpenTargetLoader, PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR,
-        RECONCILIATION_INTERVAL, ReconciliationLoader, ReconciliationResult, ReplyMessageLoader,
-        ReplyMessageResult, RunMode, SAVING_EDIT_STATUS, SENDING_MESSAGE_STATUS,
-        SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE, SMOKE_CHECK_AUTH_CONFLICT,
-        SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_OK_PREFIX, SendMessageLoader, SendMessageResult,
-        SubscribeUpdatesLoader, SubscribeUpdatesResult, TerminalAction, TerminalSetupOperations,
-        TokioInstant, UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress, abort_running_task,
+        MOCK_CHECK_AUTH_CONFLICT, MOCK_CHECK_CONFIG_CONFLICT, ManualMarkChatReadResult,
+        MarkChatReadLoader, MediaPreviewLoader, MediaPreviewResult, MutationTaskTracker,
+        OlderMessageLoadResult, OlderMessageLoader, OlderMessageNavigation, OpenTargetKind,
+        OpenTargetLoader, PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR, RECONCILIATION_INTERVAL,
+        ReconciliationLoader, ReconciliationResult, ReplyMessageLoader, ReplyMessageResult,
+        RunMode, SAVING_EDIT_STATUS, SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS,
+        SETUP_ERROR_EXIT_CODE, SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT,
+        SMOKE_OK_PREFIX, SendMessageLoader, SendMessageResult, SubscribeUpdatesLoader,
+        SubscribeUpdatesResult, TerminalAction, TerminalSetupOperations, TokioInstant,
+        UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress, abort_running_task,
         apply_chat_message_load_result, apply_delete_message_result, apply_edit_message_result,
         apply_folder_chat_load_result, apply_initial_state_load_result,
         apply_manual_mark_chat_read_result, apply_media_preview_result,
@@ -12658,6 +12671,17 @@ mod tests {
             .expect_err("--smoke plus --check-auth must be rejected to keep smoke mock-only");
 
         assert_eq!(err.to_string(), SMOKE_CHECK_AUTH_CONFLICT);
+    }
+
+    #[test]
+    fn mock_cannot_be_combined_with_real_diagnostics() {
+        let config = parse_args_from(["--mock", "--check-config"])
+            .expect_err("mock plus config diagnostics must be rejected");
+        assert_eq!(config.to_string(), MOCK_CHECK_CONFIG_CONFLICT);
+
+        let auth = parse_args_from(["--mock", "--check-auth"])
+            .expect_err("mock plus auth diagnostics must never connect to Telegram");
+        assert_eq!(auth.to_string(), MOCK_CHECK_AUTH_CONFLICT);
     }
 
     #[test]

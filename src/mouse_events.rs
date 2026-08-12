@@ -199,7 +199,7 @@ pub fn handle_mouse_click(state: &mut AppState, mouse_event: MouseEvent) -> Mous
         } else {
             MouseClickOutcome::Handled
         }
-    } else if state.messages_area.contains(position) {
+    } else if panel_inner_contains(state.messages_area, position) {
         state.focused_panel = FocusedPanel::Messages;
         let relative_y = y.saturating_sub(state.messages_area.y + 1) as usize;
         let clicked_link = message_link_at_click(state, x, y);
@@ -861,6 +861,27 @@ mod tests {
         );
         assert_eq!(state.focused_panel, FocusedPanel::Input);
         assert_eq!(state.input_cursor(), 2);
+    }
+
+    #[test]
+    fn message_border_click_does_not_open_visible_url() {
+        let mut state = AppState::new();
+        state.messages_area = Rect::new(30, 5, 80, 8);
+        state.messages = vec![message_with_content(1, "go https://example.org now")];
+
+        let url_column = 30 + 1 + 2 + 4 + 3;
+        assert_eq!(
+            handle_mouse_click(
+                &mut state,
+                mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    url_column,
+                    5
+                )
+            ),
+            MouseClickOutcome::Ignored
+        );
+        assert_eq!(state.selected_message_index, 0);
     }
 
     #[test]
