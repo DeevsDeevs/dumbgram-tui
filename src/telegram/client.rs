@@ -180,5 +180,5 @@ pub trait TelegramClient {
     #[allow(clippy::manual_async_fn)]
     fn subscribe_updates(
         &mut self,
-    ) -> impl std::future::Future<Output = Result<mpsc::UnboundedReceiver<Update>>> + Send + '_;
+    ) -> impl std::future::Future<Output = Result<mpsc::Receiver<Update>>> + Send + '_;
 }

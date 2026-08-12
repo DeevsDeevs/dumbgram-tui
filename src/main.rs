@@ -39,6 +39,7 @@ use ratatui::{
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::{pending, poll_fn};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{
@@ -46,7 +47,6 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
-use std::{fs, io};
 use telegram::types::{Message, SenderIdentity, ThreadTopic, Update};
 use telegram::{GrammersClient, MockTelegramClient, TelegramClient};
 use tokio::time::Instant as TokioInstant;
@@ -61,6 +61,7 @@ const MARK_READ_REFRESH_PENDING_STATUS: &str = "Mark read confirmed; refreshing 
 const TELEGRAM_UPDATES_DISCONNECTED_ERROR: &str =
     "Telegram updates disconnected; retrying subscription";
 const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const MAX_DEFERRED_UPDATES: usize = 100;
 const RECONCILIATION_RETRY_DELAY: Duration = Duration::from_secs(10);
 const OPENER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const OPENER_KILL_TIMEOUT: Duration = Duration::from_millis(500);
@@ -279,7 +280,7 @@ fn print_help() {
     println!(
         "Dumbgram TUI {APP_VERSION}\n\n\
 Usage:\n  {APP_COMMAND} [OPTIONS]\n\n\
-Options:\n  --mock             Run with built-in mock Telegram data for smoke testing\n  --smoke            Load mock data, render off-screen, exercise interactions, and exit\n  --check-config     Validate Telegram config and session path without connecting\n  --check-auth       Connect and verify saved Telegram session without login/TUI\n  -c, --config PATH  Load Telegram config from PATH (default: {default_config_path})\n  --log PATH         Append privacy-safe runtime diagnostics to PATH\n  -h, --help         Print this help\n\n\
+Options:\n  --mock             Run with built-in mock Telegram data for smoke testing\n  --smoke            Load mock data, render off-screen, exercise interactions, and exit\n  --check-config     Validate Telegram config and session path without connecting\n  --check-auth       Connect and verify saved Telegram session without login/TUI\n  -c, --config PATH  Load Telegram config from PATH (default: {default_config_path})\n  --log PATH         Append runtime diagnostics (may contain sensitive metadata) to PATH\n  -h, --help         Print this help\n\n\
 Examples:\n  {APP_COMMAND} --mock\n  {APP_COMMAND} --mock --smoke\n  {APP_COMMAND} --check-config --config \"{default_config_path}\"\n  {APP_COMMAND} --check-auth --config \"{default_config_path}\"\n  {APP_COMMAND} --config \"{default_config_path}\""
     );
 }
@@ -337,30 +338,11 @@ fn validate_config(config: &config::Config, config_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_session_parent_dir(session_path: &Path) -> Result<()> {
-    if let Some(parent) = session_path.parent()
-        && !parent.as_os_str().is_empty()
-        && !parent.exists()
-    {
-        fs::create_dir_all(parent).map_err(|e| {
-            color_eyre::eyre::eyre!(
-                "failed to create telegram.session_file parent directory {}: {}",
-                parent.display(),
-                e
-            )
-        })?;
-    }
-
-    Ok(())
-}
-
 fn load_checked_config_with_session_parent(config_path: &str) -> Result<(config::Config, PathBuf)> {
     let config = load_checked_config(config_path)?;
     let session_path = config
         .telegram
         .session_path_for_config(Path::new(config_path));
-    ensure_session_parent_dir(&session_path)?;
-
     Ok((config, session_path))
 }
 
@@ -2374,7 +2356,7 @@ enum LoopWake {
 async fn wait_for_loop_wake(
     events: &mut EventStream,
     wake: &tokio::sync::Notify,
-    update_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<Update>>,
+    update_rx: &mut Option<tokio::sync::mpsc::Receiver<Update>>,
     frame_deadline: Option<TokioInstant>,
     notification_deadline: Option<TokioInstant>,
     service_deadline: Option<TokioInstant>,
@@ -2403,7 +2385,7 @@ async fn next_terminal_event(
 }
 
 async fn receive_update(
-    update_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<Update>>,
+    update_rx: &mut Option<tokio::sync::mpsc::Receiver<Update>>,
 ) -> Option<Update> {
     match update_rx {
         Some(rx) => rx.recv().await,
@@ -2571,7 +2553,7 @@ struct EventLoopState {
     media_preview_rx: tokio::sync::mpsc::UnboundedReceiver<MediaPreviewResult>,
     open_target_rx: tokio::sync::mpsc::UnboundedReceiver<OpenTargetResult>,
     reconciliation_rx: tokio::sync::mpsc::UnboundedReceiver<ReconciliationResult>,
-    update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Update>>,
+    update_rx: Option<tokio::sync::mpsc::Receiver<Update>>,
     initial_state_pending: bool,
     reconciliation_pending: bool,
     subscription_pending: bool,
@@ -2582,7 +2564,9 @@ struct EventLoopState {
     reconciliation_requested_while_pending: bool,
     reconciliation_high_water_ids: HashMap<i64, i32>,
     deferred_updates: Vec<Update>,
+    deferred_updates_overflowed: bool,
     deferred_conversation_updates: Vec<Update>,
+    deferred_conversation_updates_overflowed: bool,
     staged_update: Option<Update>,
     staged_terminal_event: Option<Event>,
     #[cfg(test)]
@@ -2635,7 +2619,9 @@ impl EventLoopState {
                 reconciliation_requested_while_pending: false,
                 reconciliation_high_water_ids: HashMap::new(),
                 deferred_updates: Vec::new(),
+                deferred_updates_overflowed: false,
                 deferred_conversation_updates: Vec::new(),
+                deferred_conversation_updates_overflowed: false,
                 staged_update: None,
                 staged_terminal_event: None,
                 #[cfg(test)]
@@ -2785,7 +2771,8 @@ fn drain_ready_results<C: TelegramClient + Clone + Send + Sync + 'static>(
     if !conversation_load_active
         && !loop_state.initial_state_pending
         && !loop_state.reconciliation_pending
-        && !loop_state.deferred_conversation_updates.is_empty()
+        && (!loop_state.deferred_conversation_updates.is_empty()
+            || loop_state.deferred_conversation_updates_overflowed)
     {
         if app.state.conversation_load_status == state::ConversationLoadStatus::Loading {
             app.state.mark_conversation_load_failed();
@@ -3022,11 +3009,27 @@ where
             .finish_delete_submissions_for_update(*chat_id, *message_id);
     }
     if loop_state.initial_state_pending || loop_state.reconciliation_pending {
-        loop_state.deferred_updates.push(update);
+        defer_update(
+            &mut loop_state.deferred_updates,
+            &mut loop_state.deferred_updates_overflowed,
+            update,
+        );
+        if loop_state.deferred_updates_overflowed {
+            loop_state.announce_reconciliation_success = true;
+            loop_state.schedule_reconciliation_now();
+        }
         return false;
     }
     if conversation_load_active && update_affects_selected_conversation_snapshot(app, &update) {
-        loop_state.deferred_conversation_updates.push(update);
+        defer_update(
+            &mut loop_state.deferred_conversation_updates,
+            &mut loop_state.deferred_conversation_updates_overflowed,
+            update,
+        );
+        if loop_state.deferred_conversation_updates_overflowed {
+            loop_state.announce_reconciliation_success = true;
+            loop_state.schedule_reconciliation_now();
+        }
         return false;
     }
     if update_represented_by_reconciliation(loop_state, app, &update) {
@@ -3052,6 +3055,19 @@ where
     handle_received_update_with_conversation_load(loop_state, app, update, mark_read_loader, false)
 }
 
+fn defer_update(queue: &mut Vec<Update>, overflowed: &mut bool, update: Update) {
+    if *overflowed {
+        return;
+    }
+    if queue.len() == MAX_DEFERRED_UPDATES {
+        queue.clear();
+        *overflowed = true;
+        diagnostics::event("deferred_update_overflow", "limit=100");
+        return;
+    }
+    queue.push(update);
+}
+
 fn replay_deferred_updates<C>(
     loop_state: &mut EventLoopState,
     app: &mut App,
@@ -3060,6 +3076,12 @@ fn replay_deferred_updates<C>(
 ) where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
+    if std::mem::take(&mut loop_state.deferred_updates_overflowed) {
+        loop_state.deferred_updates.clear();
+        loop_state.announce_reconciliation_success = true;
+        loop_state.schedule_reconciliation_now();
+        return;
+    }
     let deferred_updates = std::mem::take(&mut loop_state.deferred_updates);
     for update in deferred_updates {
         handle_received_update_with_conversation_load(
@@ -3132,6 +3154,12 @@ fn replay_deferred_conversation_updates<C>(
 where
     C: TelegramClient + Clone + Send + Sync + 'static,
 {
+    if std::mem::take(&mut loop_state.deferred_conversation_updates_overflowed) {
+        loop_state.deferred_conversation_updates.clear();
+        loop_state.announce_reconciliation_success = true;
+        loop_state.schedule_reconciliation_now();
+        return false;
+    }
     let deferred_updates = std::mem::take(&mut loop_state.deferred_conversation_updates);
     let mut dirty = false;
     for update in deferred_updates {
@@ -3294,7 +3322,7 @@ enum ReconciliationReadAck {
 
 struct SubscribeUpdatesResult {
     request_id: u64,
-    result: std::result::Result<tokio::sync::mpsc::UnboundedReceiver<Update>, String>,
+    result: std::result::Result<tokio::sync::mpsc::Receiver<Update>, String>,
 }
 
 struct InitialStateLoadResult {
@@ -6294,26 +6322,27 @@ mod tests {
         LOGIN_2FA_HINT_PREFIX, LOGIN_2FA_PROMPT, LOGIN_2FA_SIGNED_IN_PREFIX, LOGIN_CODE_PROMPT,
         LOGIN_CODE_SENT_PREFIX, LOGIN_FAILED_PREFIX, LOGIN_HEADER, LOGIN_PHONE_PROMPT,
         LOGIN_REQUESTING_CODE_STATUS, LOGIN_SESSION_SAVED_STATUS, LOGIN_SIGNED_IN_PREFIX,
-        LOGIN_SIGNING_IN_STATUS, LOGIN_START_PROMPT, MIN_FRAME_INTERVAL, ManualMarkChatReadResult,
-        MarkChatReadLoader, MediaPreviewLoader, MediaPreviewResult, OlderMessageLoadResult,
-        OlderMessageLoader, OlderMessageNavigation, OpenTargetKind, OpenTargetLoader,
-        PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR, RECONCILIATION_INTERVAL, ReconciliationLoader,
-        ReconciliationResult, ReplyMessageLoader, ReplyMessageResult, RunMode, SAVING_EDIT_STATUS,
-        SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE,
-        SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_OK_PREFIX, SendMessageLoader,
-        SendMessageResult, SubscribeUpdatesLoader, SubscribeUpdatesResult, TerminalAction,
-        TerminalSetupOperations, TokioInstant, UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress,
-        abort_running_task, apply_chat_message_load_result, apply_delete_message_result,
-        apply_edit_message_result, apply_folder_chat_load_result, apply_initial_state_load_result,
+        LOGIN_SIGNING_IN_STATUS, LOGIN_START_PROMPT, MAX_DEFERRED_UPDATES, MIN_FRAME_INTERVAL,
+        ManualMarkChatReadResult, MarkChatReadLoader, MediaPreviewLoader, MediaPreviewResult,
+        OlderMessageLoadResult, OlderMessageLoader, OlderMessageNavigation, OpenTargetKind,
+        OpenTargetLoader, PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR, RECONCILIATION_INTERVAL,
+        ReconciliationLoader, ReconciliationResult, ReplyMessageLoader, ReplyMessageResult,
+        RunMode, SAVING_EDIT_STATUS, SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS,
+        SETUP_ERROR_EXIT_CODE, SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT,
+        SMOKE_OK_PREFIX, SendMessageLoader, SendMessageResult, SubscribeUpdatesLoader,
+        SubscribeUpdatesResult, TerminalAction, TerminalSetupOperations, TokioInstant,
+        UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress, abort_running_task,
+        apply_chat_message_load_result, apply_delete_message_result, apply_edit_message_result,
+        apply_folder_chat_load_result, apply_initial_state_load_result,
         apply_manual_mark_chat_read_result, apply_media_preview_result,
         apply_older_message_load_result, apply_open_target_result, apply_reconciliation_result,
         apply_reply_message_result, apply_send_message_result, apply_subscribe_updates_result,
         apply_update_with_read_ack, check_auth_ok_message, check_auth_unauthorized_message,
         check_config_message, check_config_session_status, classify_terminal_event,
-        default_config_path_string, discard_deferred_conversation_updates_represented_by_snapshot,
-        drain_ready_results, ensure_session_parent_dir, handle_input_focused, handle_key_event,
-        handle_key_event_with_progress, handle_mouse_event, handle_received_update,
-        handle_received_update_with_conversation_load, load_checked_config,
+        default_config_path_string, defer_update,
+        discard_deferred_conversation_updates_represented_by_snapshot, drain_ready_results,
+        handle_input_focused, handle_key_event, handle_key_event_with_progress, handle_mouse_event,
+        handle_received_update, handle_received_update_with_conversation_load, load_checked_config,
         load_checked_config_with_session_parent, loaded_read_ack, login_2fa_hint_message,
         login_2fa_signed_in_message, login_code_sent_message, login_failed_message,
         login_signed_in_message, message_submit_action_status, older_message_key_navigation,
@@ -6809,12 +6838,97 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(42));
     }
 
+    #[test]
+    fn deferred_update_queues_drop_partial_sequences_at_the_hard_limit() {
+        let mut queue = Vec::new();
+        let mut overflowed = false;
+        for index in 0..=MAX_DEFERRED_UPDATES {
+            defer_update(
+                &mut queue,
+                &mut overflowed,
+                Update::Error(format!("update-{index}")),
+            );
+        }
+        assert!(overflowed);
+        assert!(queue.is_empty());
+        defer_update(
+            &mut queue,
+            &mut overflowed,
+            Update::Error("ignored".to_string()),
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn global_deferral_overflow_discards_partial_replay_and_schedules_reconciliation() {
+        let (mut loop_state, _) = EventLoopState::new();
+        let client = MockTelegramClient::new();
+        let mark_read_loader = MarkChatReadLoader::new(client);
+        let mut app = App::new();
+        for message_id in 0..=MAX_DEFERRED_UPDATES as i32 {
+            handle_received_update(
+                &mut loop_state,
+                &mut app,
+                Update::EditMessage {
+                    chat_id: 1,
+                    message_id,
+                    new_content: "deferred".to_string(),
+                },
+                &mark_read_loader,
+            );
+        }
+        assert!(loop_state.deferred_updates_overflowed);
+        assert!(loop_state.deferred_updates.is_empty());
+        replay_deferred_updates(&mut loop_state, &mut app, &mark_read_loader, false);
+        assert!(!loop_state.deferred_updates_overflowed);
+        assert!(loop_state.reconciliation_requested_while_pending);
+        loop_state.initial_state_pending = false;
+        assert!(
+            loop_state.finish_reconciliation_gate(TokioInstant::now() + RECONCILIATION_INTERVAL)
+        );
+        assert!(loop_state.next_reconciliation_at.is_some());
+        assert!(app.state.messages.is_empty());
+    }
+
+    #[test]
+    fn conversation_deferral_overflow_discards_partial_replay_and_schedules_reconciliation() {
+        let (mut loop_state, _) = EventLoopState::new();
+        loop_state.initial_state_pending = false;
+        let client = MockTelegramClient::new();
+        let mark_read_loader = MarkChatReadLoader::new(client);
+        let mut app = App::new();
+        app.state.chats = vec![chat(1)];
+        for message_id in 0..=MAX_DEFERRED_UPDATES as i32 {
+            handle_received_update_with_conversation_load(
+                &mut loop_state,
+                &mut app,
+                Update::EditMessage {
+                    chat_id: 1,
+                    message_id,
+                    new_content: "deferred".to_string(),
+                },
+                &mark_read_loader,
+                true,
+            );
+        }
+        assert!(loop_state.deferred_conversation_updates_overflowed);
+        assert!(loop_state.deferred_conversation_updates.is_empty());
+        assert!(!replay_deferred_conversation_updates(
+            &mut loop_state,
+            &mut app,
+            &mark_read_loader,
+        ));
+        assert!(!loop_state.deferred_conversation_updates_overflowed);
+        assert!(loop_state.next_reconciliation_at.is_some());
+        assert!(app.state.messages.is_empty());
+    }
+
     #[tokio::test]
     async fn canonical_drain_orders_initial_replay_before_new_update() {
         let (mut loop_state, senders) = EventLoopState::new();
-        let (update_tx, update_rx) = mpsc::unbounded_channel();
+        let (update_tx, update_rx) = mpsc::channel(10);
         update_tx
-            .send(Update::Error("queued".to_string()))
+            .try_send(Update::Error("queued".to_string()))
             .expect("update receiver should be open");
         senders
             .subscribe_updates
@@ -6933,7 +7047,7 @@ mod tests {
     async fn selected_load_replays_edit_and_delete_after_installing_same_drain_snapshot() {
         let (mut loop_state, senders) = EventLoopState::new();
         loop_state.initial_state_pending = false;
-        let (update_tx, update_rx) = mpsc::unbounded_channel();
+        let (update_tx, update_rx) = mpsc::channel(10);
         loop_state.update_rx = Some(update_rx);
         let client = MockTelegramClient::new();
         let subscribe_loader =
@@ -6956,7 +7070,7 @@ mod tests {
             new_content: "edited after snapshot".to_string(),
         });
         update_tx
-            .send(Update::DeleteMessage {
+            .try_send(Update::DeleteMessage {
                 chat_id: 1,
                 message_id: 2,
             })
@@ -7720,12 +7834,12 @@ mod tests {
         app.state.folders = vec![all_folder(0)];
         app.state.chats = vec![chat(1), chat(2)];
         let context = app.state.reconciliation_context();
-        let (update_tx, update_rx) = mpsc::unbounded_channel();
+        let (update_tx, update_rx) = mpsc::channel(10);
         loop_state.update_rx = Some(update_rx);
         let mut queued = message(3);
         queued.chat_id = 2;
         update_tx
-            .send(Update::NewMessage(queued))
+            .try_send(Update::NewMessage(queued))
             .expect("update receiver should be open");
 
         let client = MockTelegramClient::new();
@@ -8747,7 +8861,7 @@ mod tests {
             panic!("hanging reconciliation should not delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             panic!("hanging reconciliation should not subscribe to updates")
         }
     }
@@ -8821,7 +8935,7 @@ mod tests {
             panic!("slow-first client should not delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             panic!("slow-first client should not subscribe to updates")
         }
     }
@@ -8883,7 +8997,7 @@ mod tests {
             panic!("slow-first-older client should not delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             panic!("slow-first-older client should not subscribe to updates")
         }
     }
@@ -8969,7 +9083,7 @@ mod tests {
             panic!("recording mark-read client should not delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             panic!("recording mark-read client should not subscribe to updates")
         }
     }
@@ -9643,7 +9757,7 @@ mod tests {
     #[test]
     fn async_subscribe_updates_result_installs_receiver() {
         let mut app = App::new();
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, rx) = tokio::sync::mpsc::channel(10);
         let (mut loop_state, _) = EventLoopState::new();
 
         apply_subscribe_updates_result(
@@ -11925,18 +12039,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_session_parent_dir_creates_missing_parent() {
-        let missing_parent = unique_temp_session_path();
-        let session_path = missing_parent.join("session.dat");
-
-        successful_test_setup(ensure_session_parent_dir(&session_path));
-
-        assert!(missing_parent.is_dir());
-        std::fs::remove_dir_all(missing_parent).ok();
-    }
-
-    #[test]
-    fn telegram_setup_creates_missing_session_parent() {
+    fn telegram_setup_defers_missing_session_parent_creation_to_secure_storage() {
         let missing_parent = unique_temp_session_path();
         let session_path = missing_parent.join("session.dat");
         let config_path = unique_temp_session_path().with_extension("toml");
@@ -11951,8 +12054,7 @@ mod tests {
         );
 
         assert_eq!(loaded_session_path, session_path);
-        assert!(missing_parent.is_dir());
+        assert!(!missing_parent.exists());
         std::fs::remove_file(config_path).ok();
-        std::fs::remove_dir_all(missing_parent).ok();
     }
 }

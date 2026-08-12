@@ -109,6 +109,10 @@
       "last_modified": "2026-04-27T06:11:55Z",
       "resolved": "github:NixOS/nixpkgs/6368eda62c9775c38ef7f714b2555a741c20c72d?lastModified=1777270315"
     },
+    "nixpkgs#acl.dev": {
+      "last_modified": "2026-08-10T07:49:06Z",
+      "resolved": "tarball+https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1051111.d482ef84049d/nixexprs.tar.xz?lastModified=1786348146&narHash=sha256-QqTLx1vezpyalH9RD66nuAenX9hbnH%2BgD73R7lJxnWA%3D#acl.dev"
+    },
     "pkg-config@latest": {
       "last_modified": "2025-11-23T21:50:36Z",
       "resolved": "github:NixOS/nixpkgs/ee09932cedcef15aaf476f9343d1dea2cb77e261#pkg-config",

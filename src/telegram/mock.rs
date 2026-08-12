@@ -17,6 +17,10 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+const UPDATE_CHANNEL_CAPACITY: usize = 100;
+const UPDATE_CHANNEL_SATURATED: &str =
+    "Mock update buffer saturated; refreshing authoritative state";
+
 #[derive(Clone)]
 pub struct MockTelegramClient {
     connected: bool,
@@ -673,10 +677,9 @@ impl TelegramClient for MockTelegramClient {
     #[allow(clippy::manual_async_fn)]
     fn subscribe_updates(
         &mut self,
-    ) -> impl std::future::Future<Output = Result<mpsc::UnboundedReceiver<Update>>> + Send + '_
-    {
+    ) -> impl std::future::Future<Output = Result<mpsc::Receiver<Update>>> + Send + '_ {
         async move {
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(UPDATE_CHANNEL_CAPACITY);
 
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -720,8 +723,18 @@ impl TelegramClient for MockTelegramClient {
                         },
                     };
 
-                    if tx.send(update).is_err() {
-                        break;
+                    match tx.try_send(update) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            if tx
+                                .send(Update::Error(UPDATE_CHANNEL_SATURATED.to_string()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                     }
                 }
             });

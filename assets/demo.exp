@@ -1,0 +1,62 @@
+#!/usr/bin/env expect
+# Run from the repository root after `devbox run build`.
+set timeout 30
+log_user 1
+
+proc pause_and_drain {seconds} {
+    set timeout $seconds
+    expect {
+        -re {.+} { exp_continue -continue_timer }
+        timeout {}
+        eof {
+            puts stderr "dumbgram_tui exited before the scripted demo completed"
+            exit 1
+        }
+    }
+}
+
+spawn -noecho ./target/debug/dumbgram_tui --mock
+pause_and_drain 2
+
+# Move to chats and search the loaded mock list.
+send -- "\t"
+pause_and_drain 1
+send -- "/"
+send -- "work"
+pause_and_drain 1
+send -- "\r"
+pause_and_drain 1
+
+# Browse the selected conversation.
+send -- "\t"
+pause_and_drain 1
+send -- "\033\[B"
+pause_and_drain 1
+
+# Start a reply draft and cancel it without changing mock history.
+send -- "r"
+pause_and_drain 1
+send -- "Mock mode is safe to explore."
+pause_and_drain 2
+send -- "\033"
+pause_and_drain 1
+
+# Show contextual controls, then exit cleanly.
+send -- "?"
+pause_and_drain 2
+send -- "?"
+pause_and_drain 2
+send -- "q"
+set timeout 5
+expect {
+    eof {}
+    timeout {
+        puts stderr "dumbgram_tui did not exit after q"
+        exit 1
+    }
+}
+set child_status [wait]
+if {[lindex $child_status 2] != 0 || [lindex $child_status 3] != 0} {
+    puts stderr "dumbgram_tui exited unsuccessfully: $child_status"
+    exit 1
+}

@@ -4,17 +4,21 @@ use grammers_client::{
     Client, Config, FixedReconnect, InitParams, InputMessage, grammers_tl_types as tl,
     types::{ChatMap, Downloadable, photo_sizes::PhotoSize},
 };
-use grammers_session::{PackedChat, Session};
+use grammers_session::PackedChat;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::client::{DownloadedMedia, ReconciliationChatList, TelegramClient};
+use super::session_file::{
+    SecureSessionFile, cleanup_private_download, open_private_file, secure_private_directory,
+    secure_private_file, verify_private_file_identity,
+};
 use super::types::{
     Chat, Folder, Message, MessageMedia, MessageMediaKind, MessageStatus, OWN_SENDER_NAME,
     SenderIdentity, ThreadTopic, UNKNOWN_DELETE_UPDATE_CHAT_ID, UNKNOWN_SENDER_NAME, Update,
@@ -26,7 +30,23 @@ const CHAT_NOT_FOUND_IN_CACHE_PREFIX: &str = "Chat not found in cache";
 const CHAT_CACHE_LOCK_FAILED: &str = "Chat cache lock failed";
 const UPDATE_ERROR_PREFIX: &str = "Update error";
 const MAX_DOWNLOAD_COPY_INDEX: u32 = 10_000;
+const UPDATE_CHANNEL_CAPACITY: usize = 100;
+const UPDATE_CHANNEL_SATURATED: &str =
+    "Telegram update buffer saturated; refreshing authoritative state";
 static MEDIA_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TOPIC_RANDOM_NONCE: OnceLock<u64> = OnceLock::new();
+static TOPIC_RANDOM_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+async fn forward_bounded_update(tx: &mpsc::Sender<Update>, update: Update) -> bool {
+    match tx.try_send(update) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Full(_)) => tx
+            .send(Update::Error(UPDATE_CHANNEL_SATURATED.to_string()))
+            .await
+            .is_ok(),
+    }
+}
 
 const TELEGRAM_RECONNECT_POLICY: FixedReconnect = FixedReconnect {
     attempts: 5,
@@ -70,13 +90,14 @@ pub struct GrammersClient {
     user_name_cache: Arc<Mutex<UserNameCache>>,
     dialog_filter_cache: Arc<Mutex<DialogFilterCache>>,
     outbox_read_max_id_cache: Arc<Mutex<OutboxReadMaxIdCache>>,
-    session_path: PathBuf,
+    session_file: Arc<SecureSessionFile>,
     media_cache_dir: PathBuf,
 }
 
 impl GrammersClient {
     pub async fn new(api_id: i32, api_hash: String, session_path: &Path) -> Result<Self> {
-        let session = Session::load_file_or_create(session_path)?;
+        let (session_file, session) = SecureSessionFile::open(session_path)?;
+        let media_cache_dir = media_cache_dir(&session_file.canonical_path())?;
 
         let client = Client::connect(Config {
             session,
@@ -92,8 +113,8 @@ impl GrammersClient {
             user_name_cache: Arc::new(Mutex::new(HashMap::new())),
             dialog_filter_cache: Arc::new(Mutex::new(HashMap::new())),
             outbox_read_max_id_cache: Arc::new(Mutex::new(HashMap::new())),
-            session_path: session_path.to_path_buf(),
-            media_cache_dir: media_cache_dir(session_path)?,
+            session_file: Arc::new(session_file),
+            media_cache_dir,
         })
     }
 
@@ -102,7 +123,7 @@ impl GrammersClient {
     }
 
     pub fn save_session(&self) -> Result<()> {
-        self.client.session().save_to_file(&self.session_path)?;
+        self.session_file.save(self.client.session())?;
         Ok(())
     }
 
@@ -574,18 +595,19 @@ fn ensure_trusted_cache_parent(_parent: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn set_private_permissions(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn set_private_permissions(_path: &Path, _mode: u32) -> io::Result<()> {
     Ok(())
 }
 
 fn ensure_private_cache_dir(path: &Path) -> io::Result<()> {
+    let mut created = false;
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => {
@@ -594,18 +616,17 @@ fn ensure_private_cache_dir(path: &Path) -> io::Result<()> {
                 "media cache path is not a regular directory",
             ));
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::create_dir(path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            std::fs::create_dir(path)?;
+            created = true;
+        }
         Err(error) => return Err(error),
     }
-    set_private_permissions(path, 0o700)?;
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "media cache path changed during setup",
-        ));
+    let result = secure_private_directory(path).map_err(io::Error::other);
+    if created && result.is_err() {
+        let _ = std::fs::remove_dir(path);
     }
-    Ok(())
+    result
 }
 
 fn media_cache_dir(session_path: &Path) -> io::Result<PathBuf> {
@@ -670,7 +691,7 @@ fn cached_media_thumbnail_path(cache_dir: &Path, chat_id: i64, message_id: i32) 
     std::fs::symlink_metadata(&path)
         .ok()
         .filter(|metadata| metadata.file_type().is_file() && !metadata.file_type().is_symlink())?;
-    set_private_permissions(&path, 0o600).ok()?;
+    secure_private_file(&path).ok()?;
     Some(path)
 }
 
@@ -682,7 +703,7 @@ fn create_private_download_dir_with(
         let candidate = cache_dir.join(format!(".download-{}-{}", std::process::id(), next_id()));
         match std::fs::create_dir(&candidate) {
             Ok(()) => {
-                if let Err(error) = set_private_permissions(&candidate, 0o700) {
+                if let Err(error) = secure_private_directory(&candidate).map_err(io::Error::other) {
                     let _ = std::fs::remove_dir(&candidate);
                     return Err(error);
                 }
@@ -704,13 +725,6 @@ fn create_private_download_dir(cache_dir: &Path) -> io::Result<PathBuf> {
     })
 }
 
-fn cleanup_private_download(temp_dir: &Path, temp_file: &Path) {
-    if std::fs::remove_file(temp_file).is_err() {
-        let _ = std::fs::remove_dir(temp_file);
-    }
-    let _ = std::fs::remove_dir(temp_dir);
-}
-
 fn complete_private_download(
     temp_dir: &Path,
     temp_file: &Path,
@@ -726,23 +740,9 @@ fn complete_private_download(
 }
 
 fn publish_downloaded_thumbnail(temp_file: &Path, final_path: &Path) -> io::Result<()> {
-    let metadata = std::fs::symlink_metadata(temp_file)?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "downloaded thumbnail is not a regular file",
-        ));
-    }
-    set_private_permissions(temp_file, 0o600)?;
+    let file = open_private_file(temp_file).map_err(io::Error::other)?;
     std::fs::rename(temp_file, final_path)?;
-    let published = std::fs::symlink_metadata(final_path)?;
-    if !published.file_type().is_file() || published.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "published thumbnail is not a regular file",
-        ));
-    }
-    Ok(())
+    verify_private_file_identity(&file, final_path).map_err(io::Error::other)
 }
 
 async fn download_media_thumbnail(
@@ -1341,10 +1341,13 @@ fn messages_response_parts(
 }
 
 fn topic_send_random_id() -> i64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as i64);
-    nanos ^ i64::from(std::process::id())
+    let nonce = *TOPIC_RANDOM_NONCE.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos() as u64);
+        nanos ^ u64::from(std::process::id()).rotate_left(32)
+    });
+    nonce.wrapping_add(TOPIC_RANDOM_COUNTER.fetch_add(1, Ordering::Relaxed)) as i64
 }
 
 fn sent_message_id_from_updates(updates: &tl::enums::Updates, random_id: i64) -> Option<i32> {
@@ -2002,10 +2005,9 @@ impl TelegramClient for GrammersClient {
     #[allow(clippy::manual_async_fn)]
     fn subscribe_updates(
         &mut self,
-    ) -> impl std::future::Future<Output = Result<mpsc::UnboundedReceiver<Update>>> + Send + '_
-    {
+    ) -> impl std::future::Future<Output = Result<mpsc::Receiver<Update>>> + Send + '_ {
         async move {
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(UPDATE_CHANNEL_CAPACITY);
             let client = self.client.clone();
             let user_name_cache = Arc::clone(&self.user_name_cache);
             let outbox_read_max_id_cache = Arc::clone(&self.outbox_read_max_id_cache);
@@ -2085,13 +2087,15 @@ impl TelegramClient for GrammersClient {
                             };
 
                             for update in updates {
-                                if tx.send(update).is_err() {
+                                if !forward_bounded_update(&tx, update).await {
                                     break 'update_loop;
                                 }
                             }
                         }
                         Err(e) => {
-                            if tx.send(Update::Error(update_error_message(e))).is_err() {
+                            if !forward_bounded_update(&tx, Update::Error(update_error_message(e)))
+                                .await
+                            {
                                 break 'update_loop;
                             }
                             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -2115,11 +2119,12 @@ mod tests {
         chat_matches_filter_categories, chat_not_found_in_cache_message, complete_private_download,
         create_private_download_dir_with, delete_message_updates, delete_update_chat_id,
         dialog_chats_from_page_parts, dialog_matches_filter, dumbgram_init_params,
-        folders_from_dialog_filters, input_peers_contain_chat, media_cache_dir,
-        merge_folder_unread_snapshot, message_sender_name, message_status_for_read_state,
-        message_thread_topic_id, publish_downloaded_thumbnail, read_outbox_update_from_raw,
-        reserve_available_download_path, sanitize_download_file_name, send_action_is_typing,
-        sender_identity_from_peer, thread_topic_from_tl, typing_status_update_from_raw,
+        folders_from_dialog_filters, forward_bounded_update, input_peers_contain_chat,
+        media_cache_dir, merge_folder_unread_snapshot, message_sender_name,
+        message_status_for_read_state, message_thread_topic_id, publish_downloaded_thumbnail,
+        read_outbox_update_from_raw, reserve_available_download_path, sanitize_download_file_name,
+        send_action_is_typing, sender_identity_from_peer, thread_topic_from_tl,
+        topic_send_random_id, typing_status_update_from_raw,
         typing_status_update_from_raw_with_user_names, update_error_message,
     };
     use crate::telegram::types::{
@@ -2129,10 +2134,33 @@ mod tests {
     use grammers_client::grammers_tl_types as tl;
     use grammers_session::{PackedChat, PackedType};
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         ops::ControlFlow,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[tokio::test]
+    async fn saturated_update_channel_drops_one_update_then_delivers_recovery_marker() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(super::UPDATE_CHANNEL_CAPACITY);
+        for index in 0..super::UPDATE_CHANNEL_CAPACITY {
+            tx.try_send(Update::Error(format!("queued-{index}")))
+                .unwrap();
+        }
+        let sender = tokio::spawn(async move {
+            forward_bounded_update(&tx, Update::Error("dropped".to_string())).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!sender.is_finished());
+        assert!(matches!(rx.recv().await, Some(Update::Error(_))));
+        assert!(sender.await.unwrap());
+        for _ in 1..super::UPDATE_CHANNEL_CAPACITY {
+            rx.recv().await.unwrap();
+        }
+        assert!(matches!(
+            rx.recv().await,
+            Some(Update::Error(error)) if error == super::UPDATE_CHANNEL_SATURATED
+        ));
+    }
 
     #[test]
     fn bounded_chat_read_requests_use_exact_nonzero_max_for_messages_and_channels() {
@@ -2203,6 +2231,14 @@ mod tests {
             relative.push(component.as_os_str());
         }
         relative
+    }
+
+    #[test]
+    fn topic_random_ids_are_unique_within_the_process() {
+        let ids = (0..10_000)
+            .map(|_| topic_send_random_id())
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 10_000);
     }
 
     #[test]
@@ -2305,6 +2341,24 @@ mod tests {
         assert_eq!(cache.parent(), Some(non_utf8.as_path()));
         assert_ne!(cache, media_cache_dir(&distinct_session).unwrap());
 
+        #[cfg(target_os = "linux")]
+        {
+            use exacl::{AclEntry, Perm, setfacl};
+            setfacl(
+                &[&cache],
+                &[
+                    AclEntry::allow_user("", Perm::READ | Perm::WRITE | Perm::EXECUTE, None),
+                    AclEntry::allow_user("65534", Perm::READ | Perm::EXECUTE, None),
+                    AclEntry::allow_group("", Perm::empty(), None),
+                    AclEntry::allow_mask(Perm::READ | Perm::EXECUTE, None),
+                    AclEntry::allow_other(Perm::empty(), None),
+                ],
+                None,
+            )
+            .unwrap();
+            assert!(media_cache_dir(&session).is_err());
+        }
+
         std::fs::remove_dir(&cache).unwrap();
         let target = root.join("cache-target");
         std::fs::create_dir(&target).unwrap();
@@ -2367,6 +2421,23 @@ mod tests {
                 std::fs::metadata(&final_path).unwrap().mode() & 0o777,
                 0o600
             );
+            #[cfg(target_os = "linux")]
+            {
+                use exacl::{AclEntry, Perm, setfacl};
+                setfacl(
+                    &[&final_path],
+                    &[
+                        AclEntry::allow_user("", Perm::READ | Perm::WRITE, None),
+                        AclEntry::allow_user("65534", Perm::READ, None),
+                        AclEntry::allow_group("", Perm::empty(), None),
+                        AclEntry::allow_mask(Perm::READ, None),
+                        AclEntry::allow_other(Perm::empty(), None),
+                    ],
+                    None,
+                )
+                .unwrap();
+                assert_eq!(cached_media_thumbnail_path(&cache, 7, 11), None);
+            }
             let symlink_entry = cache.join("chat-7-message-12-thumb.jpg");
             symlink(&final_path, &symlink_entry).unwrap();
             assert_eq!(cached_media_thumbnail_path(&cache, 7, 12), None);

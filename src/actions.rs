@@ -1459,7 +1459,7 @@ mod tests {
             unexpected_client_call("empty-folder client", "delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             unexpected_client_call("empty-folder client", "subscribe to updates")
         }
     }
@@ -1518,7 +1518,7 @@ mod tests {
             unexpected_client_call("failing-message client", "delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             unexpected_client_call("failing-message client", "subscribe to updates")
         }
     }
@@ -1584,7 +1584,7 @@ mod tests {
             unexpected_client_call("slow-message client", "delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             unexpected_client_call("slow-message client", "subscribe to updates")
         }
     }
@@ -1668,7 +1668,7 @@ mod tests {
             unexpected_client_call("mark-read client", "delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             unexpected_client_call("mark-read client", "subscribe to updates")
         }
     }
@@ -1741,7 +1741,7 @@ mod tests {
             unexpected_client_call("hanging-discovery client", "delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             unexpected_client_call("hanging-discovery client", "subscribe to updates")
         }
     }
@@ -1803,7 +1803,7 @@ mod tests {
             unexpected_client_call("slow-chat client", "delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             unexpected_client_call("slow-chat client", "subscribe to updates")
         }
     }
@@ -1868,7 +1868,7 @@ mod tests {
             unexpected_client_call("older-message client", "delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             unexpected_client_call("older-message client", "subscribe to updates")
         }
     }
@@ -1949,7 +1949,7 @@ mod tests {
             unexpected_client_call("chat-page-limit client", "delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             unexpected_client_call("chat-page-limit client", "subscribe to updates")
         }
     }
@@ -2087,7 +2087,7 @@ mod tests {
             unexpected_client_call("reconciliation-topic client", "delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             unexpected_client_call("reconciliation-topic client", "subscribe to updates")
         }
     }
@@ -2156,7 +2156,7 @@ mod tests {
             unexpected_client_call("no-older-message client", "delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             unexpected_client_call("no-older-message client", "subscribe to updates")
         }
     }
@@ -2694,7 +2694,7 @@ mod tests {
             unexpected_client_call("typing client", "delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             unexpected_client_call("typing client", "subscribe to updates")
         }
     }
@@ -2789,7 +2789,7 @@ mod tests {
             unexpected_client_call("thread-read client", "delete messages")
         }
 
-        async fn subscribe_updates(&mut self) -> Result<mpsc::UnboundedReceiver<Update>> {
+        async fn subscribe_updates(&mut self) -> Result<mpsc::Receiver<Update>> {
             unexpected_client_call("thread-read client", "subscribe to updates")
         }
     }

@@ -1,13 +1,16 @@
 {
   "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
-  "packages": [
-    "rustc@latest",
-    "cargo@latest",
-    "rustfmt@latest",
-    "clippy@latest",
-    "rust-analyzer@latest",
-    "pkg-config@latest"
-  ],
+  "packages": {
+    "rustc":         "latest",
+    "cargo":         "latest",
+    "rustfmt":       "latest",
+    "clippy":        "latest",
+    "rust-analyzer": "latest",
+    "pkg-config":    "latest",
+    "nixpkgs#acl.dev": {
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    }
+  },
   "shell": {
     "init_hook": [
       "export RUST_BACKTRACE=${RUST_BACKTRACE:-1}",

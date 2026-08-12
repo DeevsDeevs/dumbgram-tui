@@ -41,7 +41,9 @@
             pkg-config
           ];
 
-          buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [
+          buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.acl
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.libiconv
           ];
 
@@ -74,6 +76,8 @@
             rustToolchain
             pkg-config
             rust-analyzer
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.acl
           ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.libiconv
           ];
