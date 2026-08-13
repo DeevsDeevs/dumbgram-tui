@@ -368,7 +368,7 @@ mod unix {
             .iter()
             .any(|entry| !entry.name.is_empty() || !entry.flags.is_empty());
         #[cfg(target_os = "macos")]
-        let unsafe_acl = !entries.is_empty();
+        let unsafe_acl = entries.iter().any(|entry| entry.allow);
         if unsafe_acl {
             color_eyre::eyre::bail!("session path has an unsupported ACL: {}", path.display())
         }
@@ -754,6 +754,22 @@ mod unix {
             setfacl(&[&path], &entries, None).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
             assert!(SecureSessionFile::open(&path).is_err());
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn accepts_deny_acl_on_session_ancestor() {
+            use exacl::{AclEntry, Perm, setfacl};
+            let root = private_test_dir("ancestor-deny-acl");
+            setfacl(
+                &[&root],
+                &[AclEntry::deny_group("everyone", Perm::DELETE, None)],
+                None,
+            )
+            .unwrap();
+            assert!(SecureSessionFile::open(&root.join("session.dat")).is_ok());
+            setfacl(&[&root], &[], None).unwrap();
             fs::remove_dir_all(root).unwrap();
         }
 
