@@ -5,6 +5,7 @@ mod chat_keys;
 mod config;
 mod confirm_keys;
 mod diagnostics;
+mod export;
 mod file_opener;
 mod folder_keys;
 mod global_keys;
@@ -106,6 +107,19 @@ const CHECK_CONFIG_AUTH_CONFLICT: &str =
     "--check-config cannot be combined with --check-auth; choose one diagnostic";
 const CONFIG_PATH_ARGUMENT_REQUIRED: &str = "--config requires a path argument";
 const LOG_PATH_ARGUMENT_REQUIRED: &str = "--log requires a path argument";
+const EXPORT_CHAT_ARGUMENT_REQUIRED: &str = "--export-chat requires a chat id or name argument";
+const EXPORT_OUT_PATH_ARGUMENT_REQUIRED: &str = "--out requires a path argument";
+const MOCK_EXPORT_CHAT_CONFLICT: &str =
+    "--mock cannot be combined with --export-chat because export connects to Telegram";
+const SMOKE_EXPORT_CHAT_CONFLICT: &str =
+    "--smoke cannot be combined with --export-chat because smoke is mock-only";
+const CHECK_CONFIG_EXPORT_CHAT_CONFLICT: &str =
+    "--check-config cannot be combined with --export-chat; choose one command";
+const CHECK_AUTH_EXPORT_CHAT_CONFLICT: &str = "--check-auth cannot be combined with --export-chat; export already requires an authorized session";
+const OUT_WITHOUT_EXPORT_CHAT: &str = "--out can only be used with --export-chat";
+const EXPORT_CHAT_WITHOUT_OUT: &str = "--export-chat requires --out PATH";
+const MEDIA_DIR_ARGUMENT_REQUIRED: &str = "--media-dir requires a directory argument";
+const MEDIA_DIR_WITHOUT_EXPORT_CHAT: &str = "--media-dir can only be used with --export-chat";
 const SLOW_RENDER_LOG_THRESHOLD_MS: u128 = 100;
 const CLI_USAGE_EXIT_CODE: i32 = 2;
 const SETUP_ERROR_EXIT_CODE: i32 = 1;
@@ -150,6 +164,9 @@ struct Cli {
     check_auth: bool,
     help: bool,
     log_path: Option<String>,
+    export_chat: Option<String>,
+    export_out: Option<String>,
+    export_media_dir: Option<String>,
 }
 
 impl Default for Cli {
@@ -162,6 +179,9 @@ impl Default for Cli {
             check_auth: false,
             help: false,
             log_path: None,
+            export_chat: None,
+            export_out: None,
+            export_media_dir: None,
         }
     }
 }
@@ -198,6 +218,22 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|error| exit_with_error(error, SETUP_ERROR_EXIT_CODE));
         color_eyre::install()?;
         check_auth(&cli.config_path, config, session_path).await?;
+        return Ok(());
+    }
+
+    if let (Some(query), Some(out_path)) = (cli.export_chat.as_deref(), cli.export_out.as_deref()) {
+        let (config, session_path) = load_checked_config_with_session_parent(&cli.config_path)
+            .unwrap_or_else(|error| exit_with_error(error, SETUP_ERROR_EXIT_CODE));
+        color_eyre::install()?;
+        export_chat(
+            &cli.config_path,
+            config,
+            session_path,
+            query,
+            Path::new(out_path),
+            cli.export_media_dir.as_deref().map(Path::new),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -255,6 +291,30 @@ where
                     .ok_or_else(|| color_eyre::eyre::eyre!(LOG_PATH_ARGUMENT_REQUIRED))?;
                 cli.log_path = Some(path);
             }
+            "--export-chat" => {
+                let query = args
+                    .next()
+                    .filter(|query| {
+                        query.parse::<i64>().is_ok()
+                            || !(query.trim().is_empty() || query.starts_with('-'))
+                    })
+                    .ok_or_else(|| color_eyre::eyre::eyre!(EXPORT_CHAT_ARGUMENT_REQUIRED))?;
+                cli.export_chat = Some(query);
+            }
+            "--out" => {
+                let path = args
+                    .next()
+                    .filter(|path| !path.starts_with('-'))
+                    .ok_or_else(|| color_eyre::eyre::eyre!(EXPORT_OUT_PATH_ARGUMENT_REQUIRED))?;
+                cli.export_out = Some(path);
+            }
+            "--media-dir" => {
+                let path = args
+                    .next()
+                    .filter(|path| !path.starts_with('-'))
+                    .ok_or_else(|| color_eyre::eyre::eyre!(MEDIA_DIR_ARGUMENT_REQUIRED))?;
+                cli.export_media_dir = Some(path);
+            }
             "--help" | "-h" => cli.help = true,
             _ => {
                 return Err(color_eyre::eyre::eyre!(
@@ -285,6 +345,29 @@ where
         return Err(color_eyre::eyre::eyre!(MOCK_CHECK_AUTH_CONFLICT));
     }
 
+    if cli.export_chat.is_some() {
+        let conflict = if cli.smoke {
+            Some(SMOKE_EXPORT_CHAT_CONFLICT)
+        } else if cli.mode == RunMode::Mock {
+            Some(MOCK_EXPORT_CHAT_CONFLICT)
+        } else if cli.check_config {
+            Some(CHECK_CONFIG_EXPORT_CHAT_CONFLICT)
+        } else if cli.check_auth {
+            Some(CHECK_AUTH_EXPORT_CHAT_CONFLICT)
+        } else if cli.export_out.is_none() {
+            Some(EXPORT_CHAT_WITHOUT_OUT)
+        } else {
+            None
+        };
+        if let Some(conflict) = conflict {
+            return Err(color_eyre::eyre::eyre!(conflict));
+        }
+    } else if cli.export_out.is_some() {
+        return Err(color_eyre::eyre::eyre!(OUT_WITHOUT_EXPORT_CHAT));
+    } else if cli.export_media_dir.is_some() {
+        return Err(color_eyre::eyre::eyre!(MEDIA_DIR_WITHOUT_EXPORT_CHAT));
+    }
+
     if cli.smoke {
         cli.mode = RunMode::Mock;
     }
@@ -301,8 +384,8 @@ fn print_help() {
     println!(
         "Dumbgram TUI {APP_VERSION}\n\n\
 Usage:\n  {APP_COMMAND} [OPTIONS]\n\n\
-Options:\n  --mock             Run with built-in mock Telegram data for smoke testing\n  --smoke            Load mock data, render off-screen, exercise interactions, and exit\n  --check-config     Validate Telegram config and session path without connecting\n  --check-auth       Connect and verify saved Telegram session without login/TUI\n  -c, --config PATH  Load Telegram config from PATH (default: {default_config_path})\n  --log PATH         Append runtime diagnostics (may contain sensitive metadata) to PATH\n  -h, --help         Print this help\n\n\
-Examples:\n  {APP_COMMAND} --mock\n  {APP_COMMAND} --mock --smoke\n  {APP_COMMAND} --check-config --config \"{default_config_path}\"\n  {APP_COMMAND} --check-auth --config \"{default_config_path}\"\n  {APP_COMMAND} --config \"{default_config_path}\""
+Options:\n  --mock               Run with built-in mock Telegram data for smoke testing\n  --smoke              Load mock data, render off-screen, exercise interactions, and exit\n  --check-config       Validate Telegram config and session path without connecting\n  --check-auth         Connect and verify saved Telegram session without login/TUI\n  --export-chat QUERY  Export one chat's full history as Telegram Desktop-style JSON;\n                       QUERY is a chat id or a case-insensitive name substring\n  --out PATH           Output file for --export-chat (must not exist; created 0600)\n  --media-dir DIR      Also download --export-chat photos into DIR (resumable)\n  -c, --config PATH    Load Telegram config from PATH (default: {default_config_path})\n  --log PATH           Append runtime diagnostics (may contain sensitive metadata) to PATH\n  -h, --help           Print this help\n\n\
+Examples:\n  {APP_COMMAND} --mock\n  {APP_COMMAND} --mock --smoke\n  {APP_COMMAND} --check-config --config \"{default_config_path}\"\n  {APP_COMMAND} --check-auth --config \"{default_config_path}\"\n  {APP_COMMAND} --export-chat \"Finance Bot\" --out chat-export.json --config \"{default_config_path}\"\n  {APP_COMMAND} --config \"{default_config_path}\""
     );
 }
 
@@ -429,6 +512,41 @@ async fn check_auth(
             config_path
         )))
     }
+}
+
+async fn export_chat(
+    config_path: &str,
+    config: config::Config,
+    session_path: PathBuf,
+    query: &str,
+    out_path: &Path,
+    media_dir: Option<&Path>,
+) -> Result<()> {
+    let summary = export::with_output_file(out_path, async move |file| {
+        let client = GrammersClient::new(
+            config.telegram.api_id,
+            config.telegram.api_hash,
+            &session_path,
+        )
+        .await?;
+
+        if !client.inner().is_authorized().await? {
+            return Err(color_eyre::eyre::eyre!(check_auth_unauthorized_message(
+                config_path
+            )));
+        }
+
+        export::export_chat(client.inner(), query, out_path, file, media_dir).await
+    })
+    .await?;
+    println!(
+        "Exported {} messages to {} (id={}, bot_api_chat_id={})",
+        summary.message_count,
+        out_path.display(),
+        summary.chat_id,
+        summary.bot_api_chat_id
+    );
+    Ok(())
 }
 
 async fn run_real_telegram(
@@ -6740,25 +6858,29 @@ async fn handle_mouse_event_with_progress<C: TelegramClient + Clone + Send + Syn
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_COMMAND, CHECK_AUTH_OK_PREFIX, CHECK_CONFIG_AUTH_CONFLICT,
+        APP_COMMAND, CHECK_AUTH_EXPORT_CHAT_CONFLICT, CHECK_AUTH_OK_PREFIX,
+        CHECK_CONFIG_AUTH_CONFLICT, CHECK_CONFIG_EXPORT_CHAT_CONFLICT,
         CHECK_CONFIG_SESSION_EXISTS_STATUS, CHECK_CONFIG_SESSION_WILL_CREATE_STATUS,
         CLI_USAGE_EXIT_CODE, CONFIG_LOAD_HELP, CONFIG_PATH_ARGUMENT_REQUIRED, ChatMessageLoad,
         ChatMessageLoadPurpose, ChatMessageLoadResult, ChatMessageLoader, DeleteMessageLoader,
-        DeleteMessageResult, EditMessageLoader, EditMessageResult, EventLoopState,
+        DeleteMessageResult, EXPORT_CHAT_ARGUMENT_REQUIRED, EXPORT_CHAT_WITHOUT_OUT,
+        EXPORT_OUT_PATH_ARGUMENT_REQUIRED, EditMessageLoader, EditMessageResult, EventLoopState,
         FolderChatLoadResult, FolderChatLoader, FrameScheduler, HandlerLoaders,
         InitialStateLoadResult, InitialStateLoader, LOADING_CHAT_MESSAGES_STATUS,
         LOADING_TELEGRAM_STATUS, LOG_PATH_ARGUMENT_REQUIRED, LOGIN_2FA_ENABLED_STATUS,
         LOGIN_2FA_HINT_PREFIX, LOGIN_2FA_PROMPT, LOGIN_2FA_SIGNED_IN_PREFIX, LOGIN_CODE_PROMPT,
         LOGIN_CODE_SENT_PREFIX, LOGIN_FAILED_PREFIX, LOGIN_HEADER, LOGIN_PHONE_PROMPT,
         LOGIN_REQUESTING_CODE_STATUS, LOGIN_SESSION_SAVED_STATUS, LOGIN_SIGNED_IN_PREFIX,
-        LOGIN_SIGNING_IN_STATUS, LOGIN_START_PROMPT, MAX_DEFERRED_UPDATES, MIN_FRAME_INTERVAL,
-        MOCK_CHECK_AUTH_CONFLICT, MOCK_CHECK_CONFIG_CONFLICT, ManualMarkChatReadResult,
-        MarkChatReadLoader, MediaPreviewLoader, MediaPreviewResult, MutationTaskTracker,
-        OlderMessageLoadResult, OlderMessageLoader, OlderMessageNavigation, OpenTargetKind,
-        OpenTargetLoader, PROMPT_EMPTY_ERROR, PROMPT_EOF_ERROR, RECONCILIATION_INTERVAL,
-        ReconciliationLoader, ReconciliationResult, ReplyMessageLoader, ReplyMessageResult,
-        RunMode, SAVING_EDIT_STATUS, SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS,
-        SETUP_ERROR_EXIT_CODE, SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT,
+        LOGIN_SIGNING_IN_STATUS, LOGIN_START_PROMPT, MAX_DEFERRED_UPDATES,
+        MEDIA_DIR_ARGUMENT_REQUIRED, MEDIA_DIR_WITHOUT_EXPORT_CHAT, MIN_FRAME_INTERVAL,
+        MOCK_CHECK_AUTH_CONFLICT, MOCK_CHECK_CONFIG_CONFLICT, MOCK_EXPORT_CHAT_CONFLICT,
+        ManualMarkChatReadResult, MarkChatReadLoader, MediaPreviewLoader, MediaPreviewResult,
+        MutationTaskTracker, OUT_WITHOUT_EXPORT_CHAT, OlderMessageLoadResult, OlderMessageLoader,
+        OlderMessageNavigation, OpenTargetKind, OpenTargetLoader, PROMPT_EMPTY_ERROR,
+        PROMPT_EOF_ERROR, RECONCILIATION_INTERVAL, ReconciliationLoader, ReconciliationResult,
+        ReplyMessageLoader, ReplyMessageResult, RunMode, SAVING_EDIT_STATUS,
+        SENDING_MESSAGE_STATUS, SENDING_REPLY_STATUS, SETUP_ERROR_EXIT_CODE,
+        SMOKE_CHECK_AUTH_CONFLICT, SMOKE_CHECK_CONFIG_CONFLICT, SMOKE_EXPORT_CHAT_CONFLICT,
         SMOKE_OK_PREFIX, SendMessageLoader, SendMessageResult, SubscribeUpdatesLoader,
         SubscribeUpdatesResult, TerminalAction, TerminalSetupOperations, TokioInstant,
         UPDATE_SUBSCRIPTION_RETRY_DELAY, UiProgress, abort_running_task,
@@ -12690,6 +12812,93 @@ mod tests {
             .expect_err("config and auth diagnostics must be explicit separate commands");
 
         assert_eq!(err.to_string(), CHECK_CONFIG_AUTH_CONFLICT);
+    }
+
+    #[test]
+    fn export_chat_parses_as_real_command_with_out_path() {
+        let cli = parse_test_args(["--export-chat", "Finance Bot", "--out", "chat.json"]);
+
+        assert_eq!(cli.export_chat.as_deref(), Some("Finance Bot"));
+        assert_eq!(cli.export_out.as_deref(), Some("chat.json"));
+        assert_eq!(cli.mode, RunMode::RealTelegram);
+    }
+
+    #[test]
+    fn export_chat_accepts_negative_bot_api_chat_id() {
+        let cli = parse_test_args(["--export-chat", "-4242424242", "--out", "chat.json"]);
+
+        assert_eq!(cli.export_chat.as_deref(), Some("-4242424242"));
+    }
+
+    #[test]
+    fn media_dir_parses_only_with_export_chat_and_a_value() {
+        let cli = parse_test_args([
+            "--export-chat",
+            "100",
+            "--out",
+            "chat.json",
+            "--media-dir",
+            "photos",
+        ]);
+        assert_eq!(cli.export_media_dir.as_deref(), Some("photos"));
+
+        let stray = parse_args_from(["--media-dir", "photos"])
+            .expect_err("--media-dir without --export-chat must be rejected");
+        assert_eq!(stray.to_string(), MEDIA_DIR_WITHOUT_EXPORT_CHAT);
+
+        let missing = parse_args_from([
+            "--export-chat",
+            "100",
+            "--out",
+            "chat.json",
+            "--media-dir",
+            "--mock",
+        ])
+        .expect_err("--media-dir should reject another option as its path");
+        assert_eq!(missing.to_string(), MEDIA_DIR_ARGUMENT_REQUIRED);
+    }
+
+    #[test]
+    fn export_chat_cannot_be_combined_with_other_modes() {
+        for (flag, conflict) in [
+            ("--mock", MOCK_EXPORT_CHAT_CONFLICT),
+            ("--smoke", SMOKE_EXPORT_CHAT_CONFLICT),
+            ("--check-config", CHECK_CONFIG_EXPORT_CHAT_CONFLICT),
+            ("--check-auth", CHECK_AUTH_EXPORT_CHAT_CONFLICT),
+        ] {
+            let err = parse_args_from([flag, "--export-chat", "100", "--out", "chat.json"])
+                .expect_err("export must be a standalone real-Telegram command");
+
+            assert_eq!(err.to_string(), conflict, "{flag}");
+        }
+    }
+
+    #[test]
+    fn export_chat_and_out_require_each_other() {
+        let missing_out = parse_args_from(["--export-chat", "100"])
+            .expect_err("export without an output path must be rejected");
+        assert_eq!(missing_out.to_string(), EXPORT_CHAT_WITHOUT_OUT);
+
+        let stray_out = parse_args_from(["--out", "chat.json"])
+            .expect_err("--out without --export-chat must be rejected");
+        assert_eq!(stray_out.to_string(), OUT_WITHOUT_EXPORT_CHAT);
+    }
+
+    #[test]
+    fn export_arguments_require_explicit_values() {
+        let query = parse_args_from(["--export-chat", "--out", "chat.json"])
+            .expect_err("--export-chat should reject another option as its query");
+        assert_eq!(query.to_string(), EXPORT_CHAT_ARGUMENT_REQUIRED);
+
+        for blank in ["", "   "] {
+            let err = parse_args_from(["--export-chat", blank, "--out", "chat.json"])
+                .expect_err("--export-chat should reject a blank query");
+            assert_eq!(err.to_string(), EXPORT_CHAT_ARGUMENT_REQUIRED);
+        }
+
+        let out = parse_args_from(["--export-chat", "100", "--out", "--mock"])
+            .expect_err("--out should reject another option as its path");
+        assert_eq!(out.to_string(), EXPORT_OUT_PATH_ARGUMENT_REQUIRED);
     }
 
     #[test]

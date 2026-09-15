@@ -94,11 +94,14 @@ dumbgram_tui [OPTIONS]
 | `--smoke` | Run the automated off-screen interaction check and exit. It always implies mock mode. |
 | `--check-config` | Validate the config and resolved session path without a network connection. |
 | `--check-auth` | Connect to Telegram and check whether the saved session is authorized, without interactive login or the TUI. It may create local session/cache paths. |
+| `--export-chat QUERY` | Connect with the saved session and export one chat's full history as JSON; see [Exporting chat history](#exporting-chat-history). |
+| `--out PATH` | Output file for `--export-chat`. Required with it, and only valid with it. |
+| `--media-dir DIR` | With `--export-chat`, download photos into `DIR` (created `0700`) as `photo_<message_id>.jpg`, skipping files that already exist, and record their paths in the JSON `photo` field. |
 | `-c, --config PATH` | Use an explicit config file instead of the default location. |
 | `--log PATH` | Append runtime diagnostics to `PATH`; see [Diagnostics](#diagnostics). |
 | `-h, --help` | Print CLI help. |
 
-`--check-config` and `--check-auth` are mutually exclusive. Neither check can be combined with `--smoke`.
+`--check-config` and `--check-auth` are mutually exclusive. Neither check can be combined with `--smoke`. `--export-chat` cannot be combined with `--mock`, `--smoke`, `--check-config`, or `--check-auth`.
 
 Examples:
 
@@ -108,7 +111,20 @@ dumbgram_tui --config ~/.config/dumbgram/config.toml
 dumbgram_tui --check-config --config ./config.toml
 dumbgram_tui --check-auth --config ./config.toml
 dumbgram_tui --config ./config.toml --log ./dumbgram.log
+dumbgram_tui --export-chat "Finance Bot" --out ./chat-export.json --config ./config.toml
 ```
+
+## Exporting chat history
+
+`--export-chat QUERY --out PATH` writes one chat's entire history to a JSON file shaped like a subset of Telegram Desktop's "Export chat history → JSON" output, then exits without starting the TUI.
+
+- `QUERY` is a chat id or a chat name, matched against your dialog list. Ids may be Telegram chat ids or Bot API ids such as `-100…`. Names match case-insensitively; an exact name wins over substring matches. If several chats still match, the command fails and prints `id<TAB>name` candidates; re-run with one of those ids.
+- The session must already be authorized. Run the TUI once to log in; export never starts interactive login.
+- `PATH` must not exist. The file is created with mode `0600` on Unix because it contains private message text.
+- Messages are ordered oldest to newest. Dates are UTC (`date` without an offset, `date_unixtime` as a string of seconds). Documents and stickers are recorded as a `"(file)"` placeholder; photos are recorded as `"(photo)"` unless `--media-dir` is given. Text formatting is exported as a single plain `text_entities` entry. Service messages keep only `id`, `type`, and dates.
+- The top-level `bot_api_chat_id` is the id the Telegram Bot API uses for the chat: your own user id for a private chat, `-id` for a basic group, and `-100…` for supergroups and channels. The summary line prints it; for groups and channels it can be passed back to `--export-chat`, while private chats are selected by the printed `id`.
+- A supergroup upgraded from a basic group exports only history from after the upgrade. Earlier messages stay in the original basic group.
+- Progress is printed to stderr every 500 messages. Telegram flood waits are slept through, so large histories can take a while.
 
 ## Controls
 
@@ -187,6 +203,7 @@ Typing non-empty text sends Telegram typing activity on a cooldown. Outbound com
 | Thumbnail cache | A persistent sibling directory named `<session-file>.dumbgram-media-cache`. Selecting an image may download a thumbnail even if the terminal cannot render it. Remove it manually while Dumbgram is stopped. |
 | Saved media | `$HOME/Downloads`, falling back to `./Downloads`. Names are sanitized and existing files are not overwritten. On Linux and macOS files are restricted to mode `0600`; content remains untrusted. |
 | Diagnostics | The path passed to `--log`. Logs append rather than truncate and do not rotate automatically. |
+| Chat export | The path passed to `--out`. Contains message text and sender names; created `0600` on Unix and never overwritten. |
 
 Displaying a selected conversation can acknowledge its loaded messages as read whenever Dumbgram believes the terminal is focused. Terminals without focus-event support may therefore mark a selected conversation read while their window is in the background.
 
